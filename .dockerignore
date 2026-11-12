@@ -1,0 +1,9 @@
+build*/
+models/
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+**/__pycache__/
+*.glb
+*.ply
+*.swp

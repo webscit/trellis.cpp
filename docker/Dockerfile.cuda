@@ -1,0 +1,108 @@
+# trellis.cpp CUDA image (trellis-cli + trellis-server), FROM-scratch runtime.
+#
+# Build (Jetson Thor, CUDA 13.2, sm_110):
+#   docker build -f docker/Dockerfile.cuda -t trellis-cpp:cuda13.2-thor .
+# Other GPUs: --build-arg CUDA_ARCHITECTURES="86;120" (and a matching CUDA_VERSION).
+#
+# Run (models = the GGUF directory, mounted read-only at /models):
+#   docker run --rm --runtime nvidia -v $PWD/models:/models:ro -v $PWD/out:/out \
+#     trellis-cpp:cuda13.2-thor -i /out/in.png -o /out/out.glb
+#   docker run --rm --runtime nvidia -p 8080:8080 -v $PWD/models:/models:ro \
+#     --entrypoint trellis-server trellis-cpp:cuda13.2-thor --host 0.0.0.0
+ARG CUDA_VERSION=13.2.1
+ARG UBUNTU_VERSION=24.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git cmake ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /trellis.cpp
+
+# .git is kept in the context so the binaries report the commit (--version).
+COPY . .
+RUN git config --global --add safe.directory '*'
+
+ARG CUDA_ARCHITECTURES=110
+ARG GGML_NATIVE=ON
+
+# libggml-cuda needs libcuda.so.1 (the driver) to link the executables; the
+# build stage has no driver, so resolve it against the toolkit stub. The real
+# driver is mounted by the NVIDIA Container Toolkit at run time.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+RUN cmake -S . -B build \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_NCCL=OFF \
+        -DGGML_NATIVE=${GGML_NATIVE} \
+        -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+        "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"
+RUN cmake --build build --config Release -j$(nproc) \
+        --target trellis-cli trellis-server trellis-devices
+
+############################################################################
+# rootfs: assemble a FROM-scratch root with the binaries and the exact shared
+# libraries reported by ldd. The CUDA driver (libcuda.so*) is not bundled; it
+# is injected at run time by the NVIDIA Container Toolkit.
+############################################################################
+FROM build AS rootfs
+
+RUN set -eux; \
+    root=/opt/trellis-scratch-rootfs; \
+    mkdir -p "$root/etc" "$root/home/trellis" "$root/models" "$root/out" \
+             "$root/opt/trellis/bin" "$root/opt/trellis/lib" "$root/tmp"; \
+    chmod 1777 "$root/tmp"; \
+    printf 'trellis:x:1000:1000:trellis.cpp:/home/trellis:/sbin/nologin\n' > "$root/etc/passwd"; \
+    printf 'trellis:x:1000:\n' > "$root/etc/group"; \
+    printf 'hosts: files dns\npasswd: files\ngroup: files\n' > "$root/etc/nsswitch.conf"; \
+    cp -a build/trellis-cli build/trellis-server build/trellis-devices "$root/opt/trellis/bin/"; \
+    for so in build/lib*.so*; do [ -e "$so" ] && cp -a "$so" "$root/opt/trellis/lib/"; done; \
+    apt-get update -qq && apt-get install -y --no-install-recommends patchelf >/dev/null; \
+    rm -rf /var/lib/apt/lists/*; \
+    for f in "$root"/opt/trellis/bin/* "$root"/opt/trellis/lib/*.so*; do \
+        if [ -f "$f" ] && [ ! -L "$f" ]; then patchelf --remove-rpath "$f" || true; fi; \
+    done; \
+    copy_dep() { \
+        dep="$1"; \
+        case "$dep" in */libcuda.so*|"$root"/*) return 0;; esac; \
+        dest="$root${dep}"; \
+        mkdir -p "$(dirname "$dest")"; \
+        [ -e "$dest" ] || cp -L "$dep" "$dest"; \
+    }; \
+    copy_ldd_deps() { \
+        LD_LIBRARY_PATH="$root/opt/trellis/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            ldd "$1" 2>/dev/null \
+            | awk '$1 ~ /^\// { print $1 } $2 == "=>" && $3 ~ /^\// { print $3 }' \
+            | sort -u \
+            | while read -r dep; do copy_dep "$dep"; done; \
+    }; \
+    for b in "$root"/opt/trellis/bin/*; do [ -f "$b" ] && copy_ldd_deps "$b"; done; \
+    for so in "$root"/opt/trellis/lib/*.so*; do [ -f "$so" ] && copy_ldd_deps "$so"; done; \
+    for f in "$root"/opt/trellis/bin/*; do [ -f "$f" ] && strip --strip-unneeded "$f" || true; done; \
+    chmod 0755 "$root"/opt/trellis/bin/*; \
+    ln -s /models "$root/home/trellis/models"; \
+    chown -R 1000:1000 "$root/home/trellis" "$root/opt/trellis" "$root/models" "$root/out"
+
+############################################################################
+# runtime: FROM scratch
+############################################################################
+FROM scratch AS runtime
+
+COPY --from=rootfs /opt/trellis-scratch-rootfs/ /
+
+ENV HOME=/home/trellis
+# Driver (libcuda.so*) and other NVIDIA libs are mounted at run time by the
+# NVIDIA Container Toolkit. The aarch64 Tegra/NVIDIA subdirs are needed for
+# Jetson/L4T FROM-scratch images because there is no ldconfig-generated cache.
+ENV LD_LIBRARY_PATH=/opt/trellis/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PATH=/opt/trellis/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin
+
+# The default --models is "models" relative to the cwd; ~/models -> /models.
+WORKDIR /home/trellis
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT [ "/opt/trellis/bin/trellis-cli" ]
