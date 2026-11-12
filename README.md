@@ -207,6 +207,57 @@ quality is at parity with the reference CUDA postprocess on identical inputs.
 Prefer the CLI flags above. The corresponding `TRELLIS_*` environment variables remain
 available for test binaries and backwards-compatible automation.
 
+### Multi-view
+
+Several photos or renders of the same object can condition one run. Each flow (sparse
+structure, shape, texture) runs once per view, and the per-view velocities are blended token
+by token, weighting each voxel by how directly it faces that view's camera. This is the
+ComfyUI-Trellis2 multi-view sampler, generalised to any number of views (up to 12) at
+arbitrary azimuth/elevation.
+
+```bash
+trellis-cli front.png out.glb --view back.png:180                     # front + back
+trellis-cli --view f.png:0 --view r.png:90 --view b.png:180 --view l.png:270 -o out.glb
+trellis-cli front.png out.glb --view top.png:top --view side.png:45:20  # names, elevation
+```
+
+`PATH:AZ:EL` gives the angles in degrees: 0 front, 90 the camera on the object's right as seen
+from the front, 180 back, 270 left, EL +90 top. AZ may also be a name
+(`front|back|left|right|top|bottom`). The positional image is view 0.
+
+| flag | meaning |
+|---|---|
+| `--view PATH[:AZ[:EL]]` | add a view (repeatable) |
+| `--blend-temp F` | blend sharpness (default 2.0) |
+| `--front-axis -y\|+y\|+x\|-x\|ref-z\|ref-x` | where the front lies on the latent grid (default `-y`; `ref-*` reproduce ComfyUI exactly) |
+| `--yaw-offset DEG` | added to every azimuth |
+| `--mv-stages ss,shape,tex` | which stages blend (default all) |
+
+Each extra view costs about one flow forward per step. All views share the negative CFG
+branch, so a guided step costs V+1 forwards, not 2V. Peak VRAM is unchanged. With a single
+image the output is bit-identical to before. Pixal3D is single-view only. See
+[`docs/spec/30-multiview.md`](docs/spec/30-multiview.md) for the method, the axis convention
+and the test results.
+
+### Mesh refinement
+
+`--refine-mesh in.glb|in.obj` re-generates an existing mesh from one or more views. The mesh's
+voxels fix the shape SLAT's coordinates; the shape and texture are re-sampled, blended over the
+views. The sparse-structure and LR stages are skipped.
+
+```bash
+trellis-cli --refine-mesh rough.glb --view front.png:0 --view back.png:180 -o refined.glb --res 1024
+```
+
+`--refine-coords auto|encoder|voxel` picks the coordinate source. `encoder` runs the TRELLIS.2
+shape VAE encoder, as the reference refiner does, and needs `shape_enc.gguf`; `voxel` uses the
+mesh's own voxels. `auto` uses the encoder when the file is present. `shape_enc.gguf` is not in
+the published GGUF set; convert it with `TRELLIS_MODELS=<TRELLIS.2-4B> TRELLIS_GGUF_OUT=models
+python tools/convert.py shape_enc` from `ckpts/shape_enc_next_dc_f16c32_fp16.*` of
+`microsoft/TRELLIS.2-4B`. The result keeps the input's position and scale (turn this off with
+`--refine-restore-transform off`). See
+[`docs/spec/31-mesh-refine.md`](docs/spec/31-mesh-refine.md).
+
 ### trellis-server
 
 `trellis-server` keeps the process resident (no Vulkan re-init per request) and exposes:
@@ -217,6 +268,19 @@ POST /generate      multipart/form-data with an "image" file part; optional text
                     fields "seed", "resolution" (512/1024/1536), "bg_removal"
                     (threshold|birefnet), "faces" (QEM face target, >= 1000 or
                     "auto"; 400 on an invalid value). Returns model/gltf-binary.
+                    Multi-view: repeat the "image" part and add "azimuths" (one per
+                    image, comma-separated; degrees or names) and optionally
+                    "elevations", "blend_temp", "front_axis", "yaw_offset".
+POST /refine        a "mesh" part (GLB or OBJ) + one or more "image" parts and the
+                    same fields, plus "refine_coords" (auto|encoder|voxel) and
+                    "restore_transform" (on|off).
+```
+
+```bash
+curl -F image=@front.png -F image=@back.png -F azimuths=0,180 -F resolution=512 \
+     http://127.0.0.1:8080/generate -o out.glb
+curl -F mesh=@rough.glb -F image=@front.png -F image=@back.png -F azimuths=0,180 \
+     http://127.0.0.1:8080/refine -o refined.glb
 ```
 
 Launch-time flags (including `--res`) set the per-request defaults; each request can
