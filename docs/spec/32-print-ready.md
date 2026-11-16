@@ -115,6 +115,45 @@ the model. Vertices below the plane become exterior, the cells along the cut are
 activated with the caps (§2.1b), and every edge through the plane is crossed at exactly
 mid-layer, so the cap is one exact plane.
 
+### 2.3b Stable base (`--print-base auto`)
+
+A flat base is not enough if the centre of mass is not over it. On the solid's voxels the
+search takes, for each candidate cut from 1 % to 4 % of the height, the convex hull of the
+first kept layer and the centre of mass of everything above it, and computes the tilt at
+which the model would topple (`atan(margin / height of the centre of mass)`). The lowest
+cut that reaches 15° wins. If none does, the 1 % cut is kept and a pedestal about 1.5 % of
+the grid thick is added under it: the filled convex hull of the footprint and of a circle
+around the centre of mass wide enough for 15°. The flood runs once more afterwards, so a
+hollow closed off by the pedestal (an arched sole) is filled rather than left as a bubble.
+Goblin, res 512: 12.5° on a plain 1 % cut, no cut up to 4 % reaches 15°, pedestal → 15.5°.
+
+### 2.3c Thin walls (`--print-wall MM`, default 0.8)
+
+The band guarantees `2·band` cells of material and no more: a cape, a blade edge or a
+strand prints as a 0.4 mm film. Fattening the whole model (a wider band) trades that for
+lost detail everywhere, so only the thin parts are grown, on the solid's voxels, one cell
+per side per pass:
+
+- `depth`: chamfer distance (3-4-5) of each solid vertex to the exterior, near the surface;
+- `core`: solid deeper than half the wall — already thick enough;
+- `thin`: shallow solid farther than `1.6·r` from any core (`r` = half the wall). A flat
+  thick surface is exactly `r` from its core; the extra `0.6·r` keeps out the sliver an
+  opening would shave off an ordinary convex edge.
+
+Thin vertices take their exterior 6-neighbours; passes stop when nothing is thin. The new
+surface lies outside the narrow band, so it is extracted and smoothed with the caps, and
+the flood runs again so that growth cannot enclose a pocket. Relief that is attached to
+thick material (a strap, a rivet) is within reach of a core and is left alone.
+
+Measured: a sheet with no thickness comes out 2 cells thick, and about 6 with
+`min_wall_cells = 6`; a thick box is unchanged (tests). On the goblin at res 512 with a
+1.6 mm target, the wall under the thinnest 1 % of the surface goes from 0.81 mm to
+1.29 mm — better, not a guarantee: the membrane smoothing takes some of the growth back.
+At the default 0.8 mm the goblin has almost nothing to grow (13 K grid vertices).
+Needs one byte per grid vertex (1.1 GB at res 1024); skipped above that. At res 1024 the
+whole solid remesh — vote, flood, 4 thickening passes, base search, extraction and 96
+smoothing passes — takes 68 s on the goblin (5–10 s at res 512).
+
 ### 2.4 Topology-preserving decimation
 
 `decimate_qem(..., keep_topology = true)` rejects every collapse that fails the link
@@ -132,6 +171,24 @@ vertex buffer that went into the GLB (welded by position: the UV unwrap splits v
 along chart seams). `repair_for_print` is the safety net behind the construction
 (duplicate/fin removal, winding, hole fill, outward orientation); on a watertight mesh
 it does nothing.
+
+### 2.6 Printability report
+
+Printed after every watertight run, written as JSON by `--print-report PATH`, served by
+`GET /jobs/{id}/report`. Measured on the final mesh at its printed size:
+
+| item | how | warning when |
+|---|---|---|
+| size, volume, surface | bounding box, signed volume | — |
+| watertight, shells | the audit (§2.5) | not watertight; more than one shell |
+| walls | a ray from every face straight into the material; the first hit counts only if that face looks back (normals more than 120° apart), so an ordinary edge is not a thin wall. Reported: the wall under the thinnest 1 % of the surface, and the share under the target | thinnest 1 % under 75 % of the target, or more than 10 % of the surface under it |
+| base | vertices within 0.1 mm of the plate; convex hull area; centre of mass against the hull | no flat base; centre of mass outside; topples under 10° |
+| overhangs | surface share facing down steeper than 45°, base excluded | above 25 % |
+
+The wall share includes fine relief (a 1 mm strap on a thick body measures 1 mm), which is
+why the warning keys on the thinnest percentile rather than on the share alone. Goblin,
+res 512, defaults plus `--print-base auto`: 81 × 50 × 100 mm, 75 cm³, thinnest 1 % at
+0.81 mm, stands at 15.5°, 12 % overhang, no warnings.
 
 ## 3. Output formats
 
@@ -153,12 +210,12 @@ it does nothing.
 | `--watertight` | `watertight=on` | solid remesh + topology-preserving QEM + audit |
 | `--3mf PATH` | `3mf=on`, then `GET /jobs/{id}/3mf` | also write the 3MF (implies watertight) |
 | `--print-size MM` | `print_size` | longest side of the 3MF, default 100 |
-| `--print-base F` | `print_base` | flat base, fraction of height, 0..0.5 (implies watertight) |
+| `--print-base F\|auto` | `print_base` | flat base, fraction of height, 0..0.5; `auto` = lowest stable cut, else a pedestal (implies watertight) |
+| `--print-report PATH` | `GET /jobs/{id}/report` | the printability report as JSON |
 | `--print-seal N` | `print_seal` | openness threshold for capping tears, 0..26, default 3 (0 = flood only) |
-| `--print-wall MM` | `print_wall` | minimum wall: band = ceil(wall / size · extent · res / 2), capped at 8 |
+| `--print-wall MM` | `print_wall` | minimum wall at `--print-size`, default 0.8; thinner features are grown locally (0 = off) |
 
-`--print-wall` works by widening the remesh band, which also grows the whole model by
-`eps` and rounds detail of that size; an explicit `--band` wins. Not combinable with
+Not combinable with
 `--decim GRID` (cluster decimation tears the surface) or `--retopo`.
 
 `trellis-print in.glb out.3mf [--res --faces --size --base --wall --band --glb]` runs
@@ -183,8 +240,7 @@ the result is not watertight.
 - Floating parts: components under 2 % of the largest are dropped; anything larger that
   is not attached to the body is kept and reported as `shells > 1`.
 - Overhangs, supports and orientation are left to the slicer.
-- Not done: finer openness sampling, wall thickening of thin parts only (needs a medial-axis estimate),
-  hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
+- Not done: finer openness sampling, hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
 
 ## 6. Tests
 
@@ -193,5 +249,7 @@ pinch); solid remesh of a closed box (plain remesh gives two shells, solid one, 
 within 10 % of the grown box), of a box with internal geometry and with a pinhole, of an
 open cup; the openness vote (a box with a third of its lid torn out is hollow with the
 flood alone and solid with `seal = 3`; a shallow tray stays a tray); the flat base (exact plane, expected volume); `make_printable` decimated to
-2 K faces; repair of a hole + fin + inverted winding; the 3MF package; `band_for_wall`.
+2 K faces; repair of a hole + fin + inverted winding; the 3MF package; thin-wall growth (sheet grown,
+thick box unchanged); the report and the stance (a top-heavy block falls over on a plain
+cut and stands on the automatic pedestal; a thin sheet is reported thin).
 With a mesh argument it runs the full path on it and requires a watertight result.

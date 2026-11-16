@@ -96,6 +96,8 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
 - ☑ `--3mf`: textured 3MF in mm, z-up, on the plate; `--print-size`, `--print-base` (exact
       planar base), `--print-wall`, `--print-seal`; server fields + `/jobs/{id}/3mf`;
       `trellis-print` for existing meshes; Studio "3D print" toggle
+- ☑ Thin walls grown locally to `--print-wall`; `--print-base auto` (stability search, pedestal
+      fallback); printability report (log, `--print-report`, `/jobs/{id}/report`)
 - ☐ Finer openness sampling (26 rays cannot tell a deep vase from a torn figurine)
 - ☑ Cap smoothing: membrane relaxation of the vertices the field does not determine
 - ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)

@@ -67,11 +67,16 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
     errno = 0;
     const float n = std::strtof(value, &end);
     const bool number = end != value && !*end && errno != ERANGE && std::isfinite(n);
+    if (name == "print-base" && std::string(value) == "auto") {
+        p.print_base = -1.0f;
+        p.watertight = true;
+        return true;
+    }
     if (name == "print-size") {
         if (!number || n <= 0) { error = "print-size must be a positive number of millimetres"; return false; }
         p.print_size = n;
     } else if (name == "print-base") {
-        if (!number || n < 0 || n > 0.5f) { error = "print-base must be a fraction from 0 to 0.5"; return false; }
+        if (!number || n < 0 || n > 0.5f) { error = "print-base must be a fraction from 0 to 0.5, or auto"; return false; }
         p.print_base = n;
         if (n > 0) p.watertight = true;
     } else if (name == "print-seal") {
@@ -280,15 +285,19 @@ void print_usage(const char* argv0, bool server) {
         "      --3mf PATH          also write a 3MF for slicers: millimetres, z-up, on the build\n"
         "                          plate, with the base-colour texture (implies --watertight)\n"
         "      --print-size MM     longest side of the 3MF model (default 100)\n"
-        "      --print-base F      cut the lowest fraction F (0..0.5) of the height off for a\n"
-        "                          flat base, e.g. 0.02 (default 0 = off; implies --watertight)\n"
+        "      --print-base F|auto cut the lowest fraction F (0..0.5) of the height off for a\n"
+        "                          flat base, e.g. 0.02 (default 0 = off; implies --watertight).\n"
+        "                          auto: the lowest cut (1..4%%) the model stands on with 15\n"
+        "                          degrees to spare, else a pedestal under it\n"
+        "      --print-report PATH write the printability report (size, walls, base, overhangs,\n"
+        "                          warnings) as JSON; it is always printed with --watertight\n"
         "      --print-seal N      how hard to close tears in the generated surface: a point\n"
         "                          that sees open space along fewer than N of 26 directions is\n"
         "                          filled (default 3). 0 = off, for vases and other deep\n"
         "                          hollow objects, which the default fills from the bottom up\n"
-        "      --print-wall MM     minimum wall thickness at --print-size: widens the remesh\n"
-        "                          band so thin sheets print, at the cost of a fatter model\n"
-        "                          (default 0; ignored when --band is given)\n"
+        "      --print-wall MM     minimum wall thickness at --print-size (default 0.8): fins,\n"
+        "                          edges and strands thinner than this are grown, and only\n"
+        "                          they are. 0 = off\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
@@ -428,6 +437,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
             std::string error;
             if (!parse_print_arg(a.substr(2), v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
         }
+        else if (a == "--print-report")         { const char* v = need(a.c_str()); if (!v) return false; p.print_report = v; }
         else if (a == "--dump-bg")              { p.dump_bg = true; }
         else if (a == "--bg-only")              { p.bg_only = true; p.dump_bg = true; }
         else if (a == "--retopo")               { const char* g=need(a.c_str()); if (!g) return false;

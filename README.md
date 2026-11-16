@@ -248,7 +248,7 @@ of non-manifold edges and no unit. `--watertight` rebuilds it as one solid a sli
 `--3mf` writes it at a real size with the texture.
 
 ```bash
-trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base 0.02
+trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base auto
 ```
 
 | Flag | Effect |
@@ -256,13 +256,14 @@ trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base
 | `--watertight` | exterior flood fill + openness vote → closed manifold extraction → topology-preserving decimation; prints a watertightness audit. The GLB itself is the solid |
 | `--3mf PATH` | 3MF: mm, z-up, lowest point on the plate, base-colour texture embedded |
 | `--print-size MM` | longest side of the 3MF (default 100) |
-| `--print-base F` | slice the lowest fraction `F` of the height off for a flat base (e.g. `0.02`) |
-| `--print-wall MM` | minimum wall thickness at `--print-size` (widens the remesh band; fattens the model slightly) |
+| `--print-base F\|auto` | slice the lowest fraction `F` of the height off for a flat base (e.g. `0.02`); `auto` picks the lowest cut the model stands on with 15° to spare, or adds a pedestal |
+| `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and only they are |
+| `--print-report PATH` | write the printability report (size, walls, base and stability, overhangs, warnings) as JSON; it is always logged |
 | `--print-seal N` | how hard to cap tears in the generated surface (default 3). `0` for vases and other deep hollow objects, which the default fills from the bottom up |
 
 `trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
 only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
-`print_base`, `print_wall` and `print_seal`. Method, measurements and limits:
+`print_base`, `print_wall` and `print_seal`, and serves the report at `GET /jobs/{id}/report`. Method, measurements and limits:
 [docs/spec/32-print-ready.md](docs/spec/32-print-ready.md).
 
 ### Mesh refinement

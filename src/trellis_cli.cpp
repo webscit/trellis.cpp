@@ -65,6 +65,19 @@ static float print_extent(const vector<float>& v) {
     const float e = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
     return e > 0 ? e : 1.0f;
 }
+// Printability report for the final geometry: always logged, also JSON with --print-report.
+static bool emit_print_report(const trellis::TrellisParams& cfg, const vector<float>& v, const vector<int32_t>& f, int up_axis) {
+    const trellis::PrintReport report = trellis::print_report(v.data(), (int64_t)v.size() / 3, f.data(), (int64_t)f.size() / 3,
+                                                              cfg.print_size, up_axis, cfg.print_wall);
+    fputs(trellis::print_report_text(report).c_str(), stdout);
+    if (cfg.print_report.empty()) return true;
+    FILE* out = fopen(cfg.print_report.c_str(), "wb");
+    const std::string json = trellis::print_report_json(report);
+    const bool ok = out && fwrite(json.data(), 1, json.size(), out) == json.size();
+    if (out) fclose(out);
+    if (!ok) fprintf(stderr, "[trellis] cannot write %s\n", cfg.print_report.c_str());
+    return ok;
+}
 // [dbg] overall stats of a flat tensor — used to compare LR vs HR shape-SLAT in decode space.
 // Pixal3D's projection grid is y-up with the camera on +z (pixal3d_project_cell: image up =
 // grid y). TRELLIS.2's is z-up with the front on -y, which is what the writers' (x,y,z)->(x,z,-y)
@@ -1180,16 +1193,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // solid -- and extracted as a closed 2-manifold.
         trellis::RemeshOptions remesh_options;
         if (cfg.watertight) {
-            if (cfg.band <= 0 && cfg.print_wall > 0)
-                remesh_band = std::max(remesh_band, trellis::band_for_wall(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts)));
             remesh_options.solid = true;
             remesh_options.seal = cfg.print_seal;
-            if (cfg.print_base > 0) {
-                remesh_options.base_axis = print_up_axis;
-                remesh_options.base_plane = trellis::base_plane_of(mesh.verts.data(), mesh.V(), print_up_axis, cfg.print_base);
-            }
-            printf("  watertight: solid remesh, band %d -> thinnest wall %.2f mm on a %.0f mm print\n", remesh_band,
-                   2.0f * remesh_band / so.res * cfg.print_size / print_extent(mesh.verts), cfg.print_size);
+            remesh_options.min_wall_cells = trellis::wall_cells_for(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts));
+            trellis::set_print_base(remesh_options, mesh.verts.data(), mesh.V(), print_up_axis, cfg.print_base);
+            printf("  watertight: solid remesh, band %d, minimum wall %.2f mm (%.1f cells) on a %.0f mm print\n", remesh_band,
+                   cfg.print_wall, remesh_options.min_wall_cells, cfg.print_size);
         }
         remesh_options.band = remesh_band;
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
@@ -1273,6 +1282,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             if (fixed) printf("  watertight: repair pass changed %lld faces\n", (long long)fixed);
             printf("  watertight: mesh    %s\n",
                    trellis::audit_summary(trellis::audit_mesh(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3)).c_str());
+            if (!emit_print_report(cfg, dv, df, print_up_axis)) return 1;
             fflush(stdout);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
@@ -1346,8 +1356,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::PrintOptions po;
         po.res = so.res;
         po.band = cfg.band > 0 ? cfg.band : std::max(1, so.res / 512);
-        if (cfg.band <= 0 && cfg.print_wall > 0)
-            po.band = std::max(po.band, trellis::band_for_wall(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts)));
+        po.wall_cells = trellis::wall_cells_for(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts));
         po.faces = cfg.decim == 0 ? 0 : trellis::qem_face_target(cfg);
         po.base = cfg.print_base;
         po.seal = cfg.print_seal;
@@ -1358,6 +1367,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             colors.clear();
             printf("  watertight: mesh    %s\n",
                    trellis::audit_summary(trellis::audit_mesh(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F())).c_str());
+            if (!emit_print_report(cfg, mesh.verts, mesh.faces, print_up_axis)) return 1;
         } else printf("  watertight: solid remesh produced nothing; writing the raw mesh\n");
     }
     if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply

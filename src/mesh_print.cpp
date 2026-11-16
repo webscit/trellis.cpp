@@ -267,12 +267,17 @@ int64_t repair_for_print(std::vector<float>& verts, std::vector<int32_t>& faces)
     return changes;
 }
 
-int band_for_wall(float wall_mm, float size_mm, int res, float model_extent) {
-    if (!(wall_mm > 0) || !(size_mm > 0) || res <= 0 || !(model_extent > 0)) return 1;
-    // 2*eps >= wall, with eps = band cells of at least 1/res each (the inflated grid's
-    // cells are slightly larger, which only errs on the thick side).
-    const float wall_cells = wall_mm / size_mm * model_extent * (float)res;
-    return std::min(8, std::max(1, (int)std::ceil(0.5f * wall_cells - 1e-4f)));
+float wall_cells_for(float wall_mm, float size_mm, int res, float model_extent) {
+    if (!(wall_mm > 0) || !(size_mm > 0) || res <= 0 || !(model_extent > 0)) return 0.0f;
+    return wall_mm / size_mm * model_extent * (float)res;
+}
+
+void set_print_base(RemeshOptions& remesh, const float* verts, int64_t V, int up_axis, float base) {
+    if (base == 0) return;
+    remesh.base_axis = up_axis;
+    remesh.base_auto = base < 0;
+    remesh.base_plane = base_plane_of(verts, V, up_axis, base < 0 ? 0.01f : base);
+    remesh.base_plane_max = base_plane_of(verts, V, up_axis, 0.04f);
 }
 
 float base_plane_of(const float* verts, int64_t V, int axis, float fraction) {
@@ -294,10 +299,8 @@ Mesh make_printable(const Mesh& in, const PrintOptions& options) {
     remesh.band = std::max(1, options.band);
     remesh.solid = true;
     remesh.seal = options.seal;
-    if (options.base > 0) {
-        remesh.base_axis = options.up_axis;
-        remesh.base_plane = base_plane_of(source.verts.data(), source.V(), options.up_axis, options.base);
-    }
+    remesh.min_wall_cells = options.wall_cells;
+    set_print_base(remesh, source.verts.data(), source.V(), options.up_axis, options.base);
     const auto t0 = std::chrono::steady_clock::now();
     auto lap = [&t0]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
     Mesh solid = remesh_narrow_band_dc(source.verts.data(), source.V(), source.faces.data(), source.F(),

@@ -97,13 +97,16 @@ struct TrellisParams {
     std::string out_3mf;        // --3mf PATH: also write a 3MF (mm, z-up, on the plate, textured
                                 //   when a texture was baked). Implies watertight.
     float print_size = 100.0f;  // --print-size MM: longest side of the 3MF
-    float print_base = 0.0f;    // --print-base F: cut this fraction of the height off the bottom
-                                //   for a flat bed-contact face (0 = off). Implies watertight.
+    float print_base = 0.0f;    // --print-base F|auto: cut this fraction of the height off the
+                                //   bottom for a flat bed-contact face (0 = off). auto (-1):
+                                //   the lowest cut the model stands on, else a pedestal.
+                                //   Implies watertight.
+    std::string print_report;   // --print-report PATH: write the printability report as JSON
     int   print_seal = 3;       // --print-seal N: cap tears in the decoded surface -- a point with
                                 //   fewer than N of 26 unobstructed lattice rays is interior
                                 //   (0 = off, for hollow objects such as vases; default 3)
-    float print_wall = 0.0f;    // --print-wall MM: minimum wall at print_size; widens the remesh
-                                //   band unless --band is given (0 = leave the band alone)
+    float print_wall = 0.8f;    // --print-wall MM: minimum wall at print_size; features thinner
+                                //   than this are grown locally (0 = off)
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast

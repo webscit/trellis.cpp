@@ -5,7 +5,7 @@
 //
 //   post-replay <dump.bin|triangles.obj> <out.glb> [--box-uv] [--faces N] [--atlas T]
 //               [--decim GRID] [--no-weld] [--no-fill]
-//               [--watertight] [--print-base F] [--seal N] [--no-cap-smooth] [--3mf out.3mf]
+//               [--watertight] [--print-base F] [--seal N] [--no-cap-smooth] [--wall-cells N] [--base-auto MAXF] [--3mf out.3mf]
 //               [--keep-components] [--dump-geometry mesh.obj]
 //               [--quad-match-output mesh.obj | --quad-safe-output mesh.obj]
 //               [--quad-refine-output quads.obj] [--quad-refine-forced ids.txt]
@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
     float shape_max_move = 0.001f;
     int band = 1;
     bool watertight = false, cap_smooth = true;
+    float wall_cells = 0.0f, base_auto_max = 0.0f, report_wall = 0.0f;
     float print_base = 0.0f;
     int seal = -1;
     const char* out_3mf = nullptr;
@@ -99,6 +100,9 @@ int main(int argc, char** argv) {
         else if (a == "--decim" && i+1 < argc) decim = atoi(argv[++i]);
         else if (a == "--watertight") watertight = true;
         else if (a == "--no-cap-smooth") cap_smooth = false;
+        else if (a == "--wall-cells" && i+1 < argc) { wall_cells = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--report-wall" && i+1 < argc) report_wall = (float)atof(argv[++i]);
+        else if (a == "--base-auto" && i+1 < argc) { base_auto_max = (float)atof(argv[++i]); watertight = true; }
         else if (a == "--print-base" && i+1 < argc) { print_base = (float)atof(argv[++i]); watertight = true; }
         else if (a == "--seal" && i+1 < argc) seal = atoi(argv[++i]);
         else if (a == "--3mf" && i+1 < argc) { out_3mf = argv[++i]; watertight = true; }
@@ -247,9 +251,12 @@ int main(int argc, char** argv) {
         remesh_options.solid = watertight;
         remesh_options.smooth_caps = cap_smooth;
         remesh_options.seal = seal >= 0 ? seal : (watertight ? 3 : 0);
-        if (watertight && print_base > 0) {
+        remesh_options.min_wall_cells = wall_cells;
+        if (watertight && (print_base > 0 || base_auto_max > 0)) {
             remesh_options.base_axis = 2;
             remesh_options.base_plane = trellis::base_plane_of(verts.data(), (int64_t)verts.size()/3, 2, print_base);
+            remesh_options.base_auto = base_auto_max > 0;
+            remesh_options.base_plane_max = trellis::base_plane_of(verts.data(), (int64_t)verts.size()/3, 2, base_auto_max);
         }
         rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
                                             faces.data(), (int64_t)faces.size()/3, bvh, geometry_res, remesh_options);
@@ -298,8 +305,11 @@ int main(int argc, char** argv) {
         trellis::repair_for_print(dv, df);
         printf("  watertight: %s\n", trellis::audit_summary(
             trellis::audit_mesh(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3)).c_str());
+        fputs(trellis::print_report_text(trellis::print_report(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3,
+                                                               100.0f, 2, report_wall > 0 ? report_wall : wall_cells * 100.0f / (float)geometry_res)).c_str(), stdout);
         if (out_3mf && !do_bake)
-            trellis::write_3mf(out_3mf, dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3);
+            if (!trellis::write_3mf(out_3mf, dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3))
+                fprintf(stderr, "cannot write %s\n", out_3mf);
     }
     if (shape_flips) {
         auto result = trellis::flip_skinny_triangles(dv,df,shape_min_angle);

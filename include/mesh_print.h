@@ -48,10 +48,9 @@ int weld_exact(std::vector<float>& verts, std::vector<int32_t>& faces);
 // unchanged. Returns the number of faces removed + added + flipped.
 int64_t repair_for_print(std::vector<float>& verts, std::vector<int32_t>& faces);
 
-// Narrow-band remesh band for a minimum printed wall. A sheet with no thickness comes out
-// of the solid remesh 2*eps thick (eps = band cells of the inflated grid); this is the
-// smallest band whose 2*eps is at least wall_mm on a model printed size_mm long. Capped at 8.
-int band_for_wall(float wall_mm, float size_mm, int res, float model_extent);
+// A wall of wall_mm on a model printed size_mm long, in remesh grid cells
+// (RemeshOptions::min_wall_cells). model_extent is the model's longest side in mesh units.
+float wall_cells_for(float wall_mm, float size_mm, int res, float model_extent);
 
 // Complete geometry-only path for an arbitrary triangle mesh in the TRELLIS frame
 // ([-0.5, 0.5]^3, as normalize_mesh_trellis leaves it): weld, solid remesh at `res`,
@@ -59,13 +58,45 @@ int band_for_wall(float wall_mm, float size_mm, int res, float model_extent);
 // runs the same steps interleaved with its texture bake.
 struct PrintOptions {
     int   res = 512;            // remesh grid resolution
-    int   band = 1;             // remesh band (see band_for_wall)
+    int   band = 1;             // remesh band
     int   faces = 300000;       // decimation target; <= 0 keeps the full remesh
-    float base = 0.0f;          // fraction of the height cut off for a flat base; 0 = none
+    float base = 0.0f;          // fraction of the height cut off for a flat base; 0 = none;
+                                //   < 0 = automatic: the lowest stable cut, else a pedestal
+    float wall_cells = 0.0f;    // RemeshOptions::min_wall_cells (see wall_cells_for); 0 = off
     int   up_axis = 2;          // axis the base is perpendicular to (TRELLIS: z)
     int   seal = 3;             // RemeshOptions::seal: cap tears in the surface; 0 = flood only
 };
 Mesh make_printable(const Mesh& in, const PrintOptions& options);
+
+// Fills RemeshOptions' base fields from a PrintOptions-style `base` value (see above):
+// a fixed cut at that fraction of the height, or, when negative, the stability search
+// between 1 % and 4 % of the height with a pedestal as the fallback. 0 leaves them off.
+struct RemeshOptions;
+void set_print_base(RemeshOptions& remesh, const float* verts, int64_t V, int up_axis, float base);
+
+// What will matter on the printer, measured on the final mesh at its printed size.
+struct PrintReport {
+    MeshAudit audit;
+    float  size_mm[3] = {0, 0, 0};   // footprint x, footprint y, height
+    double volume_cm3 = 0, area_cm2 = 0;
+    float  wall_target_mm = 0;       // the wall the model was asked to have (0.8 if unset)
+    float  wall_p1_mm = 0;           // wall thickness under the thinnest 1 % of the surface
+    bool   wall_capped = false;      // wall_p1_mm is a lower bound (thicker than measured range)
+    double thin_area_pct = 0;        // surface share thinner than the target
+    bool   flat_base = false;        // touches the plate on an area, not on points
+    float  base_area_mm2 = 0;        // convex hull of the contact
+    bool   stands = false;           // centre of mass over the contact hull
+    float  tip_angle_deg = 0;        // tilt needed to topple it
+    double overhang_pct = 0;         // surface share facing down steeper than 45 degrees
+    std::vector<std::string> warnings;
+    bool ok() const { return warnings.empty(); }
+};
+// `verts` in any frame with `up_axis` pointing up; size_mm as for write_3mf; wall_mm is the
+// target the thin-area share is measured against (<= 0: 0.8 mm).
+PrintReport print_report(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                         float size_mm, int up_axis = 2, float wall_mm = 0.0f);
+std::string print_report_text(const PrintReport& report);   // indented log block
+std::string print_report_json(const PrintReport& report);   // one JSON object
 
 // Base-cut plane for RemeshOptions: `fraction` of the way up the mesh's extent on `axis`.
 float base_plane_of(const float* verts, int64_t V, int axis, float fraction);

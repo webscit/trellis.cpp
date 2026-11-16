@@ -49,7 +49,8 @@ public:
         const unsigned char* payload = data;
         size_t stored = size;
         unsigned char* packed = nullptr;
-        if (compress && size > 0 && size < 0x7FFFFFFFu) {
+        // stb's encoder sizes its buffers with int; very large parts are stored instead.
+        if (compress && size > 0 && size < (256u << 20)) {
             int length = 0;
             packed = stbi_zlib_compress(const_cast<unsigned char*>(data), (int)size, &length, 8);
             // zlib stream = 2-byte header + raw deflate + 4-byte adler32

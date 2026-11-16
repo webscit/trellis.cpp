@@ -49,6 +49,19 @@ static Mesh box(float half, int skip = -1) {
     return m;
 }
 
+// A 0.6 x 0.6 sheet with no thickness: lying in z = 0, or standing in y = 0.
+static Mesh flat_sheet(bool vertical) {
+    Mesh m;
+    const float o = 0.3f;
+    const float p[4][2] = {{-o, -o}, {o, -o}, {o, o}, {-o, o}};
+    for (const auto& q : p) {
+        const float v[3] = {q[0], vertical ? 0.0f : q[1], vertical ? q[1] : 0.0f};
+        m.verts.insert(m.verts.end(), v, v + 3);
+    }
+    m.faces = {0, 1, 2, 0, 2, 3};
+    return m;
+}
+
 static MeshAudit audit(const Mesh& m) { return audit_mesh(m.verts.data(), m.V(), m.faces.data(), m.F()); }
 
 static Mesh remesh(const Mesh& m, int res, const RemeshOptions& options) {
@@ -242,8 +255,51 @@ int main(int argc, char** argv) {
         CHECK(repair_for_print(m.verts, m.faces) == 0, "repair is not idempotent");
     }
 
-    CHECK(band_for_wall(0, 100, 512, 1) == 1 && band_for_wall(0.39f, 100, 512, 1) == 1 &&
-          band_for_wall(0.8f, 100, 512, 1) == 3 && band_for_wall(50, 100, 512, 1) == 8, "band_for_wall");
+    CHECK(wall_cells_for(0, 100, 512, 1) == 0 && std::fabs(wall_cells_for(0.8f, 100, 512, 1) - 4.096f) < 1e-3f, "wall_cells_for");
+
+    {   // Thin walls: a sheet with no thickness comes out 2 cells thick; asked for 6 it is
+        // grown to about that, while a thick box next to the same option does not change.
+        const Mesh sheet = flat_sheet(false);
+        RemeshOptions wall = solid;
+        wall.min_wall_cells = 6.0f;
+        const MeshAudit thin = audit(remesh(sheet, res, solid)), grown = audit(remesh(sheet, res, wall));
+        const float t0 = (thin.bbox_max[2] - thin.bbox_min[2]) / cell, t1 = (grown.bbox_max[2] - grown.bbox_min[2]) / cell;
+        CHECK(thin.watertight() && t0 > 1.5f && t0 < 3.0f, "plain sheet is %g cells thick", t0);
+        CHECK(grown.watertight() && grown.components == 1 && t1 > 5.0f && t1 < 9.0f, "grown sheet is %g cells thick: %s", t1, audit_summary(grown).c_str());
+        const double plain_box = audit(remesh(box(0.3f), res, solid)).volume, walled_box = audit(remesh(box(0.3f), res, wall)).volume;
+        CHECK(std::fabs(walled_box - plain_box) < 0.01 * plain_box, "a thick box changed under min_wall_cells: %g vs %g", walled_box, plain_box);
+    }
+
+    {   // Report and stance. A big block on a small off-centre foot falls over; the automatic
+        // base cannot fix that by cutting, so it adds a pedestal, and then the model stands.
+        Mesh lean;
+        add_box(lean, std::array<float, 3>{-0.30f, -0.05f, -0.30f}.data(), std::array<float, 3>{-0.20f, 0.05f, -0.10f}.data());
+        add_box(lean, std::array<float, 3>{-0.30f, -0.15f, -0.10f}.data(), std::array<float, 3>{0.30f, 0.15f, 0.20f}.data());
+        RemeshOptions flat = solid;
+        set_print_base(flat, lean.verts.data(), lean.V(), 2, 0.02f);
+        const Mesh a = remesh(lean, res, flat);
+        const PrintReport falls = print_report(a.verts.data(), a.V(), a.faces.data(), a.F(), 100.0f);
+        CHECK(falls.audit.watertight() && falls.flat_base && !falls.stands && !falls.ok(), "leaning block: %s", print_report_text(falls).c_str());
+        RemeshOptions stable = solid;
+        set_print_base(stable, lean.verts.data(), lean.V(), 2, -1.0f);
+        const Mesh b = remesh(lean, res, stable);
+        const PrintReport stands = print_report(b.verts.data(), b.V(), b.faces.data(), b.F(), 100.0f);
+        CHECK(stands.audit.watertight() && stands.audit.components == 1 && stands.flat_base && stands.stands && stands.tip_angle_deg > 10.0f,
+              "pedestal: %s", print_report_text(stands).c_str());
+        CHECK(std::fabs(stands.size_mm[2] - 100.0f) < 30.0f && stands.volume_cm3 > 0, "report size %g mm, volume %g", stands.size_mm[2], stands.volume_cm3);
+
+        // A plain box on its cut base: stands, thick walls, no warnings; the JSON says so.
+        RemeshOptions cut = solid;
+        set_print_base(cut, box(0.3f).verts.data(), 8, 2, 0.05f);
+        const Mesh c = remesh(box(0.3f), res, cut);
+        const PrintReport fine = print_report(c.verts.data(), c.V(), c.faces.data(), c.F(), 100.0f);
+        CHECK(fine.ok() && fine.stands && fine.tip_angle_deg > 30.0f && fine.thin_area_pct < 0.5, "box report: %s", print_report_text(fine).c_str());
+        CHECK(print_report_json(fine).find("\"ok\":true") != std::string::npos, "report json: %s", print_report_json(fine).c_str());
+        // The 2-cell sheet at 100 mm is about 3 mm thick here; ask for 10 mm and it is all thin.
+        const Mesh d = remesh(flat_sheet(true), res, cut);
+        const PrintReport thin_report = print_report(d.verts.data(), d.V(), d.faces.data(), d.F(), 100.0f, 2, 10.0f);
+        CHECK(thin_report.thin_area_pct > 50.0 && !thin_report.ok(), "thin sheet report: %s", print_report_text(thin_report).c_str());
+    }
 
     if (argc > 1) {
         Mesh m;

@@ -27,11 +27,12 @@ static void usage() {
         "      --res N         remesh grid resolution, 64..1536 (default 512)\n"
         "      --faces N       triangle budget; 0 keeps the full remesh (default 300000)\n"
         "      --size MM       longest side of the print in millimetres (default 100)\n"
-        "      --base FRACTION cut this fraction of the height off the bottom for a flat base,\n"
-        "                      0..0.5 (default 0 = off)\n"
-        "      --wall MM       minimum wall thickness at --size; widens the remesh band, which\n"
-        "                      also fattens the whole model by half of it (default 0 = band 1)\n"
-        "      --band N        force the remesh band width in cells (overrides --wall)\n"
+        "      --base F|auto   cut this fraction of the height off the bottom for a flat base,\n"
+        "                      0..0.5 (default 0 = off); auto = the lowest cut the model stands\n"
+        "                      on, else a pedestal under it\n"
+        "      --wall MM       minimum wall thickness at --size (default 0.8): thinner fins and\n"
+        "                      edges are grown, and only they are. 0 = off\n"
+        "      --band N        remesh band width in cells (default 1)\n"
         "      --seal N        close tears: fill points that see open space along fewer than N\n"
         "                      of 26 directions (default 3; 0 = off, for deep hollow objects)\n"
         "      --glb PATH      also write the solid as an untextured GLB\n");
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
     if (argc < 3) { usage(); return 1; }
     const std::string input = argv[1], output = argv[2];
     PrintOptions options;
-    float size_mm = 100.0f, wall_mm = 0.0f;
+    float size_mm = 100.0f, wall_mm = 0.8f;
     int band = 0;
     std::string glb;
     for (int i = 3; i < argc; ++i) {
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
         if      (a == "--res")   { if (!number(64, 1536, n)) return 1; options.res = (int)n; }
         else if (a == "--faces") { if (!number(0, 2e9f, n)) return 1; options.faces = (int)n; }
         else if (a == "--size")  { if (!number(1e-3f, 1e6f, size_mm)) return 1; }
+        else if (a == "--base" && v && std::string(v) == "auto") { options.base = -1.0f; ++i; }
         else if (a == "--base")  { if (!number(0, 0.5f, options.base)) return 1; }
         else if (a == "--wall")  { if (!number(0, 1e6f, wall_mm)) return 1; }
         else if (a == "--band")  { if (!number(1, 8, n)) return 1; band = (int)n; }
@@ -82,15 +84,17 @@ int main(int argc, char** argv) {
         printf("input   %s\n", audit_summary(audit_mesh(welded.verts.data(), welded.V(), welded.faces.data(), welded.F())).c_str());
     }
     // normalize_mesh_trellis scales the longest side to ~1, so the model extent is 1.
-    options.band = band > 0 ? band : band_for_wall(wall_mm, size_mm, options.res, 1.0f);
-    printf("solid remesh @res %d, band %d: thinnest wall %.2f mm at %.0f mm\n", options.res, options.band,
-           2.0f * options.band / options.res * size_mm, size_mm);
+    options.band = band > 0 ? band : 1;
+    options.wall_cells = wall_cells_for(wall_mm, size_mm, options.res, 1.0f);
+    printf("solid remesh @res %d, band %d, minimum wall %.2f mm (%.1f cells) at %.0f mm\n", options.res, options.band,
+           wall_mm, options.wall_cells, size_mm);
     fflush(stdout);
 
     Mesh solid = make_printable(mesh, options);
     if (solid.F() == 0) { fprintf(stderr, "[trellis-print] remesh produced no surface\n"); return 1; }
     const MeshAudit audit = audit_mesh(solid.verts.data(), solid.V(), solid.faces.data(), solid.F());
     printf("output  %s\n", audit_summary(audit).c_str());
+    fputs(print_report_text(print_report(solid.verts.data(), solid.V(), solid.faces.data(), solid.F(), size_mm, 2, wall_mm)).c_str(), stdout);
 
     if (!write_3mf(output.c_str(), solid.verts.data(), solid.V(), solid.faces.data(), solid.F(), size_mm)) {
         fprintf(stderr, "[trellis-print] cannot write %s\n", output.c_str());

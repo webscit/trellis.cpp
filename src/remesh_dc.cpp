@@ -331,6 +331,9 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         // Exterior = open vertices 6-connected to the domain boundary (the inflated domain
         // keeps every boundary vertex free). Scanline flood along z, the bitset's fast axis.
         // `seen` = wall | shut | visited, so one lookup answers "may the flood enter here".
+        // Called again after anything that adds solid, so no pocket of exterior is left
+        // enclosed (an enclosed pocket would be an inside-out shell in the output).
+        auto fill_unreachable = [&]() {
         std::vector<uint64_t> seen = wall;
         auto is_seen = [&seen](int64_t b) -> bool { return (seen[(size_t)(b >> 6)] >> (b & 63)) & 1; };
         std::vector<int64_t> stack;
@@ -362,11 +365,120 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         }
         // wall := solid = everything the flood did not reach (band, shut, cavities).
         for (size_t w = 0; w < wall.size(); ++w) wall[w] |= ~seen[w];
-        std::vector<uint64_t>().swap(seen);
+        };
+        fill_unreachable();
         auto is_solid = [&wall, &vbit](int x, int y, int z) -> bool {
             const int64_t b = vbit(x, y, z);
             return (wall[(size_t)(b >> 6)] >> (b & 63)) & 1;
         };
+
+        // Thin features. The band guarantees 2*band cells of material; a fin, a blade edge
+        // or a strand thinner than `min_wall_cells` is grown, and only it. One cell per
+        // side per pass:
+        //   depth  = chamfer distance of each solid vertex to the exterior (near the surface);
+        //   core   = solid deeper than half the wall: material that is already thick enough;
+        //   thin   = shallow solid farther than 1.6*r from any core. (A flat thick surface is r
+        //            from its core; the extra 0.6*r keeps the
+        //            sliver that an opening shaves off an ordinary convex edge out of it.)
+        // and thin vertices take their exterior 6-neighbours. The new surface lies outside
+        // the narrow band, so it is extracted and smoothed with the caps.
+        int64_t thickened = 0;
+        int thicken_passes = 0;
+        if (options.min_wall_cells > 2.0f * (float)band + 0.5f) {
+            if (n * n * n > 1400000000ll) {
+                printf("  remesh_solid: grid too large for wall thickening (res %d); skipped\n", res);
+            } else {
+                const float r = 0.5f * options.min_wall_cells;          // cells
+                const int deep = (int)std::floor(3.0f * r);             // chamfer units (3 = one cell)
+                const int cap = deep + 5;
+                const int near_core = (int)std::ceil(1.6f * 3.0f * r);
+                std::vector<uint8_t> depth((size_t)(n * n * n));
+                auto solid_at = [&wall](int64_t b) -> bool { return (wall[(size_t)(b >> 6)] >> (b & 63)) & 1; };
+                const int max_passes = (int)std::ceil(r) - band + 1;
+                for (int pass = 0; pass < max_passes; ++pass) {
+                    std::fill(depth.begin(), depth.end(), (uint8_t)0);
+                    // Surface layer: solid vertices with an exterior 6-neighbour.
+                    std::vector<std::vector<int64_t>> rim((size_t)std::max(1u, std::thread::hardware_concurrency()) + 1);
+                    {
+                        std::atomic<int> next_part{0};
+                        parallel_for(n, [&](int64_t xb, int64_t xe) {
+                            std::vector<int64_t>& part = rim[(size_t)next_part.fetch_add(1)];
+                            for (int64_t x = xb; x < xe; ++x)
+                                for (int64_t y = 0; y < n; ++y)
+                                    for (int64_t z = 0; z < n; ++z) {
+                                        const int64_t b = (x * n + y) * n + z;
+                                        if (!solid_at(b)) continue;
+                                        if ((x > 0 && !solid_at(b - n * n)) || (x < n - 1 && !solid_at(b + n * n)) ||
+                                            (y > 0 && !solid_at(b - n)) || (y < n - 1 && !solid_at(b + n)) ||
+                                            (z > 0 && !solid_at(b - 1)) || (z < n - 1 && !solid_at(b + 1)))
+                                            part.push_back(b);
+                                    }
+                        });
+                    }
+                    // Chamfer flood inward; first pop of a vertex is its shortest distance.
+                    std::vector<std::vector<int64_t>> bucket((size_t)cap + 6);
+                    for (auto& part : rim) { bucket[3].insert(bucket[3].end(), part.begin(), part.end()); std::vector<int64_t>().swap(part); }
+                    std::vector<int64_t> shallow;
+                    auto neighbours = [&](int64_t b, const std::function<void(int64_t, int)>& visit) {
+                        const int64_t x = b / (n * n), y = (b / n) % n, z = b % n;
+                        for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
+                            const int steps = (dx != 0) + (dy != 0) + (dz != 0);
+                            if (!steps) continue;
+                            const int64_t X = x + dx, Y = y + dy, Z = z + dz;
+                            if (X < 0 || X >= n || Y < 0 || Y >= n || Z < 0 || Z >= n) continue;
+                            visit((X * n + Y) * n + Z, 2 + steps);
+                        }
+                    };
+                    for (int d = 3; d <= cap; ++d) {
+                        for (size_t k = 0; k < bucket[(size_t)d].size(); ++k) {
+                            const int64_t b = bucket[(size_t)d][k];
+                            if (depth[(size_t)b]) continue;
+                            depth[(size_t)b] = (uint8_t)d;
+                            if (d <= deep) shallow.push_back(b);
+                            neighbours(b, [&](int64_t q, int w) {
+                                if (d + w <= cap && solid_at(q) && !depth[(size_t)q]) bucket[(size_t)(d + w)].push_back(q);
+                            });
+                        }
+                        std::vector<int64_t>().swap(bucket[(size_t)d]);
+                    }
+                    // Shallow vertices within reach of a core vertex (depth > deep, or never
+                    // reached = deeper than the cap) are marked with bit 7.
+                    bucket.assign((size_t)near_core + 6, {});
+                    for (const int64_t b : shallow)
+                        neighbours(b, [&](int64_t q, int w) {
+                            if (solid_at(q) && (depth[(size_t)q] == 0 || (depth[(size_t)q] & 0x7f) > deep) && w <= near_core)
+                                bucket[(size_t)w].push_back(b);
+                        });
+                    for (int d = 3; d <= near_core; ++d) {
+                        for (size_t k = 0; k < bucket[(size_t)d].size(); ++k) {
+                            const int64_t b = bucket[(size_t)d][k];
+                            if (depth[(size_t)b] & 0x80) continue;
+                            depth[(size_t)b] |= 0x80;
+                            neighbours(b, [&](int64_t q, int w) {
+                                if (d + w > near_core || !solid_at(q)) return;
+                                const uint8_t dq = depth[(size_t)q];
+                                if (dq == 0 || (dq & 0x80) || (dq & 0x7f) > deep) return;
+                                bucket[(size_t)(d + w)].push_back(q);
+                            });
+                        }
+                        std::vector<int64_t>().swap(bucket[(size_t)d]);
+                    }
+                    int64_t grown = 0;
+                    for (const int64_t b : shallow) {
+                        if (depth[(size_t)b] & 0x80) continue;   // supported by thick material
+                        const int64_t x = b / (n * n), y = (b / n) % n, z = b % n;
+                        const int64_t q[6] = {x > 1 ? b - n * n : -1, x < n - 2 ? b + n * n : -1, y > 1 ? b - n : -1,
+                                              y < n - 2 ? b + n : -1, z > 1 ? b - 1 : -1, z < n - 2 ? b + 1 : -1};
+                        for (const int64_t t : q)
+                            if (t >= 0 && !solid_at(t)) { wall[(size_t)(t >> 6)] |= 1ull << (t & 63); ++grown; }
+                    }
+                    if (!grown) break;
+                    thickened += grown;
+                    ++thicken_passes;
+                }
+                if (thickened) fill_unreachable();
+            }
+        }
 
         // Flat base: the solid was classified on the whole object first (cutting before
         // the flood would let it in through the cut and hollow the model out); now every
@@ -375,6 +487,92 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             base_axis = options.base_axis;
             const float g = (options.base_plane / scale + 0.5f) * (float)res;   // plane, grid units
             base_layer = std::min(res - 1, std::max(1, (int)std::lround(g + 0.5f)));
+            // Stability (base_auto): the lowest cut, between base_plane and base_plane_max,
+            // whose footprint (convex hull of the first kept layer) holds the centre of mass
+            // with `base_tip_deg` of tilt to spare. If none does, the lowest cut is kept and
+            // a pedestal is added under it: the convex hull of the footprint and of a circle
+            // around the centre of mass wide enough for that tilt.
+            std::vector<std::pair<int, int>> pedestal;   // hull, counter-clockwise, closed
+            int pedestal_layers = 0;
+            if (options.base_auto) {
+                const float gmax = (options.base_plane_max / scale + 0.5f) * (float)res;
+                const int last = std::min(res - 1, std::max(base_layer, (int)std::lround(gmax + 0.5f)));
+                const int u = (base_axis + 1) % 3, v = (base_axis + 2) % 3;
+                std::vector<double> count((size_t)n, 0), sum_u((size_t)n, 0), sum_v((size_t)n, 0);
+                std::vector<std::vector<std::pair<int, int>>> layer((size_t)(last - base_layer + 1));
+                for (size_t w = 0; w < wall.size(); ++w) {
+                    uint64_t bits = wall[w];
+                    while (bits) {
+                        const int64_t bit = (int64_t)(w << 6) | ctz64(bits);
+                        bits &= bits - 1;
+                        if (bit >= n * n * n) break;
+                        const int c[3] = {(int)(bit / (n * n)), (int)((bit / n) % n), (int)(bit % n)};
+                        const int l = c[base_axis];
+                        count[(size_t)l] += 1; sum_u[(size_t)l] += c[u]; sum_v[(size_t)l] += c[v];
+                        if (l >= base_layer && l <= last) layer[(size_t)(l - base_layer)].emplace_back(c[u], c[v]);
+                    }
+                }
+                typedef std::pair<int, int> P2;
+                auto convex_hull = [](std::vector<P2> pts) {
+                    std::sort(pts.begin(), pts.end());
+                    pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+                    std::vector<P2> hull(2 * pts.size() + 1);
+                    auto cross = [](const P2& o, const P2& p, const P2& q) {
+                        return (int64_t)(p.first - o.first) * (q.second - o.second) - (int64_t)(p.second - o.second) * (q.first - o.first);
+                    };
+                    size_t h = 0;
+                    if (pts.size() < 3) return std::vector<P2>();
+                    for (size_t i = 0; i < pts.size(); ++i) { while (h >= 2 && cross(hull[h-2], hull[h-1], pts[i]) <= 0) --h; hull[h++] = pts[i]; }
+                    for (size_t i = pts.size() - 1, lower = h + 1; i-- > 0;) { while (h >= lower && cross(hull[h-2], hull[h-1], pts[i]) <= 0) --h; hull[h++] = pts[i]; }
+                    hull.resize(h);
+                    return h >= 4 ? hull : std::vector<P2>();
+                };
+                struct Stance { float angle = -90.0f; double mu = 0, mv = 0, ml = 0; };
+                auto stance = [&](int k) {
+                    Stance st;
+                    double m = 0;
+                    for (int l = k; l < n; ++l) { m += count[(size_t)l]; st.mu += sum_u[(size_t)l]; st.mv += sum_v[(size_t)l]; st.ml += count[(size_t)l] * l; }
+                    if (m <= 0) return st;
+                    st.mu /= m; st.mv /= m; st.ml /= m;
+                    const std::vector<P2> hull = convex_hull(layer[(size_t)(k - base_layer)]);
+                    if (hull.empty()) return st;
+                    double margin = 1e30;   // inside a counter-clockwise hull: distance to the nearest edge
+                    for (size_t i = 0; i + 1 < hull.size(); ++i) {
+                        const double ex = hull[i+1].first - hull[i].first, ey = hull[i+1].second - hull[i].second;
+                        const double len = std::sqrt(ex * ex + ey * ey);
+                        if (len > 0) margin = std::min(margin, (ex * (st.mv - hull[i].second) - ey * (st.mu - hull[i].first)) / len);
+                    }
+                    st.angle = (float)(std::atan2(margin, std::max(0.5, st.ml - ((double)k - 0.5))) * 57.29577951308232);
+                    return st;
+                };
+                const Stance lowest = stance(base_layer);
+                int chosen = -1;
+                float chosen_angle = lowest.angle;
+                for (int k = base_layer; k <= last && chosen < 0; ++k) {
+                    const float angle = k == base_layer ? lowest.angle : stance(k).angle;
+                    if (angle >= options.base_tip_deg) { chosen = k; chosen_angle = angle; }
+                }
+                if (chosen >= 0) {
+                    printf("  remesh_solid: stable base at layer %d (lowest %d): tips over at %.1f deg\n", chosen, base_layer, chosen_angle);
+                    base_layer = chosen;
+                } else {
+                    // Pedestal under the lowest cut: about 1.5 % of the grid thick.
+                    pedestal_layers = std::min(base_layer - 1, std::max(3, (int)std::lround(0.015f * res)));
+                    const double height = lowest.ml - ((double)(base_layer - pedestal_layers) - 0.5);
+                    const double radius = height * std::tan(options.base_tip_deg * 0.017453292519943295) + 1.0;
+                    std::vector<P2> pts = layer[0];
+                    for (int i = 0; i < 64; ++i) {
+                        const double t = 6.283185307179586 * i / 64.0;
+                        pts.emplace_back(std::min((int)n - 2, std::max(1, (int)std::lround(lowest.mu + radius * std::cos(t)))),
+                                         std::min((int)n - 2, std::max(1, (int)std::lround(lowest.mv + radius * std::sin(t)))));
+                    }
+                    pedestal = convex_hull(pts);
+                    if (pedestal.empty()) pedestal_layers = 0;
+                    printf("  remesh_solid: base at layer %d tips over at %.1f deg (target %.0f) and no cut up to layer %d fixes it;"
+                           " %s\n", base_layer, lowest.angle, options.base_tip_deg, last,
+                           pedestal_layers ? "adding a pedestal" : "no pedestal possible");
+                }
+            }
             const int u = (base_axis + 1) % 3, v = (base_axis + 2) % 3;
             int p[3];
             for (p[base_axis] = 0; p[base_axis] < base_layer; ++p[base_axis])
@@ -383,6 +581,27 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                         const int64_t b = vbit(p[0], p[1], p[2]);
                         wall[(size_t)(b >> 6)] &= ~(1ull << (b & 63));
                     }
+            if (pedestal_layers > 0) {
+                int lo[2] = {(int)n, (int)n}, hi[2] = {0, 0};
+                for (const auto& q : pedestal) {
+                    lo[0] = std::min(lo[0], q.first); hi[0] = std::max(hi[0], q.first);
+                    lo[1] = std::min(lo[1], q.second); hi[1] = std::max(hi[1], q.second);
+                }
+                for (p[u] = lo[0]; p[u] <= hi[0]; ++p[u])
+                    for (p[v] = lo[1]; p[v] <= hi[1]; ++p[v]) {
+                        bool inside = true;
+                        for (size_t i = 0; i + 1 < pedestal.size() && inside; ++i)
+                            inside = (int64_t)(pedestal[i+1].first - pedestal[i].first) * (p[v] - pedestal[i].second) -
+                                     (int64_t)(pedestal[i+1].second - pedestal[i].second) * (p[u] - pedestal[i].first) >= 0;
+                        if (!inside) continue;
+                        for (p[base_axis] = base_layer - pedestal_layers; p[base_axis] < base_layer; ++p[base_axis]) {
+                            const int64_t b = vbit(p[0], p[1], p[2]);
+                            wall[(size_t)(b >> 6)] |= 1ull << (b & 63);
+                        }
+                    }
+                base_layer -= pedestal_layers;   // the print now stands on the pedestal's underside
+                fill_unreachable();              // e.g. the hollow under an arched sole
+            }
         }
 
         // Re-sign the field. A filled vertex (f >= 0 but not exterior) goes negative, a cut
@@ -438,6 +657,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         printf("  remesh_solid: %lld vertices filled, %lld cells outside the band (caps%s)",
                (long long)filled, (long long)extra_cells, base_axis >= 0 ? ", base" : "");
         if (options.seal > 0) printf("; openness < %d of 26 shut (%lld coarse vertices)", options.seal, (long long)shut_coarse);
+        if (thickened) printf("; thin walls grown by %lld vertices in %d passes", (long long)thickened, thicken_passes);
         if (base_axis >= 0)
             printf("; flat base on axis %d at %.4f (%lld vertices cut)", base_axis,
                    (((float)base_layer - 0.5f) / res - 0.5f) * scale, (long long)cut_away);

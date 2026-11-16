@@ -55,6 +55,15 @@ struct RemeshOptions {
     // has a bed-contact surface. The plane snaps to the nearest half grid layer. -1 = off.
     int   base_axis = -1;
     float base_plane = 0.0f;
+    // Stability search (with base_axis): raise the cut from base_plane, at most to
+    // base_plane_max, until the model would have to tilt base_tip_deg before its centre of
+    // mass leaves the footprint; if no cut gets there, the most stable one is used.
+    bool  base_auto = false;
+    float base_plane_max = 0.0f;
+    float base_tip_deg = 15.0f;
+    // Solid only: minimum wall thickness in grid cells. Features thinner than this (and
+    // only those) are grown; 0 = off. The band already guarantees 2*band cells.
+    float min_wall_cells = 0.0f;
 };
 Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
                            const TriBvh& bvh, int res, const RemeshOptions& options);
