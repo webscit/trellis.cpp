@@ -67,8 +67,13 @@ void decimate_simplify(const std::vector<float>& verts, int V, const std::vector
 // Garland-Heckbert quadrics + a skinny-triangle shape penalty + flip rejection + boundary
 // weighting, driven by the reference threshold ladder. Produces the reference's adaptive,
 // low-sliver triangulation from a dense dual-contour mesh, unlike the meshopt/FQMS path.
+// `keep_topology` rejects every collapse that fails the link condition (the edge has two
+// faces and its endpoints share exactly two neighbours), so a closed 2-manifold stays one:
+// no pinches, fins or holes. It runs on the CPU path only (the GPU kernels do not carry the
+// check). Also enabled by the TRELLIS_QEM_PRESERVE_TOPOLOGY environment variable.
 void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                  int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+                  int target_faces, std::vector<float>& ov, std::vector<int32_t>& of,
+                  bool keep_topology = false);
 
 // Drop connected components (shared-vertex face adjacency) whose face count is below
 // frac*(largest component's). Removes decode floaters + spurious ground fragments (which

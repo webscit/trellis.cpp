@@ -89,6 +89,19 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
 - ☑ Server job API (`/jobs`): FIFO queue, poll + fetch, so long runs survive client/proxy
       response timeouts; Studio uses it and resumes pending jobs after a reload
 
+## M8 — 3D printing
+- ☑ `--watertight`: signed field from an exterior flood fill + openness vote (caps the tears
+      in the decoded surface), marching cubes by cycles (closed 2-manifold by construction),
+      link-condition QEM, audit of the mesh and of the GLB buffer (spec 32)
+- ☑ `--3mf`: textured 3MF in mm, z-up, on the plate; `--print-size`, `--print-base` (exact
+      planar base), `--print-wall`, `--print-seal`; server fields + `/jobs/{id}/3mf`;
+      `trellis-print` for existing meshes; Studio "3D print" toggle
+- ☐ Finer openness sampling (26 rays cannot tell a deep vase from a torn figurine)
+- ☐ Smooth the caps over sealed tears (they are stair-stepped at the vote's grid)
+- ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
+- ☑ Studio export split button (GLB / 3MF)
+- ☐ Per-vertex colour for slicers that ignore textures
+
 ## Validation strategy
 Full reference env needs CUDA-only extensions (o-voxel, flash-attn, spconv, nvdiffrast) that
 don't all install here, so we validate **per-component**: dump reference outputs for each module

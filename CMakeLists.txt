@@ -114,6 +114,8 @@ add_library(trellis_core STATIC
   thirdparty/meshoptimizer/simplifier.cpp
   src/tri_bvh.cpp
   src/remesh_dc.cpp
+  src/mesh_print.cpp
+  src/mesh_3mf.cpp
   src/decimate_qem.cpp
   src/mesh_shape.cpp
   src/quad_refinement.cpp
@@ -462,6 +464,15 @@ set_target_properties(trellis-test-sparse-degenerate PROPERTIES BUILD_RPATH "${G
 add_executable(trellis-test-shape-dec src/test_shape_dec.cpp)
 target_link_libraries(trellis-test-shape-dec PRIVATE trellis_core)
 set_target_properties(trellis-test-shape-dec PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
+# 3D-print readiness (docs/spec/32-print-ready.md): CPU-only tool + test.
+add_executable(trellis-print src/trellis_print.cpp)
+target_link_libraries(trellis-print PRIVATE trellis_core)
+set_target_properties(trellis-print PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
+add_executable(trellis-test-mesh-print src/test_mesh_print.cpp)
+target_link_libraries(trellis-test-mesh-print PRIVATE trellis_core)
+set_target_properties(trellis-test-mesh-print PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
 add_executable(trellis-test-mesh-io src/test_mesh_io.cpp)
 target_link_libraries(trellis-test-mesh-io PRIVATE trellis_core)

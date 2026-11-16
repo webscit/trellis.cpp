@@ -86,8 +86,8 @@ click → rotate the result.
    (xatlas / box). Defaults match the CLI.
 3. **Generate 3D** — this takes a few minutes; a live stage line shows progress.
 4. **Inspect** — rotate and zoom in the interactive preview (Google's three.js-based
-   `<model-viewer>`); **Reset view** re-frames the camera and **Save GLB…** exports
-   the model.
+   `<model-viewer>`); **Reset view** re-frames the camera and **Export to GLB** saves
+   the model; the arrow beside it picks the format (GLB, or 3MF when "3D print" was on).
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
    the app.
@@ -162,6 +162,8 @@ Other useful CLI flags:
 | `--no-texture` | geometry only |
 | `--faces N` | QEM decimation face target, ≥ 1000 (default 300K @1024/1536, 150K @512). Lower gives lighter game/web assets and a faster UV unwrap; the baked texture keeps the surface detail |
 | `--decim GRID` | legacy cluster-grid decimation instead of QEM (`0` = keep the full-res mesh); not combinable with `--faces` |
+| `--watertight` | 3D-print ready: one closed, manifold, outward-oriented solid instead of the hollow double shell (see [3D printing](#3d-printing)) |
+| `--3mf PATH` | also write a textured 3MF for slicers — millimetres, z-up, on the build plate (implies `--watertight`) |
 | `--atlas PX` | UV atlas size (default 2048 @1024 / 1024 @512) |
 | `--box-uv` | voxel-native 6-way box projection instead of the default xatlas unwrap (O(faces), faster, looser packing) |
 | `--seed N` | RNG seed |
@@ -238,6 +240,30 @@ branch, so a guided step costs V+1 forwards, not 2V. Peak VRAM is unchanged. Wit
 image the output is bit-identical to before. Pixal3D is single-view only. See
 [`docs/spec/30-multiview.md`](docs/spec/30-multiview.md) for the method, the axis convention
 and the test results.
+
+### 3D printing
+
+The default GLB is built for rendering: it is a hollow double shell with a 0.4 % wall, hundreds
+of non-manifold edges and no unit. `--watertight` rebuilds it as one solid a slicer accepts, and
+`--3mf` writes it at a real size with the texture.
+
+```bash
+trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base 0.02
+```
+
+| Flag | Effect |
+|---|---|
+| `--watertight` | exterior flood fill + openness vote → closed manifold extraction → topology-preserving decimation; prints a watertightness audit. The GLB itself is the solid |
+| `--3mf PATH` | 3MF: mm, z-up, lowest point on the plate, base-colour texture embedded |
+| `--print-size MM` | longest side of the 3MF (default 100) |
+| `--print-base F` | slice the lowest fraction `F` of the height off for a flat base (e.g. `0.02`) |
+| `--print-wall MM` | minimum wall thickness at `--print-size` (widens the remesh band; fattens the model slightly) |
+| `--print-seal N` | how hard to cap tears in the generated surface (default 3). `0` for vases and other deep hollow objects, which the default fills from the bottom up |
+
+`trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
+only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
+`print_base`, `print_wall` and `print_seal`. Method, measurements and limits:
+[docs/spec/32-print-ready.md](docs/spec/32-print-ready.md).
 
 ### Mesh refinement
 
@@ -403,6 +429,8 @@ f16 tensor APIs are available from M2 on; on M1 use `TRELLIS_FA_FAST=1`
 
 | tool | purpose |
 |------|---------|
+| `trellis-print <in.glb> <out.3mf>` | make any existing mesh a watertight, sized, print-ready 3MF (CPU only) |
+| `trellis-test-mesh-print [mesh.glb]` | print-readiness tests: audit, solid remesh, tear sealing, flat base, repair, 3MF |
 | `post-replay <dump.bin> <out.glb>` | re-run the whole postprocess from a `TRELLIS_DUMP_POST` dump in seconds (flags: `--no-remesh`, `--band`, `--no-snap`, `--box-uv`, `--faces`, `--atlas`, …) |
 | `trellis-retopo-atlas --from-post SOURCE.post OUTPUT.glb GRID FIRST_FACES FINAL_FACES [ATLAS] [--no-weld-fill]` | optional native POST-to-textured-quad pipeline with geometry, topology, UV, and bake acceptance gates |
 | `tools/glb_metrics.py` | CPU geometry/UV/material metrics (components, boundary edges, winding, texel density, doubleSided/WebP flags) for ours-vs-reference GLB comparison |

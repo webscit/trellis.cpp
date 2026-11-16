@@ -21,6 +21,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "mesh_print.h"
 #include "mesh_shape.h"
 #include "stb_image_write.h"
 #include "trellis_run.h"
@@ -55,6 +56,14 @@ static bool backend_is_htp(const std::string& backend) {
     return std::tolower((unsigned char)backend[0]) == 'h' &&
            std::tolower((unsigned char)backend[1]) == 't' &&
            std::tolower((unsigned char)backend[2]) == 'p';
+}
+// Longest bounding-box side of a vertex array: what --print-size maps to millimetres.
+static float print_extent(const vector<float>& v) {
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (size_t i = 0; i + 2 < v.size(); i += 3)
+        for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], v[i + k]); hi[k] = std::max(hi[k], v[i + k]); }
+    const float e = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+    return e > 0 ? e : 1.0f;
 }
 // [dbg] overall stats of a flat tensor — used to compare LR vs HR shape-SLAT in decode space.
 // Pixal3D's projection grid is y-up with the camera on +z (pixal3d_project_cell: image up =
@@ -982,6 +991,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         return 0;
     }
 
+    const int print_up_axis = pix ? 1 : 2;   // Pixal3D grids are y-up until the final rotation
     printf("[7/7] write %s\n", outglb.c_str());
     bool textured = false;
     if (!pbr6.empty()) {   // UV-baked textured GLB (PBR material)
@@ -1165,16 +1175,35 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // scales with resolution to keep the offset resolution-independent (512->1,
         // 1024->2, 1536->3); an explicit --band / per-request band forces that value.
         int remesh_band = cfg.band > 0 ? cfg.band : std::max(1, so.res / 512);
+        // --watertight (docs/spec/32-print-ready.md): the same narrow band, but contoured as
+        // a signed field -- exterior flood fill, so the inner shell and every cavity are
+        // solid -- and extracted as a closed 2-manifold.
+        trellis::RemeshOptions remesh_options;
+        if (cfg.watertight) {
+            if (cfg.band <= 0 && cfg.print_wall > 0)
+                remesh_band = std::max(remesh_band, trellis::band_for_wall(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts)));
+            remesh_options.solid = true;
+            remesh_options.seal = cfg.print_seal;
+            if (cfg.print_base > 0) {
+                remesh_options.base_axis = print_up_axis;
+                remesh_options.base_plane = trellis::base_plane_of(mesh.verts.data(), mesh.V(), print_up_axis, cfg.print_base);
+            }
+            printf("  watertight: solid remesh, band %d -> thinnest wall %.2f mm on a %.0f mm print\n", remesh_band,
+                   2.0f * remesh_band / so.res * cfg.print_size / print_extent(mesh.verts), cfg.print_size);
+        }
+        remesh_options.band = remesh_band;
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
                                                           mesh.faces.data(), mesh.F(),
-                                                          bvh, so.res, remesh_band);
+                                                          bvh, so.res, remesh_options);
+        const bool solid = cfg.watertight && rm.F() > 0;
+        if (cfg.watertight && !solid) printf("  watertight: solid remesh produced nothing; falling back to the raw mesh\n");
         // Clean the narrow-band DC output (drop degenerate faces, unify winding), then drop
         // decode floaters (the reference is a single watertight component; ours shattered into
         // 50+ pieces). The faithful QEM simplifier below handles surface smoothing via its
         // quadric + skinny-triangle cost, so no Taubin pre-pass is needed (and none is applied,
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            if (!solid) trellis::clean_mesh(rm.V(), rm.faces);   // the solid is consistently wound already
             if (!std::getenv("TRELLIS_RETOPO_KEEP_COMPONENTS")) {
                 int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
                 printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
@@ -1194,9 +1223,11 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             printf("  QEM simplify: F=%d -> target %d faces%s\n", (int)sfaces.size()/3, qem_target,
                    cfg.faces > 0 ? "" : " (default)");
             fflush(stdout);
+            // Watertight: only collapses that keep the closed manifold (link condition); the
+            // weld + fan fill below would pinch it again, so they are skipped.
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
-                                  qem_target, dv, df);
-            if (!std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
+                                  qem_target, dv, df, /*keep_topology=*/solid);
+            if (!solid && !std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
                 !std::getenv("TRELLIS_QEM_COLLISION_GUARD")) {
                 trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
                 trellis::fill_small_holes(df);
@@ -1236,6 +1267,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                    flipped.flips,smoothed.moved,
                    flipped.collision_rejections+smoothed.collision_rejections,
                    smoothed.maximum_displacement);
+        }
+        if (solid) {
+            const int64_t fixed = trellis::repair_for_print(dv, df);
+            if (fixed) printf("  watertight: repair pass changed %lld faces\n", (long long)fixed);
+            printf("  watertight: mesh    %s\n",
+                   trellis::audit_summary(trellis::audit_mesh(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3)).c_str());
+            fflush(stdout);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
         // --normal-map: a second BVH over the remeshed shell (not the decoded `mesh`, whose
@@ -1279,6 +1317,22 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 std::string ntex = outglb.substr(0, outglb.find_last_of('.')) + "_normal.png";
                 stbi_write_png(ntex.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
             }
+            if (solid) {
+                // What actually went into the GLB: the unwrap splits vertices along chart
+                // seams (same positions) and may drop degenerate faces.
+                std::vector<float> wv = bm.verts; std::vector<int32_t> wf = bm.faces;
+                trellis::weld_exact(wv, wf);
+                printf("  watertight: GLB     %s\n",
+                       trellis::audit_summary(trellis::audit_mesh(wv.data(), (int64_t)wv.size()/3, wf.data(), (int64_t)wf.size()/3)).c_str());
+            }
+            if (!cfg.out_3mf.empty()) {
+                const std::vector<float>& pv = bm.verts;   // already z-up (TRELLIS frame)
+                const trellis::PrintTexture ptex{bm.uv.data(), bm.base.data(), bm.T};
+                if (trellis::write_3mf(cfg.out_3mf.c_str(), pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
+                                       (int64_t)bm.faces.size()/3, cfg.print_size, &ptex))
+                    printf("      3MF -> %s (%.0f mm, textured)\n", cfg.out_3mf.c_str(), cfg.print_size);
+                else { fprintf(stderr, "[trellis] cannot write %s\n", cfg.out_3mf.c_str()); return 1; }
+            }
             textured = true;
             printf("      textured GLB (atlas %d, +%s%s)\n", bm.T, tex.c_str(), bm.nrm.empty() ? "" : ", +normal map");
         } else printf("      uv_bake failed; falling back to vertex colors\n");
@@ -1287,12 +1341,39 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         fprintf(stderr,"[trellis] textured POST unavailable for retopo\n");
         return 1;
     }
+    if (cfg.watertight && !textured) {
+        // Geometry-only run (or a failed bake): the same solid pipeline, without the bake.
+        trellis::PrintOptions po;
+        po.res = so.res;
+        po.band = cfg.band > 0 ? cfg.band : std::max(1, so.res / 512);
+        if (cfg.band <= 0 && cfg.print_wall > 0)
+            po.band = std::max(po.band, trellis::band_for_wall(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts)));
+        po.faces = cfg.decim == 0 ? 0 : trellis::qem_face_target(cfg);
+        po.base = cfg.print_base;
+        po.seal = cfg.print_seal;
+        po.up_axis = print_up_axis;
+        trellis::Mesh printable = trellis::make_printable(mesh, po);
+        if (printable.F() > 0) {
+            mesh = std::move(printable);
+            colors.clear();
+            printf("  watertight: mesh    %s\n",
+                   trellis::audit_summary(trellis::audit_mesh(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F())).c_str());
+        } else printf("  watertight: solid remesh produced nothing; writing the raw mesh\n");
+    }
     if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply
     if (refine && cfg.refine_restore) trellis::restore_mesh_transform(mesh.verts, refine_norm);
-    if (!textured)
+    if (!textured) {
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),
                            colors.empty() ? nullptr : colors.data(), run_seed,
                            cfg.copyright.empty() ? nullptr : cfg.copyright.c_str());
+        if (!cfg.out_3mf.empty()) {
+            if (!trellis::write_3mf(cfg.out_3mf.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), cfg.print_size)) {
+                fprintf(stderr, "[trellis] cannot write %s\n", cfg.out_3mf.c_str());
+                return 1;
+            }
+            printf("      3MF -> %s (%.0f mm)\n", cfg.out_3mf.c_str(), cfg.print_size);
+        }
+    }
     std::string ply = outglb.substr(0, outglb.find_last_of('.')) + ".ply";
     trellis::write_ply(ply.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), colors.empty() ? nullptr : colors.data());
     printf("done in %.1fs -> %s (+ %s)\n", now() - t0, outglb.c_str(), ply.c_str());

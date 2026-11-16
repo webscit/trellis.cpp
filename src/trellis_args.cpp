@@ -62,6 +62,40 @@ bool parse_atlas_arg(const char* value, TrellisParams& p, std::string& error) {
     return true;
 }
 
+bool parse_print_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error) {
+    char* end = nullptr;
+    errno = 0;
+    const float n = std::strtof(value, &end);
+    const bool number = end != value && !*end && errno != ERANGE && std::isfinite(n);
+    if (name == "print-size") {
+        if (!number || n <= 0) { error = "print-size must be a positive number of millimetres"; return false; }
+        p.print_size = n;
+    } else if (name == "print-base") {
+        if (!number || n < 0 || n > 0.5f) { error = "print-base must be a fraction from 0 to 0.5"; return false; }
+        p.print_base = n;
+        if (n > 0) p.watertight = true;
+    } else if (name == "print-seal") {
+        if (!number || n < 0 || n > 26 || n != std::floor(n)) { error = "print-seal must be an integer from 0 to 26"; return false; }
+        p.print_seal = (int)n;
+    } else {
+        if (!number || n < 0) { error = "print-wall must be a nonnegative number of millimetres"; return false; }
+        p.print_wall = n;
+    }
+    return true;
+}
+
+bool check_print_compat(const TrellisParams& p, std::string& error) {
+    if (p.watertight && p.decim > 0) {
+        error = "watertight output cannot be combined with --decim GRID (cluster decimation tears the surface)";
+        return false;
+    }
+    if (p.watertight && p.retopo) {
+        error = "watertight output cannot be combined with --retopo";
+        return false;
+    }
+    return true;
+}
+
 bool check_faces_compat(const TrellisParams& p, std::string& error) {
     if (p.faces > 0 && p.decim >= 0) {
         error = "faces sets the QEM decimation target and cannot be combined with --decim";
@@ -239,6 +273,22 @@ void print_usage(const char* argv0, bool server) {
         "                          WebP support; off = PNG)\n"
         "      --normal-map on|off bake a tangent-space normal map from the dense remeshed\n"
         "                          shell onto the decimated mesh (3rd GLB texture; default off)\n"
+        "      --watertight        3D-print ready: rebuild the mesh as one closed solid (no inner\n"
+        "                          shell, no holes, manifold, outward normals), keep it closed\n"
+        "                          through decimation, and report the audit. Slower: the\n"
+        "                          decimation runs on the CPU\n"
+        "      --3mf PATH          also write a 3MF for slicers: millimetres, z-up, on the build\n"
+        "                          plate, with the base-colour texture (implies --watertight)\n"
+        "      --print-size MM     longest side of the 3MF model (default 100)\n"
+        "      --print-base F      cut the lowest fraction F (0..0.5) of the height off for a\n"
+        "                          flat base, e.g. 0.02 (default 0 = off; implies --watertight)\n"
+        "      --print-seal N      how hard to close tears in the generated surface: a point\n"
+        "                          that sees open space along fewer than N of 26 directions is\n"
+        "                          filled (default 3). 0 = off, for vases and other deep\n"
+        "                          hollow objects, which the default fills from the bottom up\n"
+        "      --print-wall MM     minimum wall thickness at --print-size: widens the remesh\n"
+        "                          band so thin sheets print, at the cost of a fatter model\n"
+        "                          (default 0; ignored when --band is given)\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
@@ -371,6 +421,13 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   if      (std::strcmp(v,"on")==0  || std::strcmp(v,"1")==0 || std::strcmp(v,"true")==0)  p.normal_map = 1;
                                                   else if (std::strcmp(v,"off")==0 || std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0) p.normal_map = 0;
                                                   else { fprintf(stderr, "[trellis] --normal-map must be on or off\n"); return false; } }
+        else if (a == "--watertight")           { p.watertight = true; }
+        else if (a == "--3mf")                  { const char* v = need(a.c_str()); if (!v) return false; p.out_3mf = v; p.watertight = true; }
+        else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-seal") {
+            const char* v = need(a.c_str()); if (!v) return false;
+            std::string error;
+            if (!parse_print_arg(a.substr(2), v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
+        }
         else if (a == "--dump-bg")              { p.dump_bg = true; }
         else if (a == "--bg-only")              { p.bg_only = true; p.dump_bg = true; }
         else if (a == "--retopo")               { const char* g=need(a.c_str()); if (!g) return false;
@@ -410,7 +467,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
     }
     {
         std::string error;
-        if (!check_faces_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
+        if (!check_faces_compat(p, error) || !check_print_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
     }
     if (!p.retopo && p.retopo_no_weld_fill) {
         fprintf(stderr,"[trellis] --retopo-no-weld-fill requires --retopo\n");

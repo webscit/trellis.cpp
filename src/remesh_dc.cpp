@@ -1,5 +1,6 @@
 #include "remesh_dc.h"
 #include "tri_bvh.h"
+#include "mesh_print.h"
 #include <algorithm>
 #include <atomic>
 #ifdef _MSC_VER
@@ -48,9 +49,20 @@ void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn) {
 
 Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* ifaces, int64_t iF,
                            const TriBvh& bvh, int res, int band, float project_back) {
+    RemeshOptions options;
+    options.band = band;
+    options.project_back = project_back;
+    return remesh_narrow_band_dc(iverts, iV, ifaces, iF, bvh, res, options);
+}
+
+Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* ifaces, int64_t iF,
+                           const TriBvh& bvh, int res, const RemeshOptions& options) {
     (void)iV;
     Mesh out;
     if (iF == 0 || bvh.empty() || res <= 0) return out;
+    const int band = std::max(1, options.band);
+    const float project_back = options.project_back;
+    const bool solid = options.solid;
 
     // Reference domain: the world cube is inflated by (res+3·band)/res so the
     // offset shell never touches the boundary; eps is the offset distance.
@@ -131,6 +143,13 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 for (size_t i = 0; i < cand.size(); ++i) cand[i] |= bits[i];
     }
 
+    // Solid mode: one bit per grid VERTEX (n = res+1 per axis). `wall` marks vertices
+    // closer than eps to the surface; it later becomes "not exterior" (see below).
+    const int64_t n = (int64_t)res + 1;
+    std::vector<uint64_t> wall;
+    auto vbit = [n](int x, int y, int z) -> int64_t { return ((int64_t)x * n + y) * n + z; };
+    if (solid) wall.assign((size_t)((n * n * n + 63) / 64), 0);
+
     // Active voxels: |UDF(center) - eps| < 0.87*cell (spec 27 §4.1).
     std::vector<int> acoord;
     {
@@ -148,18 +167,32 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             for (int64_t i = b; i < e; ++i) {
                 const int64_t c = cand_cells[i];
                 const int x = (int)(c / ((int64_t)res * res)), y = (int)((c / res) % res), z = (int)(c % res);
+                if (solid) {
+                    // Every vertex within eps of the surface is the min corner of a
+                    // candidate cell (its closest point sits in a triangle-marked cell at
+                    // most `band` away per axis, and candidates are dilated by band+1).
+                    const float q[3] = { ((float)x / res - 0.5f) * scale,
+                                         ((float)y / res - 0.5f) * scale,
+                                         ((float)z / res - 0.5f) * scale };
+                    const TriBvh::Hit w = bvh.closest(q, eps);
+                    if (w.face >= 0 && w.dist2 < eps * eps) act[i] |= 2;
+                }
                 const float p[3] = { ((x + 0.5f) / res - 0.5f) * scale,
                                      ((y + 0.5f) / res - 0.5f) * scale,
                                      ((z + 0.5f) / res - 0.5f) * scale };
                 const TriBvh::Hit h = bvh.closest(p, eps + keep);
                 if (h.face < 0) continue;
                 const float f = std::sqrt(h.dist2) - eps;
-                if (std::fabs(f) < keep) act[i] = 1;
+                if (std::fabs(f) < keep) act[i] |= 1;
             }
         });
         for (size_t i = 0; i < cand_cells.size(); ++i) {
-            if (!act[i]) continue;
             const int64_t c = cand_cells[i];
+            if (act[i] & 2) {
+                const int64_t b = vbit((int)(c / ((int64_t)res * res)), (int)((c / res) % res), (int)(c % res));
+                wall[(size_t)(b >> 6)] |= 1ull << (b & 63);
+            }
+            if (!(act[i] & 1)) continue;
             acoord.push_back((int)(c / ((int64_t)res * res)));
             acoord.push_back((int)((c / res) % res));
             acoord.push_back((int)(c % res));
@@ -206,8 +239,342 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         return it == vmap.end() ? 1e9f : fvert[it->second];
     };
 
-    if (std::getenv("TRELLIS_REMESH_TETS")) {
-        float min_fraction = 0.0f;
+    // ---- solid mode: signed field from an exterior flood fill ------------------------
+    int base_axis = -1, base_layer = 0;   // vertices with index < base_layer are cut away
+    if (solid) {
+        // The contoured field decides the sign wherever it is known, so the flood and the
+        // crossings cannot disagree by a rounding ulp.
+        for (int64_t i = 0; i < Nv; ++i) {
+            const int64_t b = vbit(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
+            if (fvert[i] < 0) wall[(size_t)(b >> 6)] |= 1ull << (b & 63);
+            else              wall[(size_t)(b >> 6)] &= ~(1ull << (b & 63));
+        }
+
+        // Openness vote. The decoded surface is torn (thousands of holes, some tens of
+        // cells wide), and a flood alone walks in through any tear wider than the band.
+        // A vertex that sees the surface along nearly every lattice direction is interior
+        // no matter how it could be reached: on a coarse copy of the wall (about 256^3),
+        // count for each vertex the rays, out of the 26 axis and diagonal directions, that
+        // leave the grid without meeting the wall; vertices with fewer than `seal` open
+        // rays are shut to the flood. Under a tear only the ray through it is open, so the
+        // tear is capped; a real opening (a cup, the gap between two legs) shows a cone of
+        // sky and stays open.
+        int64_t shut_coarse = 0;
+        if (options.seal > 0) {
+            const int step = std::max(1, res / 256);
+            const int m = (int)((n + step - 1) / step);
+            const size_t m3 = (size_t)m * m * m;
+            std::vector<uint8_t> coarse(m3, 0);
+            for (size_t w = 0; w < wall.size(); ++w) {
+                uint64_t bits = wall[w];
+                while (bits) {
+                    const int64_t b = (int64_t)(w << 6) | ctz64(bits);
+                    bits &= bits - 1;
+                    const int64_t x = b / (n * n), y = (b / n) % n, z = b % n;
+                    coarse[((size_t)(x / step) * m + (size_t)(y / step)) * m + (size_t)(z / step)] = 1;
+                }
+            }
+            std::vector<uint8_t> open(m3, 0);
+            {
+                int dirs[26][3], nd = 0;
+                for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz)
+                    if (dx || dy || dz) { dirs[nd][0] = dx; dirs[nd][1] = dy; dirs[nd][2] = dz; ++nd; }
+                const int nt = (int)std::min<unsigned>(26, std::max(1u, std::thread::hardware_concurrency()));
+                std::vector<std::vector<uint8_t>> counts((size_t)nt);
+                std::vector<std::thread> workers;
+                for (int t = 0; t < nt; ++t)
+                    workers.emplace_back([&, t]() {
+                        std::vector<uint8_t>& count = counts[(size_t)t];
+                        count.assign(m3, 0);
+                        std::vector<uint8_t> blocked(m3);
+                        for (int k = t; k < 26; k += nt) {
+                            const int* d = dirs[k];
+                            // blocked(v) = the ray from v toward -d meets the wall; the
+                            // predecessor v - d is always visited first.
+                            for (int i = 0; i < m; ++i) {
+                                const int x = d[0] >= 0 ? i : m - 1 - i, px = x - d[0];
+                                for (int j = 0; j < m; ++j) {
+                                    const int y = d[1] >= 0 ? j : m - 1 - j, py = y - d[1];
+                                    for (int l = 0; l < m; ++l) {
+                                        const int z = d[2] >= 0 ? l : m - 1 - l, pz = z - d[2];
+                                        const size_t v = ((size_t)x * m + y) * m + z;
+                                        if (px < 0 || px >= m || py < 0 || py >= m || pz < 0 || pz >= m) { blocked[v] = 0; continue; }
+                                        const size_t q = ((size_t)px * m + py) * m + pz;
+                                        blocked[v] = coarse[q] | blocked[q];
+                                    }
+                                }
+                            }
+                            for (size_t v = 0; v < m3; ++v) count[v] += !blocked[v];
+                        }
+                    });
+                for (auto& w : workers) w.join();
+                for (const auto& count : counts)
+                    for (size_t v = 0; v < m3; ++v) open[v] += count[v];
+            }
+            // wall := wall | shut
+            for (size_t v = 0; v < m3; ++v) {
+                coarse[v] = open[v] < options.seal;
+                shut_coarse += coarse[v];
+            }
+            for (int64_t x = 0; x < n; ++x)
+                for (int64_t y = 0; y < n; ++y) {
+                    const uint8_t* row = &coarse[((size_t)(x / step) * m + (size_t)(y / step)) * m];
+                    const int64_t b0 = (x * n + y) * n;
+                    for (int64_t z = 0; z < n; ++z)
+                        if (row[z / step]) wall[(size_t)((b0 + z) >> 6)] |= 1ull << ((b0 + z) & 63);
+                }
+        }
+
+        // Exterior = open vertices 6-connected to the domain boundary (the inflated domain
+        // keeps every boundary vertex free). Scanline flood along z, the bitset's fast axis.
+        // `seen` = wall | shut | visited, so one lookup answers "may the flood enter here".
+        std::vector<uint64_t> seen = wall;
+        auto is_seen = [&seen](int64_t b) -> bool { return (seen[(size_t)(b >> 6)] >> (b & 63)) & 1; };
+        std::vector<int64_t> stack;
+        stack.push_back(0);
+        while (!stack.empty()) {
+            const int64_t s = stack.back();
+            stack.pop_back();
+            if (is_seen(s)) continue;
+            const int64_t row = s / n;
+            int64_t lo = s % n, hi = lo;
+            while (lo > 0 && !is_seen(row * n + lo - 1)) --lo;
+            while (hi < n - 1 && !is_seen(row * n + hi + 1)) ++hi;
+            for (int64_t z = lo; z <= hi; ++z) {
+                const int64_t b = row * n + z;
+                seen[(size_t)(b >> 6)] |= 1ull << (b & 63);
+            }
+            const int64_t x = row / n, y = row % n;
+            const int64_t nb[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
+            for (const auto& q : nb) {
+                if (q[0] < 0 || q[0] >= n || q[1] < 0 || q[1] >= n) continue;
+                const int64_t r2 = (q[0] * n + q[1]) * n;
+                bool run = false;
+                for (int64_t z = lo; z <= hi; ++z) {
+                    const bool open = !is_seen(r2 + z);
+                    if (open && !run) stack.push_back(r2 + z);
+                    run = open;
+                }
+            }
+        }
+        // wall := solid = everything the flood did not reach (band, shut, cavities).
+        for (size_t w = 0; w < wall.size(); ++w) wall[w] |= ~seen[w];
+        std::vector<uint64_t>().swap(seen);
+        auto is_solid = [&wall, &vbit](int x, int y, int z) -> bool {
+            const int64_t b = vbit(x, y, z);
+            return (wall[(size_t)(b >> 6)] >> (b & 63)) & 1;
+        };
+
+        // Flat base: the solid was classified on the whole object first (cutting before
+        // the flood would let it in through the cut and hollow the model out); now every
+        // vertex below the plane becomes exterior.
+        if (options.base_axis >= 0 && options.base_axis < 3) {
+            base_axis = options.base_axis;
+            const float g = (options.base_plane / scale + 0.5f) * (float)res;   // plane, grid units
+            base_layer = std::min(res - 1, std::max(1, (int)std::lround(g + 0.5f)));
+            const int u = (base_axis + 1) % 3, v = (base_axis + 2) % 3;
+            int p[3];
+            for (p[base_axis] = 0; p[base_axis] < base_layer; ++p[base_axis])
+                for (p[u] = 0; p[u] < n; ++p[u])
+                    for (p[v] = 0; p[v] < n; ++p[v]) {
+                        const int64_t b = vbit(p[0], p[1], p[2]);
+                        wall[(size_t)(b >> 6)] &= ~(1ull << (b & 63));
+                    }
+        }
+
+        // Re-sign the field. A filled vertex (f >= 0 but not exterior) goes negative, a cut
+        // vertex goes positive; magnitudes are kept away from 0 so crossings stay interior.
+        const float half = 0.5f * cell;
+        int64_t filled = 0, cut_away = 0;
+        for (int64_t i = 0; i < Nv; ++i) {
+            const bool in = is_solid(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
+            if (in && fvert[i] >= 0)      { fvert[i] = -std::max(fvert[i], half); ++filled; }
+            else if (!in && fvert[i] < 0) { fvert[i] = std::max(-fvert[i], half); ++cut_away; }
+        }
+
+        // The solid's boundary now also runs where the narrow band never was: across the
+        // caps of sealed tears and along the base cut. Activate every cell with both solid
+        // and exterior corners; vertices the band did not sample sit half a cell from the
+        // boundary, so those faces land mid-edge.
+        std::vector<std::vector<int64_t>> mixed_parts((size_t)std::max(1u, std::thread::hardware_concurrency()) + 1);
+        {
+            std::atomic<int> next_part{0};
+            parallel_for(res, [&](int64_t xb, int64_t xe) {
+                std::vector<int64_t>& part = mixed_parts[(size_t)next_part.fetch_add(1)];
+                for (int64_t x = xb; x < xe; ++x)
+                    for (int64_t y = 0; y < res; ++y) {
+                        const int64_t rows[4] = {(x * n + y) * n, (x * n + y + 1) * n, ((x + 1) * n + y) * n, ((x + 1) * n + y + 1) * n};
+                        auto bit = [&](int r, int64_t z) -> int { const int64_t b = rows[r] + z; return (int)((wall[(size_t)(b >> 6)] >> (b & 63)) & 1); };
+                        int prev = bit(0, 0) + bit(1, 0) + bit(2, 0) + bit(3, 0);
+                        for (int64_t z = 0; z < res; ++z) {
+                            const int cur = bit(0, z + 1) + bit(1, z + 1) + bit(2, z + 1) + bit(3, z + 1);
+                            const int sum = prev + cur;
+                            if (sum != 0 && sum != 8) part.push_back((x * res + y) * res + z);
+                            prev = cur;
+                        }
+                    }
+            });
+        }
+        int64_t extra_cells = 0;
+        for (const auto& part : mixed_parts)
+            for (const int64_t c : part) {
+                const int cx = (int)(c / ((int64_t)res * res)), cy = (int)((c / res) % res), cz = (int)(c % res);
+                if (!vox.emplace(key3(cx, cy, cz), (int)(acoord.size() / 3)).second) continue;
+                acoord.push_back(cx); acoord.push_back(cy); acoord.push_back(cz);
+                ++extra_cells;
+                for (int k = 0; k < 8; ++k) {
+                    const int x = cx + (k & 1), y = cy + ((k >> 1) & 1), z = cz + ((k >> 2) & 1);
+                    if (!vmap.emplace(key3(x, y, z), (int)(vcoord.size() / 3)).second) continue;
+                    vcoord.push_back(x); vcoord.push_back(y); vcoord.push_back(z);
+                    fvert.push_back(is_solid(x, y, z) ? -half : half);
+                }
+            }
+        std::vector<uint64_t>().swap(wall);
+        printf("  remesh_solid: %lld vertices filled, %lld cells outside the band (caps%s)",
+               (long long)filled, (long long)extra_cells, base_axis >= 0 ? ", base" : "");
+        if (options.seal > 0) printf("; openness < %d of 26 shut (%lld coarse vertices)", options.seal, (long long)shut_coarse);
+        if (base_axis >= 0)
+            printf("; flat base on axis %d at %.4f (%lld vertices cut)", base_axis,
+                   (((float)base_layer - 0.5f) / res - 0.5f) * scale, (long long)cut_away);
+        printf("\n");
+        fflush(stdout);
+    }
+
+    // ---- solid mode: one polygon per surface cycle (marching cubes by construction) ----
+    // On each cube face the crossing edges are linked in pairs (an ambiguous face joins the
+    // inside corners, the same way from both cells that share it), so the crossings of a
+    // cell fall into closed cycles; each cycle becomes one polygon over vertices that live
+    // on grid edges and are shared by the four cells around them. Every polygon side lies
+    // in a cube face and is used by exactly the two cells on either side of it: a closed
+    // 2-manifold with a third of the triangles marching tetrahedra need. The result is
+    // audited and the tetrahedra below remain the fallback.
+    if (solid && !std::getenv("TRELLIS_SOLID_TETS")) {
+        Mesh mc;
+        const float min_fraction = 0.05f;
+        std::unordered_map<uint64_t, int32_t> cuts;
+        cuts.reserve(acoord.size());
+        auto cut = [&](int a, int b) -> int32_t {
+            const uint32_t lo = (uint32_t)std::min(a, b), hi = (uint32_t)std::max(a, b);
+            const uint64_t key = (uint64_t(lo) << 32) | hi;
+            auto it = cuts.find(key);
+            if (it != cuts.end()) return it->second;
+            const bool through_base = base_axis >= 0 &&
+                (vcoord[3*a+base_axis] < base_layer) != (vcoord[3*b+base_axis] < base_layer);
+            const float fa = fvert[a], fb = fvert[b];
+            const float t = through_base ? 0.5f : std::clamp(fa / (fa - fb), min_fraction, 1.0f - min_fraction);
+            const int32_t index = (int32_t)(mc.verts.size() / 3);
+            for (int k = 0; k < 3; ++k) {
+                const float coord = vcoord[3*a+k] + t * (vcoord[3*b+k] - vcoord[3*a+k]);
+                mc.verts.push_back((coord / res - 0.5f) * scale);
+            }
+            cuts.emplace(key, index);
+            return index;
+        };
+        // Cube tables: corner bit0/1/2 = +x/+y/+z; 12 edges; 6 faces as corner cycles.
+        int edge_a[12], edge_b[12], edge_of[8][8], face[6][4];
+        {
+            int ne = 0;
+            for (int axis = 0; axis < 3; ++axis)
+                for (int c = 0; c < 8; ++c) {
+                    if ((c >> axis) & 1) continue;
+                    edge_a[ne] = c; edge_b[ne] = c | (1 << axis);
+                    edge_of[c][c | (1 << axis)] = edge_of[c | (1 << axis)][c] = ne++;
+                }
+            for (int axis = 0; axis < 3; ++axis)
+                for (int side = 0; side < 2; ++side) {
+                    const int u = 1 << ((axis + 1) % 3), v = 1 << ((axis + 2) % 3), base = side << axis;
+                    const int cyc[4] = {base, base | u, base | u | v, base | v};
+                    for (int k = 0; k < 4; ++k) face[2 * axis + side][k] = cyc[k];
+                }
+        }
+        const int64_t Nc = (int64_t)acoord.size() / 3;
+        for (int64_t i = 0; i < Nc; ++i) {
+            const int x = acoord[3*i], y = acoord[3*i+1], z = acoord[3*i+2];
+            int corner[8];
+            int mask = 0;
+            for (int m = 0; m < 8; ++m) {
+                corner[m] = vmap.at(key3(x + (m & 1), y + ((m >> 1) & 1), z + ((m >> 2) & 1)));
+                if (fvert[corner[m]] < 0) mask |= 1 << m;
+            }
+            if (mask == 0 || mask == 255) continue;
+            int link[12][2], nlink[12] = {0};
+            auto join = [&](int a, int b) { link[a][nlink[a]++] = b; link[b][nlink[b]++] = a; };
+            for (const auto& cyc : face) {
+                int e[4], crossing[4], count = 0;
+                for (int k = 0; k < 4; ++k) {
+                    e[k] = edge_of[cyc[k]][cyc[(k + 1) % 4]];
+                    crossing[k] = ((mask >> cyc[k]) & 1) != ((mask >> cyc[(k + 1) % 4]) & 1);
+                    count += crossing[k];
+                }
+                if (count == 2) {
+                    int first = -1;
+                    for (int k = 0; k < 4; ++k) {
+                        if (!crossing[k]) continue;
+                        if (first < 0) first = e[k]; else join(first, e[k]);
+                    }
+                } else if (count == 4) {
+                    for (int k = 0; k < 4; ++k)   // around each OUTSIDE corner: inside stays joined
+                        if (!((mask >> cyc[k]) & 1)) join(e[(k + 3) % 4], e[k]);
+                }
+            }
+            bool visited[12] = {false};
+            for (int start = 0; start < 12; ++start) {
+                if (nlink[start] != 2 || visited[start]) continue;
+                int poly[12], n = 0, previous = -1, current = start;
+                do {
+                    visited[current] = true;
+                    poly[n++] = current;
+                    const int next = link[current][0] != previous ? link[current][0] : link[current][1];
+                    previous = current;
+                    current = next;
+                } while (current != start && n < 12);
+                int32_t pv[12];
+                float direction[3] = {0, 0, 0};   // inside -> outside, summed over the cycle
+                for (int k = 0; k < n; ++k) {
+                    const int a = edge_a[poly[k]], b = edge_b[poly[k]];
+                    pv[k] = cut(corner[a], corner[b]);
+                    const int in = (mask >> a) & 1 ? a : b, outc = in == a ? b : a;
+                    for (int d = 0; d < 3; ++d) direction[d] += (float)(((outc >> d) & 1) - ((in >> d) & 1));
+                }
+                float normal[3] = {0, 0, 0};      // Newell
+                for (int k = 0; k < n; ++k) {
+                    const float* p = &mc.verts[3 * (size_t)pv[k]];
+                    const float* q = &mc.verts[3 * (size_t)pv[(k + 1) % n]];
+                    normal[0] += (p[1] - q[1]) * (p[2] + q[2]);
+                    normal[1] += (p[2] - q[2]) * (p[0] + q[0]);
+                    normal[2] += (p[0] - q[0]) * (p[1] + q[1]);
+                }
+                if (normal[0] * direction[0] + normal[1] * direction[1] + normal[2] * direction[2] < 0)
+                    std::reverse(pv, pv + n);
+                if (n <= 4) {
+                    for (int k = 1; k + 1 < n; ++k) { mc.faces.push_back(pv[0]); mc.faces.push_back(pv[k]); mc.faces.push_back(pv[k + 1]); }
+                } else {   // a centre vertex keeps every diagonal private to this polygon
+                    float centre[3] = {0, 0, 0};
+                    for (int k = 0; k < n; ++k)
+                        for (int d = 0; d < 3; ++d) centre[d] += mc.verts[3 * (size_t)pv[k] + d] / n;
+                    const int32_t c = (int32_t)(mc.verts.size() / 3);
+                    mc.verts.insert(mc.verts.end(), centre, centre + 3);
+                    for (int k = 0; k < n; ++k) { mc.faces.push_back(c); mc.faces.push_back(pv[k]); mc.faces.push_back(pv[(k + 1) % n]); }
+                }
+            }
+        }
+        const MeshAudit check = audit_mesh(mc.verts.data(), mc.V(), mc.faces.data(), mc.F());
+        if (check.boundary_edges == 0 && check.nonmanifold_edges == 0 && check.flipped_edges == 0 &&
+            check.nonmanifold_vertices == 0 && check.inverted_components == 0 && mc.F() > 0) {
+            printf("  remesh_solid: %lld active voxels -> V=%d F=%d (eps=%.4g), closed manifold\n",
+                   (long long)Nc, mc.V(), mc.F(), eps);
+            fflush(stdout);
+            return mc;
+        }
+        printf("  remesh_solid: cycle extraction not manifold (%s); using marching tetrahedra\n",
+               audit_summary(check).c_str());
+        fflush(stdout);
+    }
+
+    if (solid || std::getenv("TRELLIS_REMESH_TETS")) {
+        // Solid mode keeps crossings 5 % of an edge away from the grid vertices: no
+        // zero-area slivers where the field is ~0 at a vertex.
+        float min_fraction = solid ? 0.05f : 0.0f;
         if (const char* setting = std::getenv("TRELLIS_TETS_MIN_EDGE_FRACTION")) {
             char* end = nullptr;
             min_fraction = std::strtof(setting, &end);
@@ -227,8 +594,11 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             auto it = intersections.find(key);
             if (it != intersections.end()) return it->second;
             const float fa = fvert[a], fb = fvert[b];
-            const float raw_t = fa / (fa - fb);
-            const float t = std::clamp(raw_t, min_fraction, 1.0f - min_fraction);
+            // An edge through the base plane crosses it exactly mid-layer: planar cap.
+            const bool through_base = base_axis >= 0 &&
+                (vcoord[3*a+base_axis] < base_layer) != (vcoord[3*b+base_axis] < base_layer);
+            const float raw_t = through_base ? 0.5f : fa / (fa - fb);
+            const float t = through_base ? 0.5f : std::clamp(raw_t, min_fraction, 1.0f - min_fraction);
             clamped_intersections += t != raw_t;
             const int32_t index = (int32_t)(out.verts.size() / 3);
             for (int k = 0; k < 3; ++k) {
@@ -250,7 +620,8 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             if (dot < 0) std::swap(b, c);
             out.faces.push_back(a); out.faces.push_back(b); out.faces.push_back(c);
         };
-        for (int64_t i = 0; i < Na; ++i) {
+        const int64_t Nt = (int64_t)acoord.size() / 3;   // Na plus any base-cut cells
+        for (int64_t i = 0; i < Nt; ++i) {
             const int x = acoord[3*i], y = acoord[3*i+1], z = acoord[3*i+2];
             int corner[8];
             for (int mask = 0; mask < 8; ++mask)
@@ -283,8 +654,9 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 }
             }
         }
-        printf("  remesh_tets: %lld active voxels -> V=%d F=%d (edge_fraction=%.4g, clamped=%zu)\n",
-               (long long)Na, out.V(), out.F(), min_fraction, clamped_intersections);
+        printf("  %s: %lld active voxels -> V=%d F=%d (eps=%.4g, edge_fraction=%.4g, clamped=%zu)\n",
+               solid ? "remesh_solid" : "remesh_tets", (long long)Nt, out.V(), out.F(), eps,
+               min_fraction, clamped_intersections);
         fflush(stdout);
         return out;
     }

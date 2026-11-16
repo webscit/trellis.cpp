@@ -26,4 +26,34 @@ Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, 
                            const TriBvh& bvh, int res, int band = 1,
                            float project_back = 0.0f);
 
+// Solid (watertight) variant for 3D printing — docs/spec/32-print-ready.md.
+//
+// The plain remesh contours |UDF| = eps, which around a closed input is TWO shells: the
+// outer skin and a mirror-image inner one eps inside it. A slicer reads that as a hollow
+// object with a 2*eps wall (0.4 % of the model at res 512). `solid` turns the unsigned
+// field into a signed one before contouring: grid vertices farther than eps from the
+// surface are flood-filled from the domain boundary, and whatever the flood cannot reach
+// (the band itself, the cavity behind it, any internal geometry) is solid. The band is
+// >= 2 cells thick, so the 6-connected flood cannot leak through a closed surface, and
+// holes narrower than 2*eps are sealed for free. The surface is then extracted by
+// marching tetrahedra on the Kuhn subdivision, which is a closed, consistently oriented
+// 2-manifold by construction (no ambiguous cases, unlike dual contouring) with outward
+// normals. `project_back` is ignored.
+struct RemeshOptions {
+    int   band = 1;
+    float project_back = 0.0f;
+    bool  solid = false;
+    // Solid only: seal tears wider than the band. A vertex with fewer than `seal` of its 26
+    // lattice rays leaving the grid unobstructed counts as interior even if the flood could
+    // reach it (see remesh_dc.cpp). 0 = flood only; higher fills deeper concavities.
+    int   seal = 0;
+    // Flat base (solid only): everything below `base_plane` (input-mesh coordinate along
+    // `base_axis`, 0/1/2) is cut away and capped with an exactly planar face, so the print
+    // has a bed-contact surface. The plane snaps to the nearest half grid layer. -1 = off.
+    int   base_axis = -1;
+    float base_plane = 0.0f;
+};
+Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                           const TriBvh& bvh, int res, const RemeshOptions& options);
+
 }  // namespace trellis
