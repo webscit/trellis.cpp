@@ -88,6 +88,9 @@ click → rotate the result.
 4. **Inspect** — rotate and zoom in the interactive preview (Google's three.js-based
    `<model-viewer>`); **Reset view** re-frames the camera and **Export to GLB** saves
    the model; the arrow beside it picks the format (GLB, or 3MF when "3D print" was on).
+   With **3D print** set to *watertight solid*, the print size, flat base, minimum wall
+   and interior (solid / keep hollow) appear under it, and a print report (size, walls,
+   stability, overhangs, warnings) shows under the preview.
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
    the app.

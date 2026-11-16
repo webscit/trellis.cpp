@@ -101,7 +101,8 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
 - ☐ Finer openness sampling (26 rays cannot tell a deep vase from a torn figurine)
 - ☑ Cap smoothing: membrane relaxation of the vertices the field does not determine
 - ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
-- ☑ Studio export split button (GLB / 3MF)
+- ☑ Studio export split button (GLB / 3MF); print options (size, flat base, minimum wall,
+      interior) under the "3D print" toggle; print report under the preview
 - ☐ Per-vertex colour for slicers that ignore textures
 
 ## Validation strategy

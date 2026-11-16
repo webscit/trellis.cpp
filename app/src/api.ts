@@ -8,7 +8,7 @@
 //                   -> model/gltf-binary, or JSON {"error": "..."} on failure.
 
 import { apiBase, loadConfig } from "./config";
-import { DEFAULT_PARAMS, type ExtraView, type GenParams } from "./types";
+import { DEFAULT_PARAMS, type ExtraView, type GenParams, type PrintReport } from "./types";
 
 async function base(): Promise<string> {
   return apiBase(await loadConfig());
@@ -135,6 +135,10 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
   if (p.watertight) {
     fd.append("watertight", "on");
     fd.append("3mf", "on"); // built in the same run; fetched from /jobs/{id}/3mf
+    fd.append("print_size", String(p.printSize ?? DEFAULT_PARAMS.printSize));
+    fd.append("print_base", p.printBase ?? DEFAULT_PARAMS.printBase!);
+    fd.append("print_wall", String(p.printWall ?? DEFAULT_PARAMS.printWall));
+    fd.append("print_seal", String(p.printSeal ?? DEFAULT_PARAMS.printSeal));
   }
   return fd;
 }
@@ -143,6 +147,8 @@ export interface GenerateResult {
   glb: Blob;
   /** The 3MF, when the job was submitted with 3mf=on and the server could serve it. */
   model3mf?: Blob;
+  /** The printability report of a watertight job. */
+  report?: PrintReport;
 }
 
 /** GET /jobs/{id} on trellis-server. */
@@ -280,6 +286,13 @@ export async function waitForJob(
   } catch {
     if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   }
+  let report: PrintReport | undefined;
+  try {
+    const extra = await fetch(url + "/report", { signal, cache: "no-store" });
+    if (extra.ok) report = (await extra.json()) as PrintReport;
+  } catch {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+  }
   fetch(url, { method: "DELETE" }).catch(() => {});
-  return { glb, model3mf };
+  return { glb, model3mf, report };
 }

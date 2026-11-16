@@ -27,6 +27,11 @@ export interface GenParams {
   texture: boolean;
   /** true => one closed, manifold solid for 3D printing (server field watertight=on). */
   watertight?: boolean;
+  /** 3D print options, sent only with watertight (server fields print_*). */
+  printSize?: number; // mm, longest side
+  printBase?: string; // "auto" | "0" | fraction of the height
+  printWall?: number; // mm, 0 = off
+  printSeal?: number; // 3 = seal tears, 0 = keep hollow
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
@@ -43,6 +48,10 @@ export const DEFAULT_PARAMS: GenParams = {
   uv: "xatlas",
   texture: true,
   watertight: false,
+  printSize: 100,
+  printBase: "auto",
+  printWall: 0.8,
+  printSeal: 3,
   blendTemp: 2,
   frontAxis: "-y",
 };
@@ -61,6 +70,21 @@ export interface AppConfig {
   configured: boolean;
 }
 
+/** trellis-server's printability report (GET /jobs/{id}/report). */
+export interface PrintReport {
+  ok: boolean;
+  size_mm: [number, number, number];
+  volume_cm3: number;
+  surface_cm2: number;
+  watertight: boolean;
+  shells: number;
+  triangles: number;
+  wall: { target_mm: number; thinnest_1pct_mm: number; at_least: boolean; thin_area_pct: number };
+  base: { flat: boolean; contact_mm2: number; stands: boolean; tip_angle_deg: number };
+  overhang_pct: number;
+  warnings: string[];
+}
+
 /** One persisted generation (IndexedDB record). */
 export interface GenRecord {
   id: string;
@@ -72,6 +96,8 @@ export interface GenRecord {
   glb: Blob | null; // resulting model/gltf-binary; null while pending
   /** The same model as a 3MF (made when "3D print" is on); absent otherwise. */
   model3mf?: Blob | null;
+  /** Printability report of a "3D print" run; absent otherwise. */
+  report?: PrintReport | null;
   /** true while the server is still working on it (the entry survives reloads). */
   pending?: boolean;
   /** trellis-server job id of a pending entry, to resume polling after a reload. */

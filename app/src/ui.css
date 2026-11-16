@@ -178,6 +178,30 @@ body {
 }
 .tool-btn:hover:not(:disabled) { border-color: var(--accent); }
 .tool-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* 3D print: options under the toggle, report above the viewer toolbar */
+.print-opts {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+}
+.print-report {
+  flex: 0 0 auto; border-top: 1px solid var(--border); background: var(--panel);
+  padding: 8px 12px; font-size: 13px;
+}
+.print-report summary { cursor: pointer; display: flex; align-items: center; gap: 10px; }
+.report-badge {
+  flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+  color: #10131a; background: var(--ok);
+}
+.report-badge.warn { background: #e0a94a; }
+.report-rows {
+  display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0 0;
+}
+.report-rows dt { color: var(--muted); }
+.report-rows dd { margin: 0; }
+.report-rows dd.bad { color: #e0a94a; }
+.report-warnings { margin: 8px 0 0; padding-left: 18px; color: #e0a94a; }
+.report-warnings:empty { display: none; }
+
 /* split button: | Export to GLB | v | with a format menu that opens upward */
 .split-btn { position: relative; display: inline-flex; }
 .split-btn .split-main { border-radius: 7px 0 0 7px; }
