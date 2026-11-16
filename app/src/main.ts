@@ -20,7 +20,9 @@ const progressStage = $("progress-stage");
 const progressElapsed = $("progress-elapsed");
 const cancelBtn = $<HTMLButtonElement>("cancel-btn");
 const resetViewBtn = $<HTMLButtonElement>("reset-view");
-const saveGlbBtn = $<HTMLButtonElement>("save-glb");
+const exportBtn = $<HTMLButtonElement>("export-btn");
+const exportMenuBtn = $<HTMLButtonElement>("export-menu-btn");
+const exportMenu = $("export-menu");
 const viewerCaption = $("viewer-caption");
 const galleryEl = $("gallery");
 const clearGalleryBtn = $("clear-gallery");
@@ -41,7 +43,8 @@ const viewer = new Viewer($("viewer-mount"));
 let inputImage: Blob | null = null;
 let inputName = "input.png";
 let currentGlb: Blob | null = null;
-let currentName = "model"; // file name stem for "Save GLB…" of the model in the viewer
+let current3mf: Blob | null = null; // the viewer model as a 3MF, when the run made one
+let currentName = "model"; // file name stem for exports of the model in the viewer
 // Set when the user opens a gallery item during a run: the result then goes to the
 // gallery without taking over the viewer.
 let browsedAway = false;
@@ -68,6 +71,7 @@ function readParams(): GenParams {
     bgRemoval: ($("ctl-bg") as HTMLSelectElement).value as GenParams["bgRemoval"],
     uv: ($("ctl-uv") as HTMLSelectElement).value as GenParams["uv"],
     texture: ($("ctl-tex") as HTMLSelectElement).value !== "off",
+    watertight: ($("ctl-print") as HTMLSelectElement).value === "on",
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
     mainAz,
@@ -87,6 +91,7 @@ function applyParams(p: GenParams): void {
   ($("ctl-uv") as HTMLSelectElement).value = p.uv;
   // records saved before this option existed have no field: treat as textured
   ($("ctl-tex") as HTMLSelectElement).value = p.texture === false ? "off" : "on";
+  ($("ctl-print") as HTMLSelectElement).value = p.watertight ? "on" : "off";
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
   ($("ctl-front") as HTMLSelectElement).value = p.frontAxis ?? DEFAULT_PARAMS.frontAxis;
@@ -383,7 +388,7 @@ async function runJob(
   abort = new AbortController();
   let running = false;
   try {
-    const { glb } = await work(abort.signal, {
+    const { glb, model3mf } = await work(abort.signal, {
       onJob: async (id) => {
         // A pending gallery entry: it survives a reload, which resumes the job.
         rec.jobId = id;
@@ -396,7 +401,7 @@ async function runJob(
         progressStage.textContent = describeJob(st);
       },
     });
-    await finishRecord(rec, glb);
+    await finishRecord(rec, glb, model3mf);
   } catch (e) {
     await removeRecord(rec.id);
     await refreshGallery();
@@ -414,8 +419,9 @@ async function runJob(
 }
 
 /** Store a finished generation; show it unless the user is browsing another item. */
-async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
+async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob): Promise<void> {
   rec.glb = glb;
+  rec.model3mf = model3mf ?? null;
   rec.pending = false;
   delete rec.jobId;
   const nViews = rec.views?.length ?? 0;
@@ -432,6 +438,8 @@ async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
       const mv = nViews ? `_mv${nViews + 1}` : "";
       const fname = `${stem}_${rec.params.resolution}${mv}_seed${rec.params.seed}_${rec.id}.glb`;
       savedPath = await saveToOutputDir(fname, bytes);
+      if (model3mf)
+        await saveToOutputDir(fname.replace(/\.glb$/, ".3mf"), new Uint8Array(await model3mf.arrayBuffer()));
     } catch (e) {
       toast(`Auto-save to output folder failed: ${(e as Error).message}`, "err");
     }
@@ -455,6 +463,7 @@ async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
   }
   toast(savedPath ? `Saved to ${savedPath}` : "Generation complete", "ok");
   currentGlb = glb;
+  current3mf = model3mf ?? null;
   currentName = stem;
   activeId = rec.id;
   setViewerTools(true);
@@ -513,13 +522,77 @@ cancelBtn.addEventListener("click", () => abort?.abort());
 // ---- viewer tools ----
 function setViewerTools(on: boolean): void {
   resetViewBtn.disabled = !on;
-  saveGlbBtn.disabled = !on;
+  exportBtn.disabled = !on;
+  exportMenuBtn.disabled = !on;
+  if (!on) closeExportMenu();
 }
 resetViewBtn.addEventListener("click", () => viewer.resetView());
-saveGlbBtn.addEventListener("click", async () => {
+
+// ---- export: | Export to GLB | v | ----
+// The main button exports in the chosen format; the arrow opens the format menu. The choice
+// is a per-user convenience, so it lives in localStorage (and works without it).
+type ExportFormat = "glb" | "3mf";
+const EXPORT_LABEL: Record<ExportFormat, string> = { glb: "GLB", "3mf": "3MF" };
+let exportFormat: ExportFormat = "glb";
+try {
+  if (localStorage.getItem("export-format") === "3mf") exportFormat = "3mf";
+} catch { /* storage unavailable: keep the default */ }
+
+function exportItems(): HTMLButtonElement[] {
+  return Array.from(exportMenu.querySelectorAll<HTMLButtonElement>("button[data-format]"));
+}
+function setExportFormat(f: ExportFormat): void {
+  exportFormat = f;
+  exportBtn.textContent = `Export to ${EXPORT_LABEL[f]}`;
+  for (const item of exportItems()) item.setAttribute("aria-checked", String(item.dataset.format === f));
+  try { localStorage.setItem("export-format", f); } catch { /* ignore */ }
+}
+function closeExportMenu(): void {
+  exportMenu.classList.add("hidden");
+  exportMenuBtn.setAttribute("aria-expanded", "false");
+}
+function openExportMenu(): void {
+  exportMenu.classList.remove("hidden");
+  exportMenuBtn.setAttribute("aria-expanded", "true");
+  (exportItems().find((i) => i.dataset.format === exportFormat) ?? exportItems()[0])?.focus();
+}
+setExportFormat(exportFormat);
+
+exportMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (exportMenu.classList.contains("hidden")) openExportMenu();
+  else closeExportMenu();
+});
+exportMenu.addEventListener("click", (e) => {
+  const item = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-format]");
+  if (!item) return;
+  setExportFormat(item.dataset.format as ExportFormat);
+  closeExportMenu();
+  exportBtn.focus();
+});
+exportMenu.addEventListener("keydown", (e) => {
+  const items = exportItems();
+  const at = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    items[(at + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
+  } else if (e.key === "Escape") {
+    closeExportMenu();
+    exportMenuBtn.focus();
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!exportMenu.contains(e.target as Node)) closeExportMenu();
+});
+
+exportBtn.addEventListener("click", async () => {
   if (!currentGlb) return;
-  const bytes = new Uint8Array(await currentGlb.arrayBuffer());
-  const ok = await saveBytes(`${currentName}.glb`, bytes);
+  if (exportFormat === "3mf" && !current3mf) {
+    toast('This model has no 3MF. Set "3D print" to "watertight solid" and generate again.', "err");
+    return;
+  }
+  const blob = exportFormat === "3mf" ? current3mf! : currentGlb;
+  const ok = await saveBytes(`${currentName}.${exportFormat}`, new Uint8Array(await blob.arrayBuffer()));
   if (ok) toast("Saved", "ok");
 });
 
@@ -552,6 +625,7 @@ async function loadRecord(id: string): Promise<void> {
   extraViews = (rec.views ?? []).map((v) => ({ ...v }));
   renderViews();
   currentGlb = rec.glb;
+  current3mf = rec.model3mf ?? null;
   currentName = rec.name.replace(/\.[^.]+$/, "") || "model";
   activeId = rec.id;
   setViewerTools(true);

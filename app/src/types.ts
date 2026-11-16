@@ -25,6 +25,8 @@ export interface GenParams {
   uv: Uv;
   /** false => geometry only (server field texture=off). */
   texture: boolean;
+  /** true => one closed, manifold solid for 3D printing (server field watertight=on). */
+  watertight?: boolean;
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
@@ -40,6 +42,7 @@ export const DEFAULT_PARAMS: GenParams = {
   bgRemoval: "auto",
   uv: "xatlas",
   texture: true,
+  watertight: false,
   blendTemp: 2,
   frontAxis: "-y",
 };
@@ -67,6 +70,8 @@ export interface GenRecord {
   input: Blob; // source image (the front view)
   views?: ExtraView[]; // extra views (multi-view); absent on single-image records
   glb: Blob | null; // resulting model/gltf-binary; null while pending
+  /** The same model as a 3MF (made when "3D print" is on); absent otherwise. */
+  model3mf?: Blob | null;
   /** true while the server is still working on it (the entry survives reloads). */
   pending?: boolean;
   /** trellis-server job id of a pending entry, to resume polling after a reload. */

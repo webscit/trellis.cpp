@@ -132,11 +132,17 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
   if (p.bgRemoval !== "auto") fd.append("bg_removal", p.bgRemoval);
   fd.append("uv", p.uv);
   if (!p.texture) fd.append("texture", "off");
+  if (p.watertight) {
+    fd.append("watertight", "on");
+    fd.append("3mf", "on"); // built in the same run; fetched from /jobs/{id}/3mf
+  }
   return fd;
 }
 
 export interface GenerateResult {
   glb: Blob;
+  /** The 3MF, when the job was submitted with 3mf=on and the server could serve it. */
+  model3mf?: Blob;
 }
 
 /** GET /jobs/{id} on trellis-server. */
@@ -263,6 +269,17 @@ export async function waitForJob(
   if (!res.ok) throw new Error(await errorOf(res, `downloading the model failed (HTTP ${res.status})`));
   const glb = await res.blob();
   if (glb.size === 0) throw new Error("server returned an empty model");
+  // Optional second artifact: 404 just means this job did not ask for one. Never fails the run.
+  let model3mf: Blob | undefined;
+  try {
+    const extra = await fetch(url + "/3mf", { signal, cache: "no-store" });
+    if (extra.ok) {
+      const blob = await extra.blob();
+      if (blob.size > 0) model3mf = blob;
+    }
+  } catch {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+  }
   fetch(url, { method: "DELETE" }).catch(() => {});
-  return { glb };
+  return { glb, model3mf };
 }

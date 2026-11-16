@@ -79,6 +79,13 @@
               <option value="off">off (geometry only)</option>
             </select>
           </label>
+          <label class="ctl" title="Rebuild the mesh as one closed, manifold solid a slicer accepts. Slower.">
+            <span>3D print</span>
+            <select id="ctl-print">
+              <option value="off" selected>off</option>
+              <option value="on">watertight solid</option>
+            </select>
+          </label>
           <label class="ctl">
             <span>Seed</span>
             <input id="ctl-seed" type="number" min="0" step="1" value="42" />
@@ -117,7 +124,19 @@
         <div id="viewer-mount" class="viewer-mount"></div>
         <div class="viewer-toolbar">
           <button id="reset-view" class="tool-btn" disabled>Reset view</button>
-          <button id="save-glb" class="tool-btn" disabled>Save GLB…</button>
+          <div class="split-btn">
+            <button id="export-btn" class="tool-btn split-main" disabled>Export to GLB</button>
+            <button id="export-menu-btn" class="tool-btn split-arrow" disabled
+                    aria-haspopup="menu" aria-expanded="false" aria-label="Choose export format">▾</button>
+            <div id="export-menu" class="split-menu hidden" role="menu">
+              <button role="menuitemradio" data-format="glb" aria-checked="true">
+                <b>GLB</b><span class="muted">textured model</span>
+              </button>
+              <button role="menuitemradio" data-format="3mf" aria-checked="false">
+                <b>3MF</b><span class="muted">3D printing, millimetres</span>
+              </button>
+            </div>
+          </div>
           <span id="viewer-caption" class="viewer-caption muted"></span>
         </div>
       </section>
