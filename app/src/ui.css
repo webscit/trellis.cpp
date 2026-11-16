@@ -123,6 +123,8 @@ body {
   border: 1px solid var(--border); border-radius: 6px; padding: 5px 4px; font-size: 12px;
 }
 .vrow select:focus, .vrow input:focus { outline: none; border-color: var(--accent); }
+.vrow.vmain { border-color: var(--accent); }
+.vrow .vmain-tag { font-size: 9px; color: var(--accent); text-align: center; }
 .vrow .vdel {
   border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0;
 }

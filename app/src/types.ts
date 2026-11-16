@@ -29,6 +29,9 @@ export interface GenParams {
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
   frontAxis: FrontAxis;
+  /** Camera direction of the main image (only sent with extra views; default 0, 0). */
+  mainAz?: number;
+  mainEl?: number;
 }
 
 export const DEFAULT_PARAMS: GenParams = {

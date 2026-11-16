@@ -53,6 +53,9 @@ let elapsedTimer: number | null = null;
 let galleryUrls: string[] = [];
 let warnedEphemeral = false;
 let extraViews: ExtraView[] = [];
+// Camera direction of the main image (sent only with extra views).
+let mainAz = 0;
+let mainEl = 0;
 let viewUrls: string[] = [];
 
 // ---- controls -> params ----
@@ -67,6 +70,8 @@ function readParams(): GenParams {
     texture: ($("ctl-tex") as HTMLSelectElement).value !== "off",
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
+    mainAz,
+    mainEl,
   };
 }
 
@@ -85,6 +90,8 @@ function applyParams(p: GenParams): void {
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
   ($("ctl-front") as HTMLSelectElement).value = p.frontAxis ?? DEFAULT_PARAMS.frontAxis;
+  mainAz = p.mainAz ?? 0;
+  mainEl = p.mainEl ?? 0;
 }
 
 // ---- toasts ----
@@ -103,7 +110,7 @@ function setInput(blob: Blob, name: string): void {
   inputPreview.src = URL.createObjectURL(blob);
   inputPreview.classList.remove("hidden");
   dropHint.classList.add("hidden");
-  frontTag.classList.toggle("hidden", extraViews.length === 0);
+  renderViews(); // the main-image row shows the new thumbnail
   updateGenerateEnabled();
 }
 
@@ -123,7 +130,7 @@ function guessDirection(name: string): { az: number; el: number } {
   if (/back/.test(n)) return { az: 180, el: 0 };
   if (/left/.test(n)) return { az: 270, el: 0 };
   if (/right/.test(n)) return { az: 90, el: 0 };
-  const used = new Set(extraViews.map((v) => v.az));
+  const used = new Set([mainAz, ...extraViews.map((v) => v.az)]);
   const az = [180, 90, 270, 45, 135, 225, 315].find((a) => !used.has(a)) ?? 180;
   return { az, el: 0 };
 }
@@ -143,12 +150,73 @@ function addViews(files: File[]): void {
   renderViews();
 }
 
+/** Direction select + elevation input for one image; calls back with clamped values. */
+function directionControls(
+  az0: number,
+  el0: number,
+  onAz: (az: number) => void,
+  onEl: (el: number) => void,
+): [HTMLSelectElement, HTMLInputElement] {
+  const az = document.createElement("select");
+  az.title = "Azimuth: where the camera was, going around the object";
+  for (const [deg, label] of AZIMUTHS) az.add(new Option(`${label} · ${deg}°`, String(deg)));
+  if (!AZIMUTHS.some(([deg]) => deg === az0)) az.add(new Option(`${az0}°`, String(az0)));
+  az.value = String(az0);
+  az.addEventListener("change", () => onAz(parseFloat(az.value)));
+
+  const el = document.createElement("input");
+  el.type = "number";
+  el.min = "-90";
+  el.max = "90";
+  el.step = "15";
+  el.value = String(el0);
+  el.title = "Elevation in degrees (90 = from above, -90 = from below)";
+  el.addEventListener("change", () => {
+    const e = Math.max(-90, Math.min(90, parseFloat(el.value) || 0));
+    el.value = String(e);
+    onEl(e);
+  });
+  return [az, el];
+}
+
+function azLabel(az: number): string {
+  return `${AZIMUTHS.find(([deg]) => deg === az)?.[1] ?? "view"} · ${az}°`;
+}
+
+function updateFrontTag(): void {
+  frontTag.textContent = `main · ${azLabel(mainAz)}${mainEl ? `, ${mainEl}° up` : ""}`;
+  frontTag.classList.toggle("hidden", extraViews.length === 0 || !inputImage);
+}
+
 function renderViews(): void {
   viewUrls.forEach((u) => URL.revokeObjectURL(u));
   viewUrls = [];
-  viewsList.innerHTML = extraViews.length
-    ? `<div class="vhead"><span></span><span>direction</span><span>elev °</span><span></span></div>`
-    : "";
+  viewsList.innerHTML = "";
+  if (extraViews.length) {
+    viewsList.innerHTML = `<div class="vhead"><span></span><span>direction</span><span>elev °</span><span></span></div>`;
+    // The main image's own direction (default front, level): the other views are
+    // placed relative to the object the same way.
+    const row = document.createElement("div");
+    row.className = "vrow vmain";
+    row.title = `${inputName} (main image)`;
+    const img = document.createElement("img");
+    if (inputImage) {
+      const url = URL.createObjectURL(inputImage);
+      viewUrls.push(url);
+      img.src = url;
+    }
+    img.alt = "main image";
+    row.appendChild(img);
+    const [az, el] = directionControls(mainAz, mainEl,
+      (a) => { mainAz = a; updateFrontTag(); },
+      (e) => { mainEl = e; updateFrontTag(); });
+    row.append(az, el);
+    const tag = document.createElement("span");
+    tag.className = "vmain-tag";
+    tag.textContent = "main";
+    row.appendChild(tag);
+    viewsList.appendChild(row);
+  }
   extraViews.forEach((v, i) => {
     const row = document.createElement("div");
     row.className = "vrow";
@@ -161,27 +229,10 @@ function renderViews(): void {
     img.alt = v.name;
     row.appendChild(img);
 
-    const az = document.createElement("select");
-    az.title = "Azimuth: where the camera was, going around the object";
-    for (const [deg, label] of AZIMUTHS) az.add(new Option(`${label} · ${deg}°`, String(deg)));
-    if (!AZIMUTHS.some(([deg]) => deg === v.az)) az.add(new Option(`${v.az}°`, String(v.az)));
-    az.value = String(v.az);
-    az.addEventListener("change", () => (extraViews[i].az = parseFloat(az.value)));
-    row.appendChild(az);
-
-    const el = document.createElement("input");
-    el.type = "number";
-    el.min = "-90";
-    el.max = "90";
-    el.step = "15";
-    el.value = String(v.el);
-    el.title = "Elevation in degrees (90 = from above, -90 = from below)";
-    el.addEventListener("change", () => {
-      const e = Math.max(-90, Math.min(90, parseFloat(el.value) || 0));
-      extraViews[i].el = e;
-      el.value = String(e);
-    });
-    row.appendChild(el);
+    const [az, el] = directionControls(v.az, v.el,
+      (a) => (extraViews[i].az = a),
+      (e) => (extraViews[i].el = e));
+    row.append(az, el);
 
     const del = document.createElement("button");
     del.className = "vdel";
@@ -197,7 +248,7 @@ function renderViews(): void {
     viewsList.appendChild(row);
   });
   const multi = extraViews.length > 0;
-  frontTag.classList.toggle("hidden", !multi || !inputImage);
+  updateFrontTag();
   clearViewsBtn.classList.toggle("hidden", !multi);
   mvAdv.classList.toggle("hidden", !multi);
   addViewBtn.disabled = extraViews.length + 1 >= MAX_VIEWS;

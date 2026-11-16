@@ -121,8 +121,8 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
   fd.append("image", image, "input.png");
   if (views.length) {
     views.forEach((v, i) => fd.append("image", v.image, `view${i + 1}.png`));
-    fd.append("azimuths", ["0", ...views.map((v) => String(v.az))].join(","));
-    fd.append("elevations", ["0", ...views.map((v) => String(v.el))].join(","));
+    fd.append("azimuths", [p.mainAz ?? 0, ...views.map((v) => v.az)].map(String).join(","));
+    fd.append("elevations", [p.mainEl ?? 0, ...views.map((v) => v.el)].map(String).join(","));
     // Only override the server's launch defaults when the user changed them.
     if (p.blendTemp !== DEFAULT_PARAMS.blendTemp) fd.append("blend_temp", String(p.blendTemp));
     if (p.frontAxis !== DEFAULT_PARAMS.frontAxis) fd.append("front_axis", p.frontAxis);
