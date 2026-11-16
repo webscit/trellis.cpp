@@ -47,6 +47,9 @@ struct RemeshOptions {
     // lattice rays leaving the grid unobstructed counts as interior even if the flood could
     // reach it (see remesh_dc.cpp). 0 = flood only; higher fills deeper concavities.
     int   seal = 0;
+    // Solid only: relax the vertices whose position the field does not determine (the caps
+    // over sealed tears and filled pockets) as a membrane pinned to the measured surface.
+    bool  smooth_caps = true;
     // Flat base (solid only): everything below `base_plane` (input-mesh coordinate along
     // `base_axis`, 0/1/2) is cut away and capped with an exactly planar face, so the print
     // has a bed-contact surface. The plane snaps to the nearest half grid layer. -1 = off.

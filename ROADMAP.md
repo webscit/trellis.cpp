@@ -97,7 +97,7 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
       planar base), `--print-wall`, `--print-seal`; server fields + `/jobs/{id}/3mf`;
       `trellis-print` for existing meshes; Studio "3D print" toggle
 - ☐ Finer openness sampling (26 rays cannot tell a deep vase from a torn figurine)
-- ☐ Smooth the caps over sealed tears (they are stair-stepped at the vote's grid)
+- ☑ Cap smoothing: membrane relaxation of the vertices the field does not determine
 - ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
 - ☑ Studio export split button (GLB / 3MF)
 - ☐ Per-vertex colour for slicers that ignore textures

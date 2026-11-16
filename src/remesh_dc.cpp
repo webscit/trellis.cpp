@@ -241,6 +241,9 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
 
     // ---- solid mode: signed field from an exterior flood fill ------------------------
     int base_axis = -1, base_layer = 0;   // vertices with index < base_layer are cut away
+    // Grid vertices whose field value is invented rather than measured: re-signed by the
+    // fill, or outside the narrow band altogether. A crossing next to one is a cap vertex.
+    std::vector<uint8_t> synthetic;
     if (solid) {
         // The contoured field decides the sign wherever it is known, so the flood and the
         // crossings cannot disagree by a rounding ulp.
@@ -385,10 +388,11 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         // Re-sign the field. A filled vertex (f >= 0 but not exterior) goes negative, a cut
         // vertex goes positive; magnitudes are kept away from 0 so crossings stay interior.
         const float half = 0.5f * cell;
+        synthetic.assign((size_t)Nv, 0);
         int64_t filled = 0, cut_away = 0;
         for (int64_t i = 0; i < Nv; ++i) {
             const bool in = is_solid(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
-            if (in && fvert[i] >= 0)      { fvert[i] = -std::max(fvert[i], half); ++filled; }
+            if (in && fvert[i] >= 0)      { fvert[i] = -std::max(fvert[i], half); ++filled; synthetic[(size_t)i] = 1; }
             else if (!in && fvert[i] < 0) { fvert[i] = std::max(-fvert[i], half); ++cut_away; }
         }
 
@@ -427,6 +431,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                     if (!vmap.emplace(key3(x, y, z), (int)(vcoord.size() / 3)).second) continue;
                     vcoord.push_back(x); vcoord.push_back(y); vcoord.push_back(z);
                     fvert.push_back(is_solid(x, y, z) ? -half : half);
+                    synthetic.push_back(1);
                 }
             }
         std::vector<uint64_t>().swap(wall);
@@ -453,6 +458,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         const float min_fraction = 0.05f;
         std::unordered_map<uint64_t, int32_t> cuts;
         cuts.reserve(acoord.size());
+        std::vector<uint8_t> cap;   // per output vertex: placed by guesswork, free to smooth
         auto cut = [&](int a, int b) -> int32_t {
             const uint32_t lo = (uint32_t)std::min(a, b), hi = (uint32_t)std::max(a, b);
             const uint64_t key = (uint64_t(lo) << 32) | hi;
@@ -468,6 +474,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 mc.verts.push_back((coord / res - 0.5f) * scale);
             }
             cuts.emplace(key, index);
+            cap.push_back(!through_base && (synthetic[(size_t)a] || synthetic[(size_t)b]));
             return index;
         };
         // Cube tables: corner bit0/1/2 = +x/+y/+z; 12 edges; 6 faces as corner cycles.
@@ -554,10 +561,69 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                         for (int d = 0; d < 3; ++d) centre[d] += mc.verts[3 * (size_t)pv[k] + d] / n;
                     const int32_t c = (int32_t)(mc.verts.size() / 3);
                     mc.verts.insert(mc.verts.end(), centre, centre + 3);
+                    uint8_t any_cap = 0;
+                    for (int k = 0; k < n; ++k) any_cap |= cap[(size_t)pv[k]];
+                    cap.push_back(any_cap);
                     for (int k = 0; k < n; ++k) { mc.faces.push_back(c); mc.faces.push_back(pv[k]); mc.faces.push_back(pv[(k + 1) % n]); }
                 }
             }
         }
+        // Cap smoothing. Where the solid's boundary was decided by the openness vote there
+        // is no distance to interpolate, so cap vertices sit mid-edge on the vote's coarse
+        // grid: stair-steps `vote_step` cells high on the visible surface. Relax them as a
+        // membrane -- umbrella averaging with every measured vertex (and the base plane)
+        // pinned -- for enough passes to diffuse a step, not enough to pull a large cap
+        // flat. Connectivity is untouched, so the surface stays the same closed manifold.
+        int64_t smoothed = 0;
+        if (options.smooth_caps) {
+            const int32_t MV = mc.V();
+            std::vector<int32_t> slot((size_t)MV, -1), free_list;
+            for (int32_t v = 0; v < MV; ++v)
+                if (cap[(size_t)v]) { slot[(size_t)v] = (int32_t)free_list.size(); free_list.push_back(v); }
+            smoothed = (int64_t)free_list.size();
+            if (smoothed) {
+                // Neighbours of the free vertices (each edge is seen from its two faces, so
+                // every neighbour appears twice: a uniform weight).
+                std::vector<int32_t> offset((size_t)smoothed + 1, 0);
+                for (size_t f = 0; f + 2 < mc.faces.size(); f += 3)
+                    for (int k = 0; k < 3; ++k) {
+                        const int32_t s = slot[(size_t)mc.faces[f + k]];
+                        if (s >= 0) offset[(size_t)s + 1] += 2;
+                    }
+                for (int64_t i = 0; i < smoothed; ++i) offset[(size_t)i + 1] += offset[(size_t)i];
+                std::vector<int32_t> ring((size_t)offset[(size_t)smoothed]);
+                {
+                    std::vector<int32_t> cursor(offset.begin(), offset.end() - 1);
+                    for (size_t f = 0; f + 2 < mc.faces.size(); f += 3)
+                        for (int k = 0; k < 3; ++k) {
+                            const int32_t s = slot[(size_t)mc.faces[f + k]];
+                            if (s < 0) continue;
+                            ring[(size_t)cursor[(size_t)s]++] = mc.faces[f + (k + 1) % 3];
+                            ring[(size_t)cursor[(size_t)s]++] = mc.faces[f + (k + 2) % 3];
+                        }
+                }
+                const int vote_step = std::max(1, res / 256);
+                const int passes = std::min(96, 6 * vote_step * vote_step);
+                std::vector<float> next((size_t)smoothed * 3);
+                for (int pass = 0; pass < passes; ++pass) {
+                    parallel_for(smoothed, [&](int64_t b, int64_t e) {
+                        for (int64_t i = b; i < e; ++i) {
+                            const int32_t begin = offset[(size_t)i], end = offset[(size_t)i + 1];
+                            const float* p = &mc.verts[3 * (size_t)free_list[(size_t)i]];
+                            float mean[3] = {0, 0, 0};
+                            for (int32_t j = begin; j < end; ++j)
+                                for (int d = 0; d < 3; ++d) mean[d] += mc.verts[3 * (size_t)ring[(size_t)j] + d];
+                            for (int d = 0; d < 3; ++d)
+                                next[3 * (size_t)i + d] = end > begin ? 0.5f * p[d] + 0.5f * mean[d] / (float)(end - begin) : p[d];
+                        }
+                    });
+                    for (int64_t i = 0; i < smoothed; ++i)
+                        for (int d = 0; d < 3; ++d) mc.verts[3 * (size_t)free_list[(size_t)i] + d] = next[3 * (size_t)i + d];
+                }
+                printf("  remesh_solid: smoothed %lld cap vertices (%d passes)\n", (long long)smoothed, passes);
+            }
+        }
+
         const MeshAudit check = audit_mesh(mc.verts.data(), mc.V(), mc.faces.data(), mc.F());
         if (check.boundary_edges == 0 && check.nonmanifold_edges == 0 && check.flipped_edges == 0 &&
             check.nonmanifold_vertices == 0 && check.inverted_components == 0 && mc.F() > 0) {

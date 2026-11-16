@@ -149,6 +149,27 @@ int main(int argc, char** argv) {
         CHECK(capped.watertight() && capped.components == 1 && capped.volume > 0.9 * 0.216,
               "sealed torn box: %s", audit_summary(capped).c_str());
 
+        // Cap smoothing only moves vertices the field does not determine: the capped box is
+        // still closed, its volume barely changes, and the cap (the lowest points under
+        // the torn lid) is no rougher than before.
+        RemeshOptions rough = sealing;
+        rough.smooth_caps = false;
+        const Mesh smooth_mesh = remesh(torn, res, sealing), rough_mesh = remesh(torn, res, rough);
+        auto cap_spread = [](const Mesh& m) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int v = 0; v < m.V(); ++v) {
+                const float* p = &m.verts[3 * (size_t)v];
+                if (std::fabs(p[0]) > 0.06f || std::fabs(p[1]) > 0.06f || p[2] < 0.0f) continue;
+                lo = std::fmin(lo, p[2]); hi = std::fmax(hi, p[2]);
+            }
+            return hi - lo;
+        };
+        CHECK(smooth_mesh.F() == rough_mesh.F(), "smoothing changed the connectivity");
+        CHECK(std::fabs(audit(smooth_mesh).volume - audit(rough_mesh).volume) < 0.02 * 0.216, "smoothing moved the volume: %g vs %g",
+              audit(smooth_mesh).volume, audit(rough_mesh).volume);
+        CHECK(cap_spread(smooth_mesh) <= cap_spread(rough_mesh) + 1e-6f, "cap spread %g after smoothing, %g before",
+              cap_spread(smooth_mesh), cap_spread(rough_mesh));
+
         Mesh tray;
         add_box(tray, std::array<float, 3>{-0.3f, -0.3f, -0.05f}.data(), std::array<float, 3>{0.3f, 0.3f, 0.05f}.data(), 5);
         const MeshAudit open_tray = audit(remesh(tray, res, sealing));

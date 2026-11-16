@@ -71,7 +71,8 @@ has to reach them from outside.
 The solid's boundary now also runs where the narrow band never was (across the caps,
 along the base cut), so after classification every cell with both solid and exterior
 corners is activated; vertices the band did not sample are placed half a cell from the
-boundary. Caps are therefore stair-stepped at the vote's grid (2 cells at res 512).
+boundary. Caps therefore come out stair-stepped at the vote's grid (2 cells at res 512,
+4 at res 1024) and are smoothed afterwards (§2.2b).
 
 Volume against the threshold on the goblin: 0 → 0.0100 (hollow), 2 → 0.0694,
 3 → 0.0702, 5 → 0.0727. The plateau is the filled figure; the slow rise is concave
@@ -95,6 +96,16 @@ coincide with a neighbour's. Crossings are clamped 5 % away from grid vertices (
 zero-area faces). The extraction is audited, and marching tetrahedra on the Kuhn
 subdivision (`TRELLIS_SOLID_TETS=1` forces it; three times the triangles) is the
 fallback.
+
+### 2.2b Cap smoothing (`RemeshOptions::smooth_caps`, on by default)
+
+A crossing is a *cap vertex* when one end of its grid edge has an invented field value
+(re-signed by the fill, or outside the narrow band). After extraction those vertices are
+relaxed as a membrane: umbrella averaging, `6·step²` passes (24 at res 512), with every
+measured vertex and the base plane pinned. Connectivity is untouched, so the mesh is
+the same closed manifold. On the goblin at res 512 (undecimated, 155 K cap vertices of
+1.09 M): mean dihedral 6.67° → 4.38°, edges over 30° 6.75 % → 2.27 %, area 2.50 → 2.38,
+volume 0.0743 → 0.0742. `post-replay --no-cap-smooth` gives the unsmoothed surface.
 
 ### 2.3 Flat base (`--print-base F`)
 
@@ -164,15 +175,14 @@ the result is not watertight.
 - Also run end to end, all auditing watertight with a textured 3MF: `--refine-mesh` at
   res 512 (158 s) and `--model pixal3d` at its 1024 cascade (1020 s; the base is cut on
   the grid's y axis there, and the 3MF still comes out upright).
-- At res 1024 the caps over sealed tears are coarser (the vote runs on a 4-cell grid)
-  and show as rough patches on the surface.
+- Before cap smoothing existed, the caps showed as rough patches at res 1024 (the vote
+  runs on a 4-cell grid there). Smoothing is measured at res 512 only so far.
 - Self-intersections are not checked. The link condition and the flip test keep them
   rare and slicers tolerate them, but the mesh is not guaranteed intersection-free
   (`TRELLIS_QEM_COLLISION_GUARD` exists and is slow).
 - Floating parts: components under 2 % of the largest are dropped; anything larger that
   is not attached to the body is kept and reported as `shells > 1`.
 - Overhangs, supports and orientation are left to the slicer.
-- The caps over sealed tears are stair-stepped and not smoothed.
 - Not done: finer openness sampling, wall thickening of thin parts only (needs a medial-axis estimate),
   hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
 

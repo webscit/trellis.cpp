@@ -5,7 +5,7 @@
 //
 //   post-replay <dump.bin|triangles.obj> <out.glb> [--box-uv] [--faces N] [--atlas T]
 //               [--decim GRID] [--no-weld] [--no-fill]
-//               [--watertight] [--print-base F] [--seal N] [--3mf out.3mf]
+//               [--watertight] [--print-base F] [--seal N] [--no-cap-smooth] [--3mf out.3mf]
 //               [--keep-components] [--dump-geometry mesh.obj]
 //               [--quad-match-output mesh.obj | --quad-safe-output mesh.obj]
 //               [--quad-refine-output quads.obj] [--quad-refine-forced ids.txt]
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     float shape_min_angle = 1.0f;
     float shape_max_move = 0.001f;
     int band = 1;
-    bool watertight = false;
+    bool watertight = false, cap_smooth = true;
     float print_base = 0.0f;
     int seal = -1;
     const char* out_3mf = nullptr;
@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
         else if (a == "--atlas" && i+1 < argc) atlas = atoi(argv[++i]);
         else if (a == "--decim" && i+1 < argc) decim = atoi(argv[++i]);
         else if (a == "--watertight") watertight = true;
+        else if (a == "--no-cap-smooth") cap_smooth = false;
         else if (a == "--print-base" && i+1 < argc) { print_base = (float)atof(argv[++i]); watertight = true; }
         else if (a == "--seal" && i+1 < argc) seal = atoi(argv[++i]);
         else if (a == "--3mf" && i+1 < argc) { out_3mf = argv[++i]; watertight = true; }
@@ -244,6 +245,7 @@ int main(int argc, char** argv) {
         trellis::RemeshOptions remesh_options;
         remesh_options.band = band;
         remesh_options.solid = watertight;
+        remesh_options.smooth_caps = cap_smooth;
         remesh_options.seal = seal >= 0 ? seal : (watertight ? 3 : 0);
         if (watertight && print_base > 0) {
             remesh_options.base_axis = 2;
