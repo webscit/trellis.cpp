@@ -274,13 +274,28 @@ POST /generate      multipart/form-data with an "image" file part; optional text
 POST /refine        a "mesh" part (GLB or OBJ) + one or more "image" parts and the
                     same fields, plus "refine_coords" (auto|encoder|voxel) and
                     "restore_transform" (on|off).
+POST /jobs          asynchronous form of the two above: same fields ("task"=refine for
+                    /refine) -> 202 {"id","status","position"}; errors in the fields
+                    still answer 400 at once.
+GET  /jobs/{id}     -> {"status": queued|running|done|error, "position", "elapsed", "error"}
+GET  /jobs/{id}/result   -> model/gltf-binary (409 while queued or running)
+DELETE /jobs/{id}   cancels a queued job or frees a finished one (409 while running).
 ```
+
+Requests run one at a time, in arrival order. `/generate` and `/refine` hold the connection
+open for the whole run, which at 1024 can be 20 minutes, longer than browsers and proxies
+wait for a response (Firefox gives up after 300 s). Use `/jobs` for long runs or remote
+clients; Trellis Studio does. Finished jobs are kept for 60 minutes.
 
 ```bash
 curl -F image=@front.png -F image=@back.png -F azimuths=0,180 -F resolution=512 \
      http://127.0.0.1:8080/generate -o out.glb
 curl -F mesh=@rough.glb -F image=@front.png -F image=@back.png -F azimuths=0,180 \
      http://127.0.0.1:8080/refine -o refined.glb
+
+id=$(curl -s -F image=@front.png -F resolution=1024 http://127.0.0.1:8080/jobs | jq -r .id)
+curl -s http://127.0.0.1:8080/jobs/$id                       # poll until "done"
+curl -s http://127.0.0.1:8080/jobs/$id/result -o out.glb
 ```
 
 Launch-time flags (including `--res`) set the per-request defaults; each request can

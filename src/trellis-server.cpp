@@ -29,18 +29,34 @@
 //                    "refine_coords" (auto|encoder|voxel) and "restore_transform" (on|off).
 //                    Re-generates the mesh from the view(s) on the mesh's own voxels
 //                    (docs/spec/31-mesh-refine.md). model=pixal3d -> 400.
+//   POST /jobs        asynchronous form of the two above (same fields; "task"=refine selects
+//                    /refine) -> 202 {"id","status","position"}. Use it for long runs: the
+//                    synchronous endpoints hold one request open for the whole run, which a
+//                    browser or proxy may time out (Firefox gives up after 300 s).
+//   GET  /jobs/{id}         -> {"status": queued|running|done|error, "position", "elapsed",
+//                              "error"}
+//   GET  /jobs/{id}/result  -> model/gltf-binary (409 while queued/running)
+//   DELETE /jobs/{id}       cancels a queued job or frees a finished one (409 while running).
+//                    Finished jobs are kept for 60 minutes.
 //
 // Launch-time defaults come from CLI flags (see trellis::parse_args);
 // each request copies those defaults and applies its own overrides. The model
 // directory is resolved once; each request runs the full pipeline via trellis_run()
-// (per-stage load/free, like trellis-cli), serialized by a mutex. Keeping the
-// process resident avoids re-initializing the Vulkan backend on every request.
+// (per-stage load/free, like trellis-cli) on a single worker thread, in arrival order.
+// Keeping the process resident avoids re-initializing the GPU backend on every request.
 #include "trellis_args.h"
 #include "trellis_run.h"
 #include "httplib.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <map>
+#include <memory>
+#include <random>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -225,6 +241,317 @@ bool parse_view_angles(const httplib::Request& req, size_t n, std::vector<trelli
     return true;
 }
 
+std::string json_escape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) break;
+                out += c;
+        }
+    }
+    return out;
+}
+
+void json_error(httplib::Response& res, int status, const std::string& msg) {
+    res.status = status;
+    res.set_content("{\"error\":\"" + json_escape(msg) + "\"}", "application/json");
+}
+
+// One pipeline run: validated params plus the uploaded bytes, staged to disk only when the
+// worker picks it up.
+struct Job {
+    enum class State { Queued, Running, Done, Error, Cancelled };
+    std::string id;
+    bool refine = false;
+    bool sync = false;               // /generate, /refine: the handler waits and then drops it
+    trellis::TrellisParams p;
+    std::string stem;
+    std::vector<std::string> staged; // file paths, parallel to `bytes`
+    std::vector<std::string> bytes;
+    size_t n_images = 0;
+    State state = State::Queued;
+    std::string glb;
+    std::string error;
+    std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point started, finished;
+};
+
+const char* state_name(Job::State s) {
+    switch (s) {
+        case Job::State::Queued:    return "queued";
+        case Job::State::Running:   return "running";
+        case Job::State::Done:      return "done";
+        case Job::State::Error:     return "error";
+        case Job::State::Cancelled: return "cancelled";
+    }
+    return "?";
+}
+
+// Validates a /generate, /refine or /jobs request into a Job. Returns nullptr with a 400 (or
+// 500) already set on `res`.
+std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& res,
+                              const trellis::TrellisParams& base, bool refine) {
+    if (refine && !req.has_file("mesh")) {
+        json_error(res, 400, "missing 'mesh' file part (GLB or OBJ)");
+        return nullptr;
+    }
+    if (!req.has_file("image")) {
+        json_error(res, 400, "missing 'image' file part");
+        return nullptr;
+    }
+    const auto images = req.get_file_values("image");
+
+    auto job = std::make_shared<Job>();
+    job->refine = refine;
+    job->n_images = images.size();
+    // Per-request params start from the launch defaults, then apply overrides.
+    trellis::TrellisParams& p = job->p;
+    p = base;
+    if (!apply_common_fields(req, p, res)) return nullptr;
+    std::vector<trellis::ViewSpec> angles;
+    {
+        std::string error;
+        if (!parse_view_angles(req, images.size(), angles, error)) { bad_request(res, error); return nullptr; }
+        if ((int)images.size() > trellis::kMaxViews) {
+            bad_request(res, "at most " + std::to_string(trellis::kMaxViews) + " images are supported");
+            return nullptr;
+        }
+        if ((images.size() > 1 || refine) && p.family == trellis::ModelFamily::Pixal3D) {
+            bad_request(res, "--model pixal3d does not support multi-view conditioning (--view) or --refine-mesh yet;"
+                             " use --model trellis, or pass a single image.");
+            return nullptr;
+        }
+    }
+
+    std::string mesh_bytes;
+    if (refine) {
+        mesh_bytes = req.get_file_value("mesh").content;
+        if (mesh_bytes.size() < 4) { bad_request(res, "mesh part is empty"); return nullptr; }
+        if (req.has_file("refine_coords")) {
+            const std::string& v = req.get_file_value("refine_coords").content;
+            if      (v == "auto")    p.refine_coords = -1;
+            else if (v == "voxel")   p.refine_coords = 0;
+            else if (v == "encoder") p.refine_coords = 1;
+            else { bad_request(res, "refine_coords must be auto, encoder or voxel"); return nullptr; }
+        }
+        if (req.has_file("restore_transform")) {
+            const std::string& v = req.get_file_value("restore_transform").content;
+            if      (v == "on" || v == "1" || v == "true")   p.refine_restore = true;
+            else if (v == "off" || v == "0" || v == "false") p.refine_restore = false;
+            else { bad_request(res, "restore_transform must be on or off"); return nullptr; }
+        }
+    }
+
+    try {
+        job->stem = temp_stem(p.retopo ? p.retopo_workdir : std::string{});
+    } catch (const std::exception&) {
+        json_error(res, 500, "failed to stage request files");
+        return nullptr;
+    }
+    const std::string& stem = job->stem;
+    // One image and no angle fields: exactly the historical request (p.image, no views).
+    // Otherwise every image is a view: <stem>_v<i>.png at its azimuth/elevation.
+    const bool multi = images.size() > 1 || req.has_file("azimuths") || req.has_file("elevations");
+    if (multi) {
+        p.image.clear();
+        p.views.clear();
+        for (size_t i = 0; i < images.size(); ++i) {
+            job->staged.push_back(stem + "_v" + std::to_string(i) + ".png");
+            job->bytes.push_back(images[i].content);
+            p.views.push_back(trellis::ViewSpec{ job->staged.back(), angles[i].az_deg, angles[i].el_deg });
+        }
+    } else {
+        p.image = stem + ".png";
+        job->staged.push_back(p.image);
+        job->bytes.push_back(images[0].content);
+    }
+    p.output = stem + ".glb";
+    if (refine) {
+        // Detected by magic: binary glTF, else treated as OBJ text (load_mesh re-checks).
+        p.refine_mesh = stem + (mesh_bytes.compare(0, 4, "glTF") == 0 ? "_mesh.glb" : "_mesh.obj");
+        job->staged.push_back(p.refine_mesh);
+        job->bytes.push_back(std::move(mesh_bytes));
+    }
+    return job;
+}
+
+// Runs one job (worker thread only): stage inputs, trellis_run, read the GLB, clean up.
+void execute(Job& job) {
+    trellis::TrellisParams& p = job.p;
+    for (size_t i = 0; i < job.staged.size(); ++i) {
+        if (!write_file_bytes(job.staged[i], job.bytes[i])) {
+            for (const auto& f : job.staged) std::remove(f.c_str());
+            job.error = "failed to stage input image";
+            return;
+        }
+    }
+    fprintf(stderr, "[trellis-server] %s %s: %zu image(s), %zu-byte first image, seed %u, res %s, bg %s, uv %s, faces %d, atlas %s, webp %s, texture %s\n",
+            job.refine ? "refine" : "generate", job.id.c_str(), job.n_images, job.bytes[0].size(), p.seed,
+            p.cascade ? std::to_string(p.hr_res).c_str() : "512",
+            p.birefnet < 0 ? "auto" : (p.birefnet ? "birefnet" : "threshold"), p.xatlas ? "xatlas" : "box",
+            trellis::qem_face_target(p), p.tex > 0 ? std::to_string(p.tex).c_str() : "auto",
+            p.webp < 0 ? "auto" : (p.webp ? "on" : "off"), p.texture ? "on" : "off");
+    job.bytes.clear();
+    job.bytes.shrink_to_fit();
+    std::string error_message = "3D reconstruction failed";
+    try {
+        int rc = trellis_run(p);
+        if (rc == 0) job.glb = read_file_bytes(p.output);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[trellis-server] generate failed: %s\n", e.what());
+        error_message = e.what();
+    }
+    for (const auto& f : job.staged) std::remove(f.c_str());
+    std::remove(p.output.c_str());
+    // trellis_run also writes sibling debug artifacts; clean them up too.
+    std::remove((job.stem + ".ply").c_str());
+    std::remove((job.stem + "_base.png").c_str());
+    if (job.glb.empty()) job.error = error_message;
+}
+
+// FIFO queue with a single worker: one pipeline run at a time, in arrival order. Finished
+// /jobs entries are kept for kRetention so a client can fetch the result after a reload or a
+// dropped connection; DELETE frees one early.
+class JobQueue {
+public:
+    static constexpr std::chrono::minutes kRetention{60};
+
+    JobQueue() : worker_([this] { run(); }) {}
+    ~JobQueue() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        worker_.join();
+    }
+
+    void submit(const std::shared_ptr<Job>& job) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            prune_locked();
+            job->id = new_id_locked();
+            jobs_[job->id] = job;
+            pending_.push_back(job);
+        }
+        cv_.notify_all();
+    }
+
+    // Blocks until the job leaves the queue/running states (the synchronous endpoints).
+    void wait(const std::shared_ptr<Job>& job) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return job->state != Job::State::Queued && job->state != Job::State::Running; });
+        jobs_.erase(job->id);
+    }
+
+    std::shared_ptr<Job> find(const std::string& id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        prune_locked();
+        auto it = jobs_.find(id);
+        return it == jobs_.end() ? nullptr : it->second;
+    }
+
+    // Status JSON for GET /jobs/{id}.
+    std::string status_json(const Job& job) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t position = 0;
+        for (size_t i = 0; i < pending_.size(); ++i)
+            if (pending_[i].get() == &job) position = i + 1;
+        const auto now = std::chrono::steady_clock::now();
+        auto secs = [](auto d) { return std::chrono::duration<double>(d).count(); };
+        std::string s = "{\"id\":\"" + job.id + "\",\"status\":\"" + state_name(job.state) + "\"";
+        if (job.state == Job::State::Queued) s += ",\"position\":" + std::to_string(position);
+        char buf[64];
+        if (job.state == Job::State::Running) {
+            snprintf(buf, sizeof buf, ",\"elapsed\":%.1f", secs(now - job.started));
+            s += buf;
+        }
+        if (job.state == Job::State::Done || job.state == Job::State::Error) {
+            snprintf(buf, sizeof buf, ",\"elapsed\":%.1f", secs(job.finished - job.started));
+            s += buf;
+        }
+        if (job.state == Job::State::Done) s += ",\"size\":" + std::to_string(job.glb.size());
+        if (job.state == Job::State::Error) s += ",\"error\":\"" + json_escape(job.error) + "\"";
+        return s + "}";
+    }
+
+    // DELETE /jobs/{id}: a queued job is cancelled, a finished one is freed; a running job can't
+    // be interrupted (trellis_run has no cancel hook). Returns the HTTP status.
+    int remove(const std::string& id, std::string& msg) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = jobs_.find(id);
+        if (it == jobs_.end()) { msg = "unknown job"; return 404; }
+        Job& job = *it->second;
+        if (job.state == Job::State::Running) { msg = "job is running and can't be cancelled"; return 409; }
+        if (job.state == Job::State::Queued) {
+            job.state = Job::State::Cancelled;
+            for (auto p = pending_.begin(); p != pending_.end(); ++p)
+                if (p->get() == &job) { pending_.erase(p); break; }
+        }
+        jobs_.erase(it);
+        cv_.notify_all();
+        return 200;
+    }
+
+    // Guards Job::state reads that pair with other fields.
+    std::mutex& mutex() { return mu_; }
+
+private:
+    void run() {
+        for (;;) {
+            std::shared_ptr<Job> job;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stop_ || !pending_.empty(); });
+                if (stop_) return;
+                job = pending_.front();
+                pending_.pop_front();
+                job->state = Job::State::Running;
+                job->started = std::chrono::steady_clock::now();
+            }
+            execute(*job);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                job->state = job->error.empty() ? Job::State::Done : Job::State::Error;
+                job->finished = std::chrono::steady_clock::now();
+                prune_locked();
+            }
+            cv_.notify_all();
+        }
+    }
+
+    void prune_locked() {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = jobs_.begin(); it != jobs_.end();) {
+            const Job& j = *it->second;
+            const bool finished = j.state == Job::State::Done || j.state == Job::State::Error;
+            if (!j.sync && finished && now - j.finished > kRetention) it = jobs_.erase(it);
+            else ++it;
+        }
+    }
+
+    std::string new_id_locked() {
+        static std::mt19937_64 rng{std::random_device{}()};
+        char buf[32];
+        snprintf(buf, sizeof buf, "%u-%08x", ++counter_, (unsigned)(rng() & 0xffffffffu));
+        return buf;
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::shared_ptr<Job>> pending_;
+    std::map<std::string, std::shared_ptr<Job>> jobs_;
+    unsigned counter_ = 0;
+    bool stop_ = false;
+    std::thread worker_;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -238,7 +565,7 @@ int main(int argc, char** argv) {
         return base.help ? 0 : 1;
     }
 
-    std::mutex gen_mu;
+    JobQueue queue;
     httplib::Server svr;
 
     // Trellis Studio (and any browser client) calls this server from a different
@@ -248,7 +575,7 @@ int main(int argc, char** argv) {
     // OPTIONS. Applied to every route via the post-routing hook + a catch-all OPTIONS.
     svr.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
         res.set_header("Access-Control-Max-Age", "86400");
     });
@@ -260,141 +587,62 @@ int main(int argc, char** argv) {
         res.set_content("ok", "text/plain");
     });
 
-    // /generate and /refine share everything but the mesh part.
-    auto run_request = [&](const httplib::Request& req, httplib::Response& res, bool refine) {
-        if (refine && !req.has_file("mesh")) {
-            res.status = 400;
-            res.set_content("{\"error\":\"missing 'mesh' file part (GLB or OBJ)\"}", "application/json");
-            return;
-        }
-        if (!req.has_file("image")) {
-            res.status = 400;
-            res.set_content("{\"error\":\"missing 'image' file part\"}", "application/json");
-            return;
-        }
-        const auto images = req.get_file_values("image");
-
-        // Per-request params start from the launch defaults, then apply overrides.
-        trellis::TrellisParams p = base;
-        if (!apply_common_fields(req, p, res)) return;
-        std::vector<trellis::ViewSpec> angles;
-        {
-            std::string error;
-            if (!parse_view_angles(req, images.size(), angles, error)) { bad_request(res, error); return; }
-            if ((int)images.size() > trellis::kMaxViews) {
-                bad_request(res, "at most " + std::to_string(trellis::kMaxViews) + " images are supported");
-                return;
-            }
-            if ((images.size() > 1 || refine) && p.family == trellis::ModelFamily::Pixal3D) {
-                bad_request(res, "--model pixal3d does not support multi-view conditioning (--view) or --refine-mesh yet;"
-                                 " use --model trellis, or pass a single image.");
-                return;
-            }
-        }
-
-        std::string mesh_bytes;
-        if (refine) {
-            mesh_bytes = req.get_file_value("mesh").content;
-            if (mesh_bytes.size() < 4) { bad_request(res, "mesh part is empty"); return; }
-            if (req.has_file("refine_coords")) {
-                const std::string& v = req.get_file_value("refine_coords").content;
-                if      (v == "auto")    p.refine_coords = -1;
-                else if (v == "voxel")   p.refine_coords = 0;
-                else if (v == "encoder") p.refine_coords = 1;
-                else { bad_request(res, "refine_coords must be auto, encoder or voxel"); return; }
-            }
-            if (req.has_file("restore_transform")) {
-                const std::string& v = req.get_file_value("restore_transform").content;
-                if      (v == "on" || v == "1" || v == "true")   p.refine_restore = true;
-                else if (v == "off" || v == "0" || v == "false") p.refine_restore = false;
-                else { bad_request(res, "restore_transform must be on or off"); return; }
-            }
-        }
-
-        std::string stem;
-        try {
-            stem = temp_stem(p.retopo ? p.retopo_workdir : std::string{});
-        } catch (const std::exception& e) {
-            res.status = 500;
-            res.set_content("{\"error\":\"failed to stage request files\"}", "application/json");
-            return;
-        }
-        // One image and no angle fields: exactly the historical request (p.image, no views).
-        // Otherwise every image is a view: <stem>_v<i>.png at its azimuth/elevation.
-        const bool multi = images.size() > 1 || req.has_file("azimuths") || req.has_file("elevations");
-        std::vector<std::string> staged;
-        if (multi) {
-            p.image.clear();
-            p.views.clear();
-            for (size_t i = 0; i < images.size(); ++i) {
-                staged.push_back(stem + "_v" + std::to_string(i) + ".png");
-                p.views.push_back(trellis::ViewSpec{ staged.back(), angles[i].az_deg, angles[i].el_deg });
-            }
-        } else {
-            p.image = stem + ".png";
-            staged.push_back(p.image);
-        }
-        p.output = stem + ".glb";
-        if (refine) {
-            // Detected by magic: binary glTF, else treated as OBJ text (load_mesh re-checks).
-            p.refine_mesh = stem + (mesh_bytes.compare(0, 4, "glTF") == 0 ? "_mesh.glb" : "_mesh.obj");
-            staged.push_back(p.refine_mesh);
-        }
-
-        std::string glb;
-        std::string error_message = "3D reconstruction failed";
-        {
-            std::lock_guard<std::mutex> lk(gen_mu);
-            for (size_t i = 0; i < staged.size(); ++i) {
-                const std::string& bytes = (refine && i + 1 == staged.size()) ? mesh_bytes : images[i].content;
-                if (!write_file_bytes(staged[i], bytes)) {
-                    for (const auto& f : staged) std::remove(f.c_str());
-                    res.status = 500;
-                    res.set_content("{\"error\":\"failed to stage input image\"}", "application/json");
-                    return;
-                }
-            }
-            fprintf(stderr, "[trellis-server] %s: %zu image(s), %zu-byte first image, seed %u, res %s, bg %s, uv %s, faces %d, atlas %s, webp %s, texture %s\n",
-                    refine ? "refine" : "generate", images.size(), images[0].content.size(), p.seed, p.cascade ? std::to_string(p.hr_res).c_str() : "512",
-                    p.birefnet < 0 ? "auto" : (p.birefnet ? "birefnet" : "threshold"), p.xatlas ? "xatlas" : "box",
-                    trellis::qem_face_target(p), p.tex > 0 ? std::to_string(p.tex).c_str() : "auto",
-                    p.webp < 0 ? "auto" : (p.webp ? "on" : "off"), p.texture ? "on" : "off");
-            try {
-                int rc = trellis_run(p);
-                if (rc == 0) glb = read_file_bytes(p.output);
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[trellis-server] generate failed: %s\n", e.what());
-                error_message = e.what();
-            }
-            for (const auto& f : staged) std::remove(f.c_str());
-            std::remove(p.output.c_str());
-            // trellis_run also writes sibling debug artifacts; clean them up too.
-            std::remove((stem + ".ply").c_str());
-            std::remove((stem + "_base.png").c_str());
-        }
-
-        if (glb.empty()) {
-            res.status = 500;
-            std::string escaped;
-            for (char c : error_message) {
-                switch (c) {
-                    case '"':  escaped += "\\\""; break;
-                    case '\\': escaped += "\\\\"; break;
-                    case '\n': escaped += "\\n";  break;
-                    case '\r': escaped += "\\r";  break;
-                    case '\t': escaped += "\\t";  break;
-                    default:
-                        if ((unsigned char)c < 0x20) break;
-                        escaped += c;
-                }
-            }
-            res.set_content("{\"error\":\"" + escaped + "\"}", "application/json");
-            return;
-        }
-        res.set_content(glb.data(), glb.size(), "model/gltf-binary");
+    // /generate and /refine: synchronous -- queue the job and hold the connection until it is
+    // done. Kept for curl and older clients; a long run can outlast a browser's or proxy's
+    // response timeout, which is what /jobs avoids.
+    auto run_sync = [&](const httplib::Request& req, httplib::Response& res, bool refine) {
+        auto job = make_job(req, res, base, refine);
+        if (!job) return;
+        job->sync = true;
+        queue.submit(job);
+        queue.wait(job);
+        if (job->state == Job::State::Cancelled) { json_error(res, 500, "job was cancelled"); return; }
+        if (job->state != Job::State::Done) { json_error(res, 500, job->error); return; }
+        res.set_content(job->glb.data(), job->glb.size(), "model/gltf-binary");
     };
-    svr.Post("/generate", [&](const httplib::Request& req, httplib::Response& res) { run_request(req, res, false); });
-    svr.Post("/refine",   [&](const httplib::Request& req, httplib::Response& res) { run_request(req, res, true); });
+    svr.Post("/generate", [&](const httplib::Request& req, httplib::Response& res) { run_sync(req, res, false); });
+    svr.Post("/refine",   [&](const httplib::Request& req, httplib::Response& res) { run_sync(req, res, true); });
+
+    // Asynchronous jobs: POST /jobs takes the /generate form (plus "task"=refine with a "mesh"
+    // part for /refine) and answers 202 {"id",...} at once; GET /jobs/{id} reports
+    // queued (with position) / running / done / error; GET /jobs/{id}/result returns the GLB;
+    // DELETE /jobs/{id} cancels a queued job or frees a finished one.
+    svr.Post("/jobs", [&](const httplib::Request& req, httplib::Response& res) {
+        bool refine = false;
+        if (req.has_file("task")) {
+            const std::string& t = req.get_file_value("task").content;
+            if      (t == "refine")   refine = true;
+            else if (t != "generate") { json_error(res, 400, "task must be generate or refine"); return; }
+        }
+        auto job = make_job(req, res, base, refine);
+        if (!job) return;
+        queue.submit(job);
+        res.status = 202;
+        res.set_content(queue.status_json(*job), "application/json");
+    });
+    svr.Get(R"(/jobs/([\w-]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        auto job = queue.find(req.matches[1]);
+        if (!job) { json_error(res, 404, "unknown job (finished jobs are kept for 60 minutes)"); return; }
+        res.set_content(queue.status_json(*job), "application/json");
+    });
+    svr.Get(R"(/jobs/([\w-]+)/result)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto job = queue.find(req.matches[1]);
+        if (!job) { json_error(res, 404, "unknown job (finished jobs are kept for 60 minutes)"); return; }
+        Job::State st;
+        {
+            std::lock_guard<std::mutex> lk(queue.mutex());
+            st = job->state;
+        }
+        if (st == Job::State::Error) { json_error(res, 500, job->error); return; }
+        if (st != Job::State::Done)  { json_error(res, 409, std::string("job is ") + state_name(st)); return; }
+        res.set_content(job->glb.data(), job->glb.size(), "model/gltf-binary");
+    });
+    svr.Delete(R"(/jobs/([\w-]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        std::string msg;
+        const int status = queue.remove(req.matches[1], msg);
+        if (status != 200) { json_error(res, status, msg); return; }
+        res.set_content("{\"ok\":true}", "application/json");
+    });
 
     fprintf(stderr, "[trellis-server] models=%s gpu=%d listening on http://%s:%d\n",
             base.models.c_str(), base.gpu, base.host.c_str(), base.port);
