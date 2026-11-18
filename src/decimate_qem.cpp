@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include "tri_bvh.h"
 #include "triangle_intersection.h"
@@ -71,9 +72,9 @@ inline uint64_t pack_cost(int id, float c) { uint32_t b; std::memcpy(&b, &c, 4);
 // only if it is the strict minimum-cost edge over every face incident to either endpoint,
 // so no two collapses in a round share a face or vertex (matches the CUDA propagate+own check).
 void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& faces, int& F,
-                    float lam_len, float lam_skinny, float thresh) {
+                    float lam_len, float lam_skinny, float thresh, bool keep_topology) {
     auto vat = [&](int i) -> V3 { return {verts[3*i], verts[3*i+1], verts[3*i+2]}; };
-    const bool preserve_topology = std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
+    const bool preserve_topology = keep_topology || std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
     const bool collision_guard = std::getenv("TRELLIS_QEM_COLLISION_GUARD") != nullptr;
     float normal_cos2 = -1.0f;
     if (const char* setting = std::getenv("TRELLIS_QEM_MAX_NORMAL_CHANGE_DEG")) {
@@ -181,7 +182,11 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
     // edge collapse cost + collapse target
     std::vector<float> cost((size_t)E);
     std::vector<V3> vnew((size_t)E);
-    for (int t = 0; t < E; ++t) {
+    // Each edge's cost reads shared state and writes only its own slot, so the loop is
+    // split across threads; the result is identical to the serial order.
+    const int cost_threads = E < 65536 ? 1 : (int)std::max(1u, std::thread::hardware_concurrency());
+    auto cost_range = [&](int t_begin, int t_end) {
+    for (int t = t_begin; t < t_end; ++t) {
         int e0 = (int)(edges[t] >> 32), e1 = (int)(edges[t] & 0xffffffffu);
         V3 v0 = vat(e0), v1 = vat(e1);
         float w0 = 0.5f;
@@ -205,6 +210,14 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
             continue;
         }
         cost[t] = c;
+    }
+    };
+    if (cost_threads == 1) cost_range(0, E);
+    else {
+        std::vector<std::thread> workers;
+        const int chunk = (E + cost_threads - 1) / cost_threads;
+        for (int b = 0; b < E; b += chunk) workers.emplace_back(cost_range, b, std::min(E, b + chunk));
+        for (auto& w : workers) w.join();
     }
 
     // propagate each edge's (cost,id) to all faces touching either endpoint (min-reduce)
@@ -342,12 +355,13 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
 } // namespace
 
 void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<int32_t>& in_faces, int F0,
-                  int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
+                  int target_faces, std::vector<float>& ov, std::vector<int32_t>& of,
+                  bool keep_topology) {
     std::vector<float> verts = in_verts;
     std::vector<int32_t> faces = in_faces;
     int V = V0, F = F0;
     if (F <= target_faces) { ov = verts; of = faces; return; }
-    const bool preserve_topology = std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
+    const bool preserve_topology = keep_topology || std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
     const bool bounded_normals = std::getenv("TRELLIS_QEM_MAX_NORMAL_CHANGE_DEG") != nullptr;
     const bool collision_guard = std::getenv("TRELLIS_QEM_COLLISION_GUARD") != nullptr;
 
@@ -372,7 +386,7 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
     const float lam_len = 1e-2f, lam_skinny = 1e-3f;
     int prevF = F, stalls = 0;
     for (int round = 0; round < 400 && F > target_faces; ++round) {
-        simplify_round(verts, V, faces, F, lam_len, lam_skinny, thresh);
+        simplify_round(verts, V, faces, F, lam_len, lam_skinny, thresh, preserve_topology);
         if (F <= target_faces) break;
         int removed = prevF - F;
         if (removed <= 0) { if (++stalls >= 2) { thresh *= 10.0f; stalls = 0; } }

@@ -22,6 +22,9 @@ export interface ExtraView {
 }
 
 /** Generation knobs mapped onto trellis-server's POST /generate form fields. */
+/** --print-interior: what is sealed inside the model. */
+export type PrintInterior = "auto" | "solid" | "hollow";
+
 export interface GenParams {
   resolution: Resolution;
   seed: number;
@@ -29,6 +32,17 @@ export interface GenParams {
   uv: Uv;
   /** false => geometry only (server field texture=off). */
   texture: boolean;
+  /** true => one closed, manifold solid for 3D printing (server field watertight=on). */
+  watertight?: boolean;
+  /** 3D print options, sent only with watertight (server fields print_*). */
+  printSize?: number; // mm, longest side
+  printBase?: string; // "auto" | "0" | fraction of the height
+  printWall?: number; // mm, 0 = off
+  printInterior?: PrintInterior;
+  /** Filament colours in the 3MF (server field print_colors): 0 = textured 3MF, else 2..32. */
+  printColors?: number;
+  /** Older records: 0 = keep hollow, anything else = the then default. */
+  printSeal?: number;
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
@@ -50,6 +64,12 @@ export const DEFAULT_PARAMS: GenParams = {
   bgRemoval: "auto",
   uv: "xatlas",
   texture: true,
+  watertight: false,
+  printSize: 100,
+  printBase: "auto",
+  printWall: 0.8,
+  printInterior: "auto",
+  printColors: 0,
   blendTemp: 2,
   frontAxis: "-y",
 };
@@ -68,6 +88,23 @@ export interface AppConfig {
   configured: boolean;
 }
 
+/** trellis-server's printability report (GET /jobs/{id}/report). */
+export interface PrintReport {
+  ok: boolean;
+  size_mm: [number, number, number];
+  volume_cm3: number;
+  surface_cm2: number;
+  watertight: boolean;
+  shells: number;
+  triangles: number;
+  wall: { target_mm: number; thinnest_1pct_mm: number; at_least: boolean; thin_area_pct: number };
+  base: { flat: boolean; contact_mm2: number; stands: boolean; tip_angle_deg: number };
+  overhang_pct: number;
+  /** Present when the 3MF carries filament colours: slot 1.. by surface share. */
+  colors?: { patches: number; palette: { slot: number; hex: string; share_pct: number }[] };
+  warnings: string[];
+}
+
 /** One persisted generation (IndexedDB record). */
 export interface GenRecord {
   id: string;
@@ -77,6 +114,10 @@ export interface GenRecord {
   input: Blob; // source image (the front view)
   views?: ExtraView[]; // extra views (multi-view); absent on single-image records
   glb: Blob | null; // resulting model/gltf-binary; null while pending
+  /** The same model as a 3MF (made when "3D print" is on); absent otherwise. */
+  model3mf?: Blob | null;
+  /** Printability report of a "3D print" run; absent otherwise. */
+  report?: PrintReport | null;
   /** true while the server is still working on it (the entry survives reloads). */
   pending?: boolean;
   /** trellis-server job id of a pending entry, to resume polling after a reload. */

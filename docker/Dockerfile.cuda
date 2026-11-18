@@ -40,7 +40,7 @@ RUN cmake -S . -B build \
         -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
         "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"
 RUN cmake --build build --config Release -j$(nproc) \
-        --target trellis-cli trellis-server trellis-devices
+        --target trellis-cli trellis-server trellis-devices trellis-print
 
 ############################################################################
 # rootfs: assemble a FROM-scratch root with the binaries and the exact shared
@@ -57,7 +57,7 @@ RUN set -eux; \
     printf 'trellis:x:1000:1000:trellis.cpp:/home/trellis:/sbin/nologin\n' > "$root/etc/passwd"; \
     printf 'trellis:x:1000:\n' > "$root/etc/group"; \
     printf 'hosts: files dns\npasswd: files\ngroup: files\n' > "$root/etc/nsswitch.conf"; \
-    cp -a build/trellis-cli build/trellis-server build/trellis-devices "$root/opt/trellis/bin/"; \
+    cp -a build/trellis-cli build/trellis-server build/trellis-devices build/trellis-print "$root/opt/trellis/bin/"; \
     for so in build/lib*.so*; do [ -e "$so" ] && cp -a "$so" "$root/opt/trellis/lib/"; done; \
     apt-get update -qq && apt-get install -y --no-install-recommends patchelf >/dev/null; \
     rm -rf /var/lib/apt/lists/*; \

@@ -5,6 +5,7 @@
 //
 //   post-replay <dump.bin|triangles.obj> <out.glb> [--box-uv] [--faces N] [--atlas T]
 //               [--decim GRID] [--no-weld] [--no-fill]
+//               [--watertight] [--print-base F] [--seal N] [--no-cap-smooth] [--wall-cells N] [--neck-cells N] [--open-ball N] [--base-auto MAXF] [--3mf out.3mf]
 //               [--keep-components] [--dump-geometry mesh.obj]
 //               [--quad-match-output mesh.obj | --quad-safe-output mesh.obj]
 //               [--quad-refine-output quads.obj] [--quad-refine-forced ids.txt]
@@ -16,6 +17,7 @@
 #include "remesh_dc.h"
 #include "mesh_glb.h"
 #include "mesh_shape.h"
+#include "mesh_print.h"
 #include "quad_refinement.h"
 #include "quad_refinement_io.h"
 #include "quad_components.h"
@@ -84,6 +86,11 @@ int main(int argc, char** argv) {
     float shape_min_angle = 1.0f;
     float shape_max_move = 0.001f;
     int band = 1;
+    bool watertight = false, cap_smooth = true;
+    float wall_cells = 0.0f, neck_cells = 0.0f, open_ball = 0.0f, base_auto_max = 0.0f, report_wall = 0.0f;
+    float print_base = 0.0f;
+    int seal = -1;
+    const char* out_3mf = nullptr;
     int faces_target = 300000, atlas = 2048, decim = -1, geometry_res = 0;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
@@ -91,6 +98,16 @@ int main(int argc, char** argv) {
         else if (a == "--faces" && i+1 < argc) faces_target = atoi(argv[++i]);
         else if (a == "--atlas" && i+1 < argc) atlas = atoi(argv[++i]);
         else if (a == "--decim" && i+1 < argc) decim = atoi(argv[++i]);
+        else if (a == "--watertight") watertight = true;
+        else if (a == "--no-cap-smooth") cap_smooth = false;
+        else if (a == "--wall-cells" && i+1 < argc) { wall_cells = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--report-wall" && i+1 < argc) report_wall = (float)atof(argv[++i]);
+        else if (a == "--base-auto" && i+1 < argc) { base_auto_max = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--print-base" && i+1 < argc) { print_base = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--seal" && i+1 < argc) seal = atoi(argv[++i]);
+        else if (a == "--neck-cells" && i+1 < argc) { neck_cells = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--open-ball" && i+1 < argc) { open_ball = (float)atof(argv[++i]); watertight = true; }
+        else if (a == "--3mf" && i+1 < argc) { out_3mf = argv[++i]; watertight = true; }
         else if (a == "--no-weld") do_weld = false;
         else if (a == "--no-fill") do_fill = false;
         else if (a == "--no-bake") do_bake = false;
@@ -231,13 +248,27 @@ int main(int argc, char** argv) {
     printf("  [bvh %.1fs]\n", now()-t); t = now();
     trellis::Mesh rm;
     if (do_remesh) {
+        trellis::RemeshOptions remesh_options;
+        remesh_options.band = band;
+        remesh_options.solid = watertight;
+        remesh_options.smooth_caps = cap_smooth;
+        remesh_options.seal = seal >= 0 ? seal : (watertight ? 3 : 0);
+        remesh_options.min_wall_cells = wall_cells;
+        remesh_options.min_neck_cells = neck_cells;
+        remesh_options.open_ball_cells = open_ball;
+        if (watertight && (print_base > 0 || base_auto_max > 0)) {
+            remesh_options.base_axis = 2;
+            remesh_options.base_plane = trellis::base_plane_of(verts.data(), (int64_t)verts.size()/3, 2, print_base);
+            remesh_options.base_auto = base_auto_max > 0;
+            remesh_options.base_plane_max = trellis::base_plane_of(verts.data(), (int64_t)verts.size()/3, 2, base_auto_max);
+        }
         rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
-                                            faces.data(), (int64_t)faces.size()/3, bvh, geometry_res, band);
+                                            faces.data(), (int64_t)faces.size()/3, bvh, geometry_res, remesh_options);
         printf("  [remesh %.1fs]\n", now()-t); t = now();
         audit("remesh", rm.faces);
         // match the CLI: clean degenerates/unify winding, drop floater components
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            if (!watertight) trellis::clean_mesh(rm.V(), rm.faces);
             audit("clean_mesh", rm.faces);
             if (!keep_components) {
                 int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
@@ -254,9 +285,9 @@ int main(int argc, char** argv) {
     else if (decim == 0) { dv = sverts; df = sfaces; }
     else {
         // match the CLI: faithful QEM port (not the old meshopt/FQMS decimate_simplify)
-        trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, faces_target, dv, df);
+        trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, faces_target, dv, df, watertight);
         audit("decimate_qem", df);
-        if (!std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
+        if (!watertight && !std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
             !std::getenv("TRELLIS_QEM_COLLISION_GUARD")) {
             if (do_weld) {
                 trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)geometry_res * 8.0f));
@@ -274,6 +305,16 @@ int main(int argc, char** argv) {
         }
     }
     printf("  [decimate %.1fs]\n", now()-t); t = now();
+    if (watertight) {
+        trellis::repair_for_print(dv, df);
+        printf("  watertight: %s\n", trellis::audit_summary(
+            trellis::audit_mesh(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3)).c_str());
+        fputs(trellis::print_report_text(trellis::print_report(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3,
+                                                               100.0f, 2, report_wall > 0 ? report_wall : wall_cells * 100.0f / (float)geometry_res)).c_str(), stdout);
+        if (out_3mf && !do_bake)
+            if (!trellis::write_3mf(out_3mf, dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3))
+                fprintf(stderr, "cannot write %s\n", out_3mf);
+    }
     if (shape_flips) {
         auto result = trellis::flip_skinny_triangles(dv,df,shape_min_angle);
         printf("  shape_flips: accepted=%d collisions=%d swept=%d\n",

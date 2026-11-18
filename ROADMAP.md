@@ -89,6 +89,28 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
 - ☑ Server job API (`/jobs`): FIFO queue, poll + fetch, so long runs survive client/proxy
       response timeouts; Studio uses it and resumes pending jobs after a reload
 
+## M8 — 3D printing
+- ☑ `--watertight`: signed field from an exterior flood fill + openness vote (caps the tears
+      in the decoded surface), marching cubes by cycles (closed 2-manifold by construction),
+      link-condition QEM, audit of the mesh and of the GLB buffer (spec 32)
+- ☑ `--3mf`: textured 3MF in mm, z-up, on the plate; `--print-size`, `--print-base` (exact
+      planar base), `--print-wall`, `--print-interior`; server fields + `/jobs/{id}/3mf`;
+      `trellis-print` for existing meshes; Studio "3D print" toggle
+- ☑ Thin walls grown locally to `--print-wall`; `--print-base auto` (stability search, pedestal
+      fallback); printability report (log, `--print-report`, `/jobs/{id}/report`)
+- ☑ Vessels stay open: an open ball tells a cup's mouth from a tear (`--print-interior auto`,
+      default; `solid` / `hollow` force either way)
+- ☑ Necks: joints between thick parts narrower than twice `--print-wall` are thickened
+- ☑ Cap smoothing: membrane relaxation of the vertices the field does not determine
+- ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
+- ☑ Studio export split button (GLB / 3MF); print options (size, flat base, minimum wall,
+      interior) under the "3D print" toggle; print report under the preview
+- ☑ Filament colours for multi-material printers: `--print-colors N` (2..32) reduces the
+      texture to N colours, one per triangle, written as Orca `paint_color` + basematerials
+      + the filament list; checked in Snapmaker Orca 2.4.1; Studio "3MF colours" + palette
+      in the report
+- ☐ Colour boundaries finer than the mesh (sub-triangle paint)
+
 ## Validation strategy
 Full reference env needs CUDA-only extensions (o-voxel, flash-attn, spconv, nvdiffrast) that
 don't all install here, so we validate **per-component**: dump reference outputs for each module

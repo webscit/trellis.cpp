@@ -74,7 +74,7 @@ Examples:
 2. Adjust **Resolution** (512 light / 1024 cascade / 1536 high), **seed**,
    **background removal**, and **UV unwrap** if you like.
 3. **Generate 3D** — this takes a few minutes; the live stage line shows progress.
-4. **Rotate/zoom** in the preview; **Reset view** re-frames; **Save GLB…** exports.
+4. **Rotate/zoom** in the preview; **Reset view** re-frames; **Export to GLB** saves the model; the arrow beside it picks the format (GLB, or 3MF when "3D print" was on). Turning **3D print** on reveals the print size, flat base, minimum wall and interior options, and adds a print report under the preview.
 5. Every result is saved to a local **gallery** (IndexedDB) — click a thumbnail to
    reload it, even after restarting the app.
 

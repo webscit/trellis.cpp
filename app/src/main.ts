@@ -5,7 +5,7 @@ import { renderSettings } from "./settings";
 import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphemeral, newId, put } from "./store";
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
-import { AUTO_AZ, DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord } from "./types";
+import { AUTO_AZ, DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -20,7 +20,9 @@ const progressStage = $("progress-stage");
 const progressElapsed = $("progress-elapsed");
 const cancelBtn = $<HTMLButtonElement>("cancel-btn");
 const resetViewBtn = $<HTMLButtonElement>("reset-view");
-const saveGlbBtn = $<HTMLButtonElement>("save-glb");
+const exportBtn = $<HTMLButtonElement>("export-btn");
+const exportMenuBtn = $<HTMLButtonElement>("export-menu-btn");
+const exportMenu = $("export-menu");
 const viewerCaption = $("viewer-caption");
 const galleryEl = $("gallery");
 const clearGalleryBtn = $("clear-gallery");
@@ -41,7 +43,8 @@ const viewer = new Viewer($("viewer-mount"));
 let inputImage: Blob | null = null;
 let inputName = "input.png";
 let currentGlb: Blob | null = null;
-let currentName = "model"; // file name stem for "Save GLB…" of the model in the viewer
+let current3mf: Blob | null = null; // the viewer model as a 3MF, when the run made one
+let currentName = "model"; // file name stem for exports of the model in the viewer
 // Set when the user opens a gallery item during a run: the result then goes to the
 // gallery without taking over the viewer.
 let browsedAway = false;
@@ -68,6 +71,12 @@ function readParams(): GenParams {
     bgRemoval: ($("ctl-bg") as HTMLSelectElement).value as GenParams["bgRemoval"],
     uv: ($("ctl-uv") as HTMLSelectElement).value as GenParams["uv"],
     texture: ($("ctl-tex") as HTMLSelectElement).value !== "off",
+    watertight: ($("ctl-print") as HTMLSelectElement).value === "on",
+    printSize: readNumber("ctl-print-size", DEFAULT_PARAMS.printSize!, 5, 2000),
+    printBase: ($("ctl-print-base") as HTMLSelectElement).value,
+    printWall: readNumber("ctl-print-wall", DEFAULT_PARAMS.printWall!, 0, 20),
+    printInterior: ($("ctl-print-interior") as HTMLSelectElement).value as PrintInterior,
+    printColors: parseInt(($("ctl-print-colors") as HTMLSelectElement).value, 10) || 0,
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
     autoYaw: ($("ctl-yaw") as HTMLSelectElement).value === "auto",
@@ -76,6 +85,12 @@ function readParams(): GenParams {
     mainAz,
     mainEl,
   };
+}
+
+/** A number input's value, clamped; the fallback when it is empty or not a number. */
+function readNumber(id: string, fallback: number, lo: number, hi: number): number {
+  const n = parseFloat(($(id) as HTMLInputElement).value);
+  return isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
 }
 
 function readBlendTemp(): number {
@@ -90,6 +105,14 @@ function applyParams(p: GenParams): void {
   ($("ctl-uv") as HTMLSelectElement).value = p.uv;
   // records saved before this option existed have no field: treat as textured
   ($("ctl-tex") as HTMLSelectElement).value = p.texture === false ? "off" : "on";
+  ($("ctl-print") as HTMLSelectElement).value = p.watertight ? "on" : "off";
+  // records saved before the print options existed have none of these fields
+  ($("ctl-print-size") as HTMLInputElement).value = String(p.printSize ?? DEFAULT_PARAMS.printSize);
+  ($("ctl-print-base") as HTMLSelectElement).value = p.printBase ?? DEFAULT_PARAMS.printBase!;
+  ($("ctl-print-wall") as HTMLInputElement).value = String(p.printWall ?? DEFAULT_PARAMS.printWall);
+  ($("ctl-print-interior") as HTMLSelectElement).value = p.printInterior ?? (p.printSeal === 0 ? "hollow" : DEFAULT_PARAMS.printInterior!);
+  ($("ctl-print-colors") as HTMLSelectElement).value = String(p.printColors ?? DEFAULT_PARAMS.printColors);
+  syncPrintOptions();
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
   ($("ctl-front") as HTMLSelectElement).value = p.frontAxis ?? DEFAULT_PARAMS.frontAxis;
@@ -394,7 +417,7 @@ async function runJob(
   abort = new AbortController();
   let running = false;
   try {
-    const { glb } = await work(abort.signal, {
+    const { glb, model3mf, report } = await work(abort.signal, {
       onJob: async (id) => {
         // A pending gallery entry: it survives a reload, which resumes the job.
         rec.jobId = id;
@@ -407,7 +430,7 @@ async function runJob(
         progressStage.textContent = describeJob(st);
       },
     });
-    await finishRecord(rec, glb);
+    await finishRecord(rec, glb, model3mf, report);
   } catch (e) {
     await removeRecord(rec.id);
     await refreshGallery();
@@ -425,8 +448,10 @@ async function runJob(
 }
 
 /** Store a finished generation; show it unless the user is browsing another item. */
-async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
+async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob, report?: PrintReport): Promise<void> {
   rec.glb = glb;
+  rec.model3mf = model3mf ?? null;
+  rec.report = report ?? null;
   rec.pending = false;
   delete rec.jobId;
   const nViews = rec.views?.length ?? 0;
@@ -443,6 +468,8 @@ async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
       const mv = nViews ? `_mv${nViews + 1}` : "";
       const fname = `${stem}_${rec.params.resolution}${mv}_seed${rec.params.seed}_${rec.id}.glb`;
       savedPath = await saveToOutputDir(fname, bytes);
+      if (model3mf)
+        await saveToOutputDir(fname.replace(/\.glb$/, ".3mf"), new Uint8Array(await model3mf.arrayBuffer()));
     } catch (e) {
       toast(`Auto-save to output folder failed: ${(e as Error).message}`, "err");
     }
@@ -466,6 +493,8 @@ async function finishRecord(rec: GenRecord, glb: Blob): Promise<void> {
   }
   toast(savedPath ? `Saved to ${savedPath}` : "Generation complete", "ok");
   currentGlb = glb;
+  current3mf = model3mf ?? null;
+  showPrintReport(rec.report);
   currentName = stem;
   activeId = rec.id;
   setViewerTools(true);
@@ -524,13 +553,156 @@ cancelBtn.addEventListener("click", () => abort?.abort());
 // ---- viewer tools ----
 function setViewerTools(on: boolean): void {
   resetViewBtn.disabled = !on;
-  saveGlbBtn.disabled = !on;
+  exportBtn.disabled = !on;
+  exportMenuBtn.disabled = !on;
+  if (!on) closeExportMenu();
 }
 resetViewBtn.addEventListener("click", () => viewer.resetView());
-saveGlbBtn.addEventListener("click", async () => {
+
+// ---- 3D print: options follow the toggle; the report follows the model in the viewer ----
+const printOpts = $("print-opts");
+function syncPrintOptions(): void {
+  printOpts.classList.toggle("hidden", ($("ctl-print") as HTMLSelectElement).value !== "on");
+}
+$("ctl-print").addEventListener("change", syncPrintOptions);
+syncPrintOptions();
+
+const reportEl = $<HTMLDetailsElement>("print-report");
+/** The server words its advice as CLI flags; say it with this app's control names. */
+function studioWording(warning: string): string {
+  return warning
+    .replace("raise --print-wall or --print-size", 'raise "Minimum wall" or "Print size"')
+    .replace("use --print-base auto for a wider base", 'set "Flat base" to auto for a wider base')
+    .replace("use --print-base auto", 'set "Flat base" to auto')
+    .replace("use --print-base", 'choose a "Flat base"');
+}
+function showPrintReport(report: PrintReport | null | undefined): void {
+  reportEl.classList.toggle("hidden", !report);
+  if (!report) return;
+  const badge = $("print-report-badge");
+  badge.textContent = report.ok ? "Ready to print" : `${report.warnings.length} warning${report.warnings.length === 1 ? "" : "s"}`;
+  badge.classList.toggle("warn", !report.ok);
+  const [w, d, h] = report.size_mm;
+  $("print-report-line").textContent =
+    `${w.toFixed(0)} × ${d.toFixed(0)} × ${h.toFixed(0)} mm · ${report.volume_cm3.toFixed(1)} cm³`;
+
+  const rows = $("print-report-rows");
+  rows.replaceChildren();
+  const row = (label: string, value: string, bad = false) => {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dd.classList.toggle("bad", bad);
+    rows.append(dt, dd);
+  };
+  row("Watertight", report.watertight ? `yes · ${report.shells} shell${report.shells === 1 ? "" : "s"}` : "no",
+      !report.watertight || report.shells > 1);
+  row("Walls",
+      `thinnest 1% of the surface is ${report.wall.at_least ? "at least " : ""}${report.wall.thinnest_1pct_mm.toFixed(2)} mm · ` +
+      `${report.wall.thin_area_pct.toFixed(1)}% under ${report.wall.target_mm.toFixed(2)} mm (fine relief included)`,
+      report.wall.thinnest_1pct_mm < 0.75 * report.wall.target_mm);
+  row("Base",
+      !report.base.flat ? "not flat" :
+      `flat · ${report.base.contact_mm2.toFixed(0)} mm² · ` +
+      (report.base.stands ? `tips over at ${report.base.tip_angle_deg.toFixed(0)}°` : "falls over"),
+      !report.base.flat || !report.base.stands || report.base.tip_angle_deg < 10);
+  row("Overhangs", `${report.overhang_pct.toFixed(0)}% of the surface steeper than 45°`, report.overhang_pct > 25);
+  row("Triangles", report.triangles.toLocaleString());
+  if (report.colors && report.colors.palette.length) {
+    // One swatch per filament slot, in slot order, with its share of the surface on hover.
+    const dt = document.createElement("dt");
+    dt.textContent = "Colours";
+    const dd = document.createElement("dd");
+    const note = document.createElement("div");
+    note.textContent = `${report.colors.palette.length} filaments · ${report.colors.patches.toLocaleString()} patches`;
+    const strip = document.createElement("div");
+    strip.className = "swatches";
+    for (const c of report.colors.palette) {
+      const s = document.createElement("span");
+      s.className = "swatch";
+      s.style.background = c.hex;
+      s.title = `slot ${c.slot} · ${c.hex} · ${c.share_pct.toFixed(1)}%`;
+      strip.append(s);
+    }
+    dd.append(note, strip);
+    rows.append(dt, dd);
+  }
+
+  const list = $("print-report-warnings");
+  list.replaceChildren(...report.warnings.map((text) => {
+    const li = document.createElement("li");
+    li.textContent = studioWording(text);
+    return li;
+  }));
+  reportEl.open = !report.ok; // warnings open by themselves; a clean report stays one line
+}
+
+// ---- export: | Export to GLB | v | ----
+// The main button exports in the chosen format; the arrow opens the format menu. The choice
+// is a per-user convenience, so it lives in localStorage (and works without it).
+type ExportFormat = "glb" | "3mf";
+const EXPORT_LABEL: Record<ExportFormat, string> = { glb: "GLB", "3mf": "3MF" };
+let exportFormat: ExportFormat = "glb";
+try {
+  if (localStorage.getItem("export-format") === "3mf") exportFormat = "3mf";
+} catch { /* storage unavailable: keep the default */ }
+
+function exportItems(): HTMLButtonElement[] {
+  return Array.from(exportMenu.querySelectorAll<HTMLButtonElement>("button[data-format]"));
+}
+function setExportFormat(f: ExportFormat): void {
+  exportFormat = f;
+  exportBtn.textContent = `Export to ${EXPORT_LABEL[f]}`;
+  for (const item of exportItems()) item.setAttribute("aria-checked", String(item.dataset.format === f));
+  try { localStorage.setItem("export-format", f); } catch { /* ignore */ }
+}
+function closeExportMenu(): void {
+  exportMenu.classList.add("hidden");
+  exportMenuBtn.setAttribute("aria-expanded", "false");
+}
+function openExportMenu(): void {
+  exportMenu.classList.remove("hidden");
+  exportMenuBtn.setAttribute("aria-expanded", "true");
+  (exportItems().find((i) => i.dataset.format === exportFormat) ?? exportItems()[0])?.focus();
+}
+setExportFormat(exportFormat);
+
+exportMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (exportMenu.classList.contains("hidden")) openExportMenu();
+  else closeExportMenu();
+});
+exportMenu.addEventListener("click", (e) => {
+  const item = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-format]");
+  if (!item) return;
+  setExportFormat(item.dataset.format as ExportFormat);
+  closeExportMenu();
+  exportBtn.focus();
+});
+exportMenu.addEventListener("keydown", (e) => {
+  const items = exportItems();
+  const at = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    items[(at + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
+  } else if (e.key === "Escape") {
+    closeExportMenu();
+    exportMenuBtn.focus();
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!exportMenu.contains(e.target as Node)) closeExportMenu();
+});
+
+exportBtn.addEventListener("click", async () => {
   if (!currentGlb) return;
-  const bytes = new Uint8Array(await currentGlb.arrayBuffer());
-  const ok = await saveBytes(`${currentName}.glb`, bytes);
+  if (exportFormat === "3mf" && !current3mf) {
+    toast('This model has no 3MF. Set "3D print" to "watertight solid" and generate again.', "err");
+    return;
+  }
+  const blob = exportFormat === "3mf" ? current3mf! : currentGlb;
+  const ok = await saveBytes(`${currentName}.${exportFormat}`, new Uint8Array(await blob.arrayBuffer()));
   if (ok) toast("Saved", "ok");
 });
 
@@ -563,6 +735,8 @@ async function loadRecord(id: string): Promise<void> {
   extraViews = (rec.views ?? []).map((v) => ({ ...v }));
   renderViews();
   currentGlb = rec.glb;
+  current3mf = rec.model3mf ?? null;
+  showPrintReport(rec.report);
   currentName = rec.name.replace(/\.[^.]+$/, "") || "model";
   activeId = rec.id;
   setViewerTools(true);

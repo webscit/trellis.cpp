@@ -28,18 +28,23 @@ export async function listen<T>(
  * the fs plugin. In the browser, trigger a normal download.
  */
 export async function saveBytes(defaultName: string, bytes: Uint8Array): Promise<boolean> {
+  // The format follows the file name's extension (GLB unless it says 3MF).
+  const is3mf = /\.3mf$/i.test(defaultName);
+  const kind = is3mf
+    ? { name: "3MF", extensions: ["3mf"], mime: "model/3mf" }
+    : { name: "glTF binary", extensions: ["glb"], mime: "model/gltf-binary" };
   if (isTauri()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const { writeFile } = await import("@tauri-apps/plugin-fs");
     const path = await save({
       defaultPath: defaultName,
-      filters: [{ name: "glTF binary", extensions: ["glb"] }],
+      filters: [{ name: kind.name, extensions: kind.extensions }],
     });
     if (!path) return false;
     await writeFile(path, bytes);
     return true;
   }
-  const blob = new Blob([bytes as BlobPart], { type: "model/gltf-binary" });
+  const blob = new Blob([bytes as BlobPart], { type: kind.mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;

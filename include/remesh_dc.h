@@ -26,4 +26,55 @@ Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, 
                            const TriBvh& bvh, int res, int band = 1,
                            float project_back = 0.0f);
 
+// Solid (watertight) variant for 3D printing — docs/spec/32-print-ready.md.
+//
+// The plain remesh contours |UDF| = eps, which around a closed input is TWO shells: the
+// outer skin and a mirror-image inner one eps inside it. A slicer reads that as a hollow
+// object with a 2*eps wall (0.4 % of the model at res 512). `solid` turns the unsigned
+// field into a signed one before contouring: grid vertices farther than eps from the
+// surface are flood-filled from the domain boundary, and whatever the flood cannot reach
+// (the band itself, the cavity behind it, any internal geometry) is solid. The band is
+// >= 2 cells thick, so the 6-connected flood cannot leak through a closed surface, and
+// holes narrower than 2*eps are sealed for free. The surface is then extracted by
+// marching tetrahedra on the Kuhn subdivision, which is a closed, consistently oriented
+// 2-manifold by construction (no ambiguous cases, unlike dual contouring) with outward
+// normals. `project_back` is ignored.
+struct RemeshOptions {
+    int   band = 1;
+    float project_back = 0.0f;
+    bool  solid = false;
+    // Solid only: seal tears wider than the band. A vertex with fewer than `seal` of its 26
+    // lattice rays leaving the grid unobstructed counts as interior even if the flood could
+    // reach it (see remesh_dc.cpp). 0 = flood only; higher fills deeper concavities.
+    int   seal = 0;
+    // Solid with seal: openings a ball of this radius (grid cells) can pass through from
+    // outside are real (the mouth of a cup or a vase), and the free space that ball reaches
+    // stays exterior even where the vote would shut it. Tears are narrower and stay capped.
+    // 0 = off: every point the vote shuts is filled. See open_ball_cells_for (mesh_print.h).
+    float open_ball_cells = 0.0f;
+    // Solid only: relax the vertices whose position the field does not determine (the caps
+    // over sealed tears and filled pockets) as a membrane pinned to the measured surface.
+    bool  smooth_caps = true;
+    // Flat base (solid only): everything below `base_plane` (input-mesh coordinate along
+    // `base_axis`, 0/1/2) is cut away and capped with an exactly planar face, so the print
+    // has a bed-contact surface. The plane snaps to the nearest half grid layer. -1 = off.
+    int   base_axis = -1;
+    float base_plane = 0.0f;
+    // Stability search (with base_axis): raise the cut from base_plane, at most to
+    // base_plane_max, until the model would have to tilt base_tip_deg before its centre of
+    // mass leaves the footprint; if no cut gets there, the most stable one is used.
+    bool  base_auto = false;
+    float base_plane_max = 0.0f;
+    float base_tip_deg = 15.0f;
+    // Solid only: minimum wall thickness in grid cells. Features thinner than this (and
+    // only those) are grown; 0 = off. The band already guarantees 2*band cells.
+    float min_wall_cells = 0.0f;
+    // Solid only: minimum neck diameter in grid cells. Where two thick parts of the model
+    // are joined only through a cross-section smaller than a disc of this diameter (a
+    // wrist, an ankle, a head on a thin neck), the joint is thickened to it; 0 = off.
+    float min_neck_cells = 0.0f;
+};
+Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                           const TriBvh& bvh, int res, const RemeshOptions& options);
+
 }  // namespace trellis

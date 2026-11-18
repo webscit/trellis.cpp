@@ -90,6 +90,27 @@ struct TrellisParams {
     int  normal_map = 0;        // bake a tangent-space normal map from the remeshed shell onto the
                                 //   decimated mesh and add it to the GLB as a third texture
                                 //   (--normal-map on|off, server "normal_map"; default off)
+    // ---- 3D printing (docs/spec/32-print-ready.md) ----
+    bool  watertight = false;   // --watertight: rebuild the mesh as one closed solid (exterior
+                                //   flood fill + manifold extraction), decimate without changing
+                                //   the topology, audit the result. The GLB itself is the solid.
+    std::string out_3mf;        // --3mf PATH: also write a 3MF (mm, z-up, on the plate, textured
+                                //   when a texture was baked). Implies watertight.
+    float print_size = 100.0f;  // --print-size MM: longest side of the 3MF
+    float print_base = 0.0f;    // --print-base F|auto: cut this fraction of the height off the
+                                //   bottom for a flat bed-contact face (0 = off). auto (-1):
+                                //   the lowest cut the model stands on, else a pedestal.
+                                //   Implies watertight.
+    std::string print_report;   // --print-report PATH: write the printability report as JSON
+    std::string print_interior = "auto";   // --print-interior auto|solid|hollow: auto caps tears
+                                //   in the decoded surface and keeps wide openings (cups, vases)
+                                //   open; solid fills those too; hollow caps nothing
+    float print_wall = 0.8f;    // --print-wall MM: minimum wall at print_size; features thinner
+                                //   than this are grown locally (0 = off)
+    int   print_colors = 0;     // --print-colors N: 3MF with N filament colours (2..32), one per
+                                //   triangle, instead of the texture (0 = off)
+    float print_speck = 4.0f;   // --print-speck MM2: colour patches smaller than this merge
+    float print_color_lift = 0.3f;  // --print-color-lift F: shadow lift before the palette (0 = off)
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast
@@ -199,6 +220,12 @@ bool parse_faces_arg(const char* value, TrellisParams& p, std::string& error);
 // --faces only steers the QEM path; reject it alongside --decim (cluster grid or 0 = keep
 // full mesh) rather than silently ignoring it. Call after all params are applied.
 bool check_faces_compat(const TrellisParams& p, std::string& error);
+
+// ---- 3D printing (--watertight & co / server fields) ----
+// name is print-size | print-base | print-wall | print-interior. Shared by the CLI and trellis-server.
+bool parse_print_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error);
+// Watertight output needs the QEM path (or --decim 0): cluster decimation tears the surface.
+bool check_print_compat(const TrellisParams& p, std::string& error);
 
 // ---- UV atlas size (--atlas / server field "atlas") ----
 // Side length in px of the square textures baked onto the mesh (base color + metallic/

@@ -14,6 +14,13 @@
 //                      "extend_pixel", "texture" (on|off; off = geometry
 //                      only, like --no-texture), and "normal_map" (on|off;
 //                      on = bake a tangent-space normal map, like --normal-map).
+//                      3D printing (docs/spec/32-print-ready.md): "watertight" (on|off;
+//                      on = the GLB is one closed manifold solid, like --watertight),
+//                      "print_base" (0..0.5 or auto, flat base), "print_wall" (mm), "print_size"
+//                      (mm), "print_interior" (auto|solid|hollow), and "3mf" (on|off; on also builds a textured 3MF, served by
+//                      GET /jobs/{id}/3mf -- /jobs only). "print_colors" (0 or 2..32) makes that
+//                      3MF carry N filament colours instead of the texture (needs 3mf=on); "print_speck" (mm2)
+//                      and "print_color_lift" tune it.
 //                      Returns model/gltf-binary.
 //
 //                    Multi-view (docs/spec/30-multiview.md): send several "image" parts
@@ -38,6 +45,8 @@
 //   GET  /jobs/{id}         -> {"status": queued|running|done|error, "position", "elapsed",
 //                              "error"}
 //   GET  /jobs/{id}/result  -> model/gltf-binary (409 while queued/running)
+//   GET  /jobs/{id}/3mf     -> model/3mf, when the job was submitted with "3mf"=on (else 404)
+//   GET  /jobs/{id}/report  -> the printability report as JSON, for a watertight job (else 404)
 //   DELETE /jobs/{id}       cancels a queued job or frees a finished one (409 while running).
 //                    Finished jobs are kept for 60 minutes.
 //
@@ -156,6 +165,35 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
         if      (n == "off" || n == "0" || n == "false") p.normal_map = 0;
         else if (n == "on"  || n == "1" || n == "true")  p.normal_map = 1;
         else { bad_request(res, "normal_map must be on or off"); return false; }
+    }
+    if (req.has_file("watertight")) {
+        const std::string& w = req.get_file_value("watertight").content;
+        if      (w == "off" || w == "0" || w == "false") p.watertight = false;
+        else if (w == "on"  || w == "1" || w == "true")  p.watertight = true;
+        else { bad_request(res, "watertight must be on or off"); return false; }
+    }
+    for (const auto& field : {std::pair<const char*, const char*>{"print_size", "print-size"},
+                              {"print_base", "print-base"}, {"print_wall", "print-wall"},
+                              {"print_interior", "print-interior"}, {"print_colors", "print-colors"},
+                              {"print_speck", "print-speck"}, {"print_color_lift", "print-color-lift"}}) {
+        if (!req.has_file(field.first)) continue;
+        std::string error;
+        if (!trellis::parse_print_arg(field.second, req.get_file_value(field.first).content.c_str(), p, error)) {
+            bad_request(res, error);
+            return false;
+        }
+    }
+    if (req.has_file("3mf")) {
+        const std::string& m = req.get_file_value("3mf").content;
+        if      (m == "off" || m == "0" || m == "false") p.out_3mf.clear();
+        else if (m == "on"  || m == "1" || m == "true")  { p.out_3mf = "pending"; p.watertight = true; }   // path set in make_job
+        else { bad_request(res, "3mf must be on or off"); return false; }
+    } else p.out_3mf.clear();   // a launch-time --3mf path is not per-request state
+    p.print_report.clear();     // likewise; make_job points it at the job's own file
+    if (p.print_colors > 0 && p.out_3mf.empty()) { bad_request(res, "print_colors needs 3mf=on"); return false; }
+    {
+        std::string error;
+        if (!trellis::check_print_compat(p, error)) { bad_request(res, error); return false; }
     }
     if (req.has_file("webp")) {
         const std::string& w = req.get_file_value("webp").content;
@@ -298,6 +336,8 @@ struct Job {
     size_t n_images = 0;
     State state = State::Queued;
     std::string glb;
+    std::string model_3mf;   // the 3MF bytes, when the request asked for one
+    std::string report;      // printability report (JSON), for a watertight job
     std::string error;
     std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point started, finished;
@@ -393,6 +433,8 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
         job->bytes.push_back(images[0].content);
     }
     p.output = stem + ".glb";
+    if (!p.out_3mf.empty()) p.out_3mf = stem + ".3mf";
+    if (p.watertight) p.print_report = stem + ".print.json";
     if (refine) {
         // Detected by magic: binary glTF, else treated as OBJ text (load_mesh re-checks).
         p.refine_mesh = stem + (mesh_bytes.compare(0, 4, "glTF") == 0 ? "_mesh.glb" : "_mesh.obj");
@@ -424,6 +466,8 @@ void execute(Job& job) {
     try {
         int rc = trellis_run(p);
         if (rc == 0) job.glb = read_file_bytes(p.output);
+        if (rc == 0 && !p.out_3mf.empty()) job.model_3mf = read_file_bytes(p.out_3mf);
+        if (rc == 0 && !p.print_report.empty()) job.report = read_file_bytes(p.print_report);
     } catch (const std::exception& e) {
         fprintf(stderr, "[trellis-server] generate failed: %s\n", e.what());
         error_message = e.what();
@@ -433,6 +477,8 @@ void execute(Job& job) {
     // trellis_run also writes sibling debug artifacts; clean them up too.
     std::remove((job.stem + ".ply").c_str());
     std::remove((job.stem + "_base.png").c_str());
+    if (!p.out_3mf.empty()) std::remove(p.out_3mf.c_str());
+    if (!p.print_report.empty()) std::remove(p.print_report.c_str());
     if (job.glb.empty()) job.error = error_message;
 }
 
@@ -657,6 +703,32 @@ int main(int argc, char** argv) {
         if (st == Job::State::Error) { json_error(res, 500, job->error); return; }
         if (st != Job::State::Done)  { json_error(res, 409, std::string("job is ") + state_name(st)); return; }
         res.set_content(job->glb.data(), job->glb.size(), "model/gltf-binary");
+    });
+    svr.Get(R"(/jobs/([\w-]+)/3mf)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto job = queue.find(req.matches[1]);
+        if (!job) { json_error(res, 404, "unknown job (finished jobs are kept for 60 minutes)"); return; }
+        Job::State st;
+        {
+            std::lock_guard<std::mutex> lk(queue.mutex());
+            st = job->state;
+        }
+        if (st == Job::State::Error) { json_error(res, 500, job->error); return; }
+        if (st != Job::State::Done)  { json_error(res, 409, std::string("job is ") + state_name(st)); return; }
+        if (job->model_3mf.empty())  { json_error(res, 404, "this job was not submitted with 3mf=on"); return; }
+        res.set_content(job->model_3mf.data(), job->model_3mf.size(), "model/3mf");
+    });
+    svr.Get(R"(/jobs/([\w-]+)/report)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto job = queue.find(req.matches[1]);
+        if (!job) { json_error(res, 404, "unknown job (finished jobs are kept for 60 minutes)"); return; }
+        Job::State st;
+        {
+            std::lock_guard<std::mutex> lk(queue.mutex());
+            st = job->state;
+        }
+        if (st == Job::State::Error) { json_error(res, 500, job->error); return; }
+        if (st != Job::State::Done)  { json_error(res, 409, std::string("job is ") + state_name(st)); return; }
+        if (job->report.empty())     { json_error(res, 404, "this job was not submitted with watertight=on"); return; }
+        res.set_content(job->report, "application/json");
     });
     svr.Delete(R"(/jobs/([\w-]+))", [&](const httplib::Request& req, httplib::Response& res) {
         std::string msg;
