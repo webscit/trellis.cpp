@@ -8,7 +8,7 @@
 //                   -> model/gltf-binary, or JSON {"error": "..."} on failure.
 
 import { apiBase, loadConfig } from "./config";
-import { DEFAULT_PARAMS, type ExtraView, type GenParams } from "./types";
+import { AUTO_AZ, DEFAULT_PARAMS, type ExtraView, type GenParams } from "./types";
 
 async function base(): Promise<string> {
   return apiBase(await loadConfig());
@@ -121,11 +121,15 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
   fd.append("image", image, "input.png");
   if (views.length) {
     views.forEach((v, i) => fd.append("image", v.image, `view${i + 1}.png`));
-    fd.append("azimuths", [p.mainAz ?? 0, ...views.map((v) => v.az)].map(String).join(","));
+    const az = (a: number) => (a === AUTO_AZ ? "auto" : String(a));
+    fd.append("azimuths", [p.mainAz ?? 0, ...views.map((v) => v.az)].map(az).join(","));
     fd.append("elevations", [p.mainEl ?? 0, ...views.map((v) => v.el)].map(String).join(","));
     // Only override the server's launch defaults when the user changed them.
     if (p.blendTemp !== DEFAULT_PARAMS.blendTemp) fd.append("blend_temp", String(p.blendTemp));
     if (p.frontAxis !== DEFAULT_PARAMS.frontAxis) fd.append("front_axis", p.frontAxis);
+    if (p.autoYaw) fd.append("yaw_offset", "auto");
+    if (p.ssMode && p.ssMode !== "fill") fd.append("mv_ss", p.ssMode);
+    if (p.visibility) fd.append("mv_visibility", "on");
   }
   fd.append("seed", String(p.seed));
   fd.append("resolution", String(p.resolution));

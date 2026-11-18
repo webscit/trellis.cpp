@@ -10,6 +10,7 @@
 #include "pixal3d.h"
 #include "flow_runner.h"
 #include "multiview.h"
+#include "mv_pose.h"
 #include "mesh_io.h"
 #include "mesh_voxelize.h"
 #include "shape_encoder.h"
@@ -443,6 +444,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
     }
     bm.free(); bm_loaded = false;
+    // Bbox-normalised mattes for the pose checks (mv_pose.h). Taken now: the cutouts of views
+    // 1.. are released once DINOv3 has encoded them.
+    std::vector<trellis::Silhouette> mattes;
+    if (V > 1)
+        for (int v = 0; v < V; ++v)
+            mattes.push_back(trellis::matte_silhouette(vd[v].cutout.data(), vd[v].cut_sz, vd[v].cut_sz));
 
     // --dump-bg: write the bg-removal cutout next to the output; --bg-only: stop here.
     // View 0 keeps the historical <out>_cutout.png; view i > 0 writes <out>_cutout_v<i>.png.
@@ -562,6 +569,83 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         return pc;
     };
 
+    // Pose checks (include/mv_pose.h): compare each view's matte with the silhouettes of an
+    // occupancy that does not depend on the views' angles (the front-view sparse structure, or
+    // the refine mesh), then pick the yaw offset, fill in "auto" azimuths and flag suspicious
+    // ones. Updates `views` / `blend` in place for the stages that follow.
+    bool any_auto = false;
+    for (int v = 1; v < V; ++v) any_auto = any_auto || views[v].auto_az;
+    const bool pose_on = V > 1 && (cfg.yaw_auto || any_auto || cfg.check_views);
+    auto pose_check = [&](const vector<std::array<int,3>>& cells, int G, const char* source) {
+        const double tp = now();
+        const trellis::PoseTable t = trellis::pose_table(cells, G, views, mattes, blend.front);
+        std::vector<bool> known(V);
+        for (int v = 0; v < V; ++v) known[v] = !views[v].auto_az;
+        printf("[pose] silhouette IoU of the %s (%d cells @%d) vs each matte\n"
+               "      (azimuths in the views' frame; the model's frame is az + yaw offset)\n", source, (int)cells.size(), G);
+        if (cfg.yaw_auto) {
+            const trellis::YawChoice yc = trellis::choose_yaw(t, views, known);
+            printf("      yaw 0/90/180/270: %.3f %.3f %.3f %.3f -> yaw offset %g%s\n", yc.scores[0], yc.scores[1],
+                   yc.scores[2], yc.scores[3], yc.yaw, yc.ambiguous ? " (ambiguous: another yaw is within the margin)" : "");
+            blend.yaw_offset = yc.yaw;
+        }
+        const float yaw = blend.yaw_offset;
+        std::vector<float> placed;
+        for (int v = 0; v < V; ++v) if (known[v]) placed.push_back(views[v].az_deg);
+        for (int v = 0; v < V; ++v) {
+            const trellis::AzChoice ac = trellis::choose_azimuth(t, v, yaw, placed);
+            auto alts = [&] {
+                std::string a;
+                for (float x : ac.alternatives) { char b[24]; snprintf(b, sizeof b, "%s%g", a.empty() ? "" : "/", x); a += b; }
+                return a;
+            };
+            if (!known[v]) {
+                views[v].az_deg = ac.az;
+                placed.push_back(ac.az);
+                printf("      view %d: az auto -> %g (IoU %.3f)%s%s\n", v, ac.az, ac.iou,
+                       ac.alternatives.size() > 1 ? ", ambiguous between " : "", ac.alternatives.size() > 1 ? alts().c_str() : "");
+                continue;
+            }
+            const float sup = t.at(v, views[v].az_deg + yaw);
+            float best = 0; int kb = 0;
+            for (size_t k = 0; k < t.iou[v].size(); ++k) if (t.iou[v][k] > best) { best = t.iou[v][k]; kb = (int)k; }
+            const float best_az = std::fmod(kb * t.step - yaw + 720.0f, 360.0f);
+            printf("      view %d: az %g (+ yaw %g) IoU %.3f; best fit az %g IoU %.3f\n", v, views[v].az_deg, yaw,
+                   sup, best_az, best);
+            if (v > 0 && best - sup > 0.08f)
+                printf("      [warn] view %d (%s): its silhouette fits az %s better than the supplied %g (IoU %.3f vs"
+                       " %.3f). Check the angle -- or the generated object's proportions differ from the photo's.\n",
+                       v, views[v].image.c_str(), alts().c_str(), views[v].az_deg, best, sup);
+        }
+        for (int v = 0; v < V; ++v) {
+            const auto d = trellis::view_dir_grid(views[v].az_deg, views[v].el_deg, blend);
+            printf("      view %d: az %.1f el %.1f (+ yaw %g) -> grid dir (%+.3f, %+.3f, %+.3f)\n", v,
+                   views[v].az_deg, views[v].el_deg, blend.yaw_offset, d[0], d[1], d[2]);
+        }
+        // TRELLIS_DBG_POSE=<dir>: write each matte and the occupancy silhouettes at 0/90/180/270
+        // (yaw 0) as PGM images, for eyeballing the pose decisions.
+        if (const char* dd = std::getenv("TRELLIS_DBG_POSE")) {
+            auto pgm = [&](const std::string& f, const trellis::Silhouette& sil) {
+                if (FILE* fp = fopen((std::string(dd) + "/" + f).c_str(), "wb")) {
+                    fprintf(fp, "P5 %d %d 255\n", trellis::kSilSize, trellis::kSilSize);
+                    for (uint8_t b : sil) fputc(b ? 255 : 0, fp);
+                    fclose(fp);
+                }
+            };
+            trellis::BlendParams b0 = blend; b0.yaw_offset = 0;
+            for (int v = 0; v < V; ++v) pgm("matte_v" + std::to_string(v) + ".pgm", mattes[v]);
+            for (int a = 0; a < 360; a += 90)
+                pgm("occ_az" + std::to_string(a) + ".pgm", trellis::voxel_silhouette(cells, G, (float)a, 0, b0));
+        }
+        printf("      pose check %.2fs\n", now() - tp);
+    };
+    // The blend of one stage: the run's blend with that stage's temperature.
+    auto stage_blend = [&](int stage) {
+        trellis::BlendParams b = blend;
+        b.temperature = trellis::stage_blend_temp(cfg, stage);
+        return b;
+    };
+
     vector<std::array<int,3>> coords;
     // Refine: the fine coords @R come from the input mesh; no sparse-structure or LR stage runs.
     vector<std::array<int,3>> refine_fine;
@@ -595,6 +679,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             refine_fine = std::move(dg.coords);
         }
         if (refine_fine.empty()) { fprintf(stderr, "--refine-mesh: the mesh voxelized to nothing\n"); return 1; }
+        if (pose_on) {
+            const int G = 64, f = std::max(1, refine_R / G);
+            std::set<std::array<int,3>> cs;
+            for (const auto& c : refine_fine) cs.insert({c[0] / f, c[1] / f, c[2] / f});
+            pose_check(vector<std::array<int,3>>(cs.begin(), cs.end()), G, "refine mesh voxels");
+        }
     } else {
     printf("[3/6] sparse-structure flow + decode\n");
     {
@@ -608,28 +698,73 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
-        vector<float> z;
-        if (mv_on(1)) {
-            const vector<float> w = trellis::view_weights_dense(16, views, blend);
-            log_weights("ss", w);
-            z = trellis::sample_flow_mv(fwd, noise(8*4096), make_mv(cs512, w, 4096), sp);  // [8,4096]
-        } else {
-            z = trellis::sample_flow(fwd, noise(8*4096),
+        // [8,4096] latent -> 64^3 occupancy logits.
+        auto decode = [&](const vector<float>& z) {
+            // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
+            vector<float> zdec(8*4096);
+            for (int c = 0; c < 8; ++c) for (int sp2 = 0; sp2 < 4096; ++sp2) zdec[(size_t)c*4096 + sp2] = z[c + 8*sp2];
+            // This small decoder currently miscomputes a CONT/view-to-ADD chain on HTP.
+            // Its CPU cost is negligible; other backends retain their existing placement.
+            const std::string saved_backend = trellis::g_backend;
+            const bool ss_dec_on_cpu = backend_is_htp(requested_backend);
+            if (ss_dec_on_cpu) trellis::g_backend = "CPU";
+            trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", ss_dec_on_cpu ? -1 : gpu);
+            trellis::g_backend = saved_backend;
+            vector<float> lg = trellis::ss_decode(d, zdec); d.free();
+            return lg;
+        };
+        // Multi-view runs may need two passes from the same noise: the front view alone (the
+        // pose checks and --mv-ss union need an occupancy that does not depend on the views'
+        // angles) and the blended one. A plain run is just one of the two.
+        // --mv-ss: 0 blend, 1 union (front OR blend), 2 fill (blend plus the front pass's cells
+        // on the front-view lines of sight the blend misses).
+        const bool ss_mv = mv_on(1);
+        const bool blended = ss_mv;
+        const bool front_pass = !blended || pose_on || cfg.mv_ss != 0;
+        const bool keep_front = cfg.mv_ss != 0;
+        const vector<float> x0 = noise(8*4096);
+        vector<float> logits, z;
+        if (front_pass) {
+            if (ss_mv) printf("      front-view pass%s\n", pose_on ? " (pose check)" : " (--mv-ss)");
+            z = trellis::sample_flow(fwd, x0,
                     trellis::FlowCond(cond.data(), pix ? pc.proj.data()     : nullptr),
                     trellis::FlowCond(neg.data(),  nullptr), sp);  // [8,4096] ne0=8
         }
-        delete run; m.free();
-        // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
-        vector<float> zdec(8*4096);
-        for (int c = 0; c < 8; ++c) for (int sp2 = 0; sp2 < 4096; ++sp2) zdec[(size_t)c*4096 + sp2] = z[c + 8*sp2];
-        // This small decoder currently miscomputes a CONT/view-to-ADD chain on HTP.
-        // Its CPU cost is negligible; other backends retain their existing placement.
-        const std::string saved_backend = trellis::g_backend;
-        const bool ss_dec_on_cpu = backend_is_htp(requested_backend);
-        if (ss_dec_on_cpu) trellis::g_backend = "CPU";
-        trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", ss_dec_on_cpu ? -1 : gpu);
-        trellis::g_backend = saved_backend;
-        vector<float> logits = trellis::ss_decode(d, zdec); d.free();
+        if (blended) {
+            vector<float> front_logits;
+            if (front_pass) {
+                front_logits = decode(z);
+                if (pose_on) pose_check(trellis::occupied_cells(front_logits, 64), 64, "front-view occupancy");
+                if (!keep_front) vector<float>().swap(front_logits);
+            }
+            const vector<float> w = trellis::view_weights_dense(16, views, stage_blend(0));
+            log_weights("ss", w);
+            z = trellis::sample_flow_mv(fwd, x0, make_mv(cs512, w, 4096), sp);  // [8,4096]
+            delete run; run = nullptr; m.free();
+            logits = decode(z);
+            if (cfg.mv_ss == 2) {
+                const auto fc = trellis::occupied_cells(front_logits, 64), bc = trellis::occupied_cells(logits, 64);
+                const auto add = trellis::front_fill(bc, fc, 64, views[0].az_deg, views[0].el_deg, blend);
+                for (size_t i : add) {
+                    const auto& c = fc[i];
+                    const size_t k = ((size_t)c[0] * 64 + c[1]) * 64 + c[2];
+                    logits[k] = std::max(logits[k], front_logits[k]);
+                }
+                printf("      [mv] ss fill: blended %zu + %zu front cells on uncovered front lines of sight @64\n", bc.size(), add.size());
+            } else if (keep_front) {
+                size_t nf = 0, nb = 0, nu = 0;
+                for (size_t i = 0; i < logits.size(); ++i) {
+                    nf += front_logits[i] > 0; nb += logits[i] > 0;
+                    logits[i] = std::max(logits[i], front_logits[i]);
+                    nu += logits[i] > 0;
+                }
+                printf("      [mv] ss union: front %zu + blended %zu -> %zu cells @64\n", nf, nb, nu);
+            }
+        } else {
+            delete run; run = nullptr; m.free();
+            logits = decode(z);
+            if (pose_on) pose_check(trellis::occupied_cells(logits, 64), 64, "front-view occupancy");
+        }
         coords = trellis::ss_coords(logits, 64, 32);
     }
     if (cfg.voxply) { FILE*f=fopen("out/myvox.ply","wb"); fprintf(f,"ply\nformat binary_little_endian 1.0\nelement vertex %zu\nproperty float x\nproperty float y\nproperty float z\nelement face 0\nproperty list uchar int vertex_indices\nend_header\n",coords.size()); for(auto&c:coords){float p[3]={(c[0]+0.5f)/32-0.5f,(c[1]+0.5f)/32-0.5f,(c[2]+0.5f)/32-0.5f}; fwrite(p,4,3,f);} fclose(f); }
@@ -669,7 +804,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         vector<float> sn;
         if (mv_on(2)) {
             const int rr = blend.ref_norm() ? (ref_res > 0 ? ref_res : flow_model_resolution(path)) : 0;
-            const vector<float> w = trellis::view_weights_sparse(cds, grid_res, views, blend, rr);
+            const vector<float> w = trellis::view_weights_sparse(cds, grid_res, views, stage_blend(1), rr);
             log_weights("shape", w);
             sn = trellis::sample_flow_mv(fwd, noise((size_t)32*n), make_mv(cs, w, n), sp);   // [32,n]
         } else {
@@ -880,7 +1015,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
             if (mv_on(4)) {
                 const int rr = blend.ref_norm() ? flow_model_resolution(tflow) : 0;
-                const vector<float> w = trellis::view_weights_sparse(tcoords, tgrid, views, blend, rr);
+                vector<float> w = trellis::view_weights_sparse(tcoords, tgrid, views, stage_blend(2), rr);
+                if (cfg.mv_visibility) {
+                    const auto mv = trellis::apply_visibility(w, tcoords, tgrid, views, stage_blend(2));
+                    printf("      [mv] tex visibility (mean per view):");
+                    for (double x : mv) printf(" %.3f", x);
+                    printf("\n");
+                }
                 log_weights("tex", w);
                 texlat = trellis::sample_flow_mv(fwd, noise((size_t)32*tN), make_mv(tcs, w, tN), sp);  // [32,tN]
             } else {
