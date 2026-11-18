@@ -1,5 +1,6 @@
 // 3MF writer (core spec + materials extension) for print-ready meshes: an OPC/ZIP package
-// holding the model XML and, when textured, the base-colour PNG. See mesh_print.h.
+// holding the model XML and, when textured, the base-colour PNG; with filament colours, the
+// per-triangle colours and an Orca-style filament list instead. See mesh_print.h.
 #include "mesh_print.h"
 
 #include <algorithm>
@@ -116,6 +117,7 @@ const char kTypes[] =
     " <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n"
     " <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n"
     " <Default Extension=\"png\" ContentType=\"image/png\"/>\n"
+    " <Default Extension=\"config\" ContentType=\"text/plain\"/>\n"
     "</Types>\n";
 const char kRels[] =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -133,9 +135,13 @@ const char kModelRels[] =
 }  // namespace
 
 bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* faces, int64_t F,
-               float size_mm, const PrintTexture* texture) {
+               float size_mm, const PrintTexture* texture, const PrintColors* colors) {
     if (V <= 0 || F <= 0) return false;
-    const bool textured = texture && texture->ok();
+    const bool colored = colors && colors->ok() && (int64_t)colors->face_slot.size() == F;
+    const bool textured = !colored && texture && texture->ok();
+    std::vector<std::string> paint;   // per slot
+    if (colored)
+        for (size_t s = 0; s < colors->palette.size(); ++s) paint.push_back(paint_color_code((int)s + 1));
 
     // Placement: z-up, on the plate, centred, longest side = size_mm.
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
@@ -162,6 +168,17 @@ bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* f
              " xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\""
              " xmlns:m=\"http://schemas.microsoft.com/3dmanufacturing/material/2015/02\">\n"
              " <metadata name=\"Application\">trellis.cpp</metadata>\n <resources>\n";
+    if (colored) {
+        // The standard form (materials extension core: basematerials); Orca-family slicers
+        // ignore it and read paint_color below.
+        model += "  <basematerials id=\"1\">\n";
+        for (size_t s = 0; s < colors->palette.size(); ++s) {
+            std::snprintf(line, sizeof line, "   <base name=\"Filament %d\" displaycolor=\"#%06XFF\"/>\n",
+                          (int)s + 1, (unsigned)colors->palette[s]);
+            model += line;
+        }
+        model += "  </basematerials>\n";
+    }
     if (textured) {
         model += "  <m:texture2d id=\"1\" path=\"/3D/Textures/base_color.png\" contenttype=\"image/png\"/>\n"
                  "  <m:texture2dgroup id=\"2\" texid=\"1\">\n";
@@ -172,7 +189,8 @@ bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* f
         }
         model += "  </m:texture2dgroup>\n";
     }
-    model += "  <object id=\"3\" type=\"model\">\n   <mesh>\n    <vertices>\n";
+    model += colored ? "  <object id=\"3\" type=\"model\" pid=\"1\" pindex=\"0\">\n   <mesh>\n    <vertices>\n"
+                     : "  <object id=\"3\" type=\"model\">\n   <mesh>\n    <vertices>\n";
     for (size_t v = 0; v < welded.size() / 3; ++v) {
         std::snprintf(line, sizeof line, "     <vertex x=\"%.5f\" y=\"%.5f\" z=\"%.5f\"/>\n",
                       (welded[3 * v] - origin[0]) * scale, (welded[3 * v + 1] - origin[1]) * scale,
@@ -183,7 +201,12 @@ bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* f
     for (int64_t f = 0; f < F; ++f) {
         const int32_t* t = &tris[3 * (size_t)f];
         if (t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) continue;
-        if (textured)
+        if (colored) {
+            const int s = colors->face_slot[f];
+            std::snprintf(line, sizeof line,
+                          "     <triangle v1=\"%d\" v2=\"%d\" v3=\"%d\" pid=\"1\" p1=\"%d\" paint_color=\"%s\"/>\n",
+                          t[0], t[1], t[2], s, paint[s].c_str());
+        } else if (textured)
             std::snprintf(line, sizeof line,
                           "     <triangle v1=\"%d\" v2=\"%d\" v3=\"%d\" pid=\"2\" p1=\"%d\" p2=\"%d\" p3=\"%d\"/>\n",
                           t[0], t[1], t[2], faces[3 * f], faces[3 * f + 1], faces[3 * f + 2]);
@@ -199,6 +222,20 @@ bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* f
     zip.add("[Content_Types].xml", (const unsigned char*)kTypes, sizeof kTypes - 1, true);
     zip.add("_rels/.rels", (const unsigned char*)kRels, sizeof kRels - 1, true);
     zip.add("3D/3dmodel.model", (const unsigned char*)model.data(), model.size(), true);
+    if (colored) {
+        // Orca-family project settings: just the filament list, so the slots open with these
+        // colours. Everything else (printer, process) stays the user's. Exactly the keys that
+        // were checked in Snapmaker Orca 2.4.1, version included.
+        std::string hex, types;
+        for (size_t s = 0; s < colors->palette.size(); ++s) {
+            std::snprintf(line, sizeof line, "%s\"#%06X\"", s ? ", " : "", (unsigned)colors->palette[s]);
+            hex += line;
+            types += s ? ", \"PLA\"" : "\"PLA\"";
+        }
+        const std::string settings = "{\n    \"filament_colour\": [" + hex + "],\n    \"filament_multi_colors\": [" + hex +
+                                     "],\n    \"filament_type\": [" + types + "],\n    \"version\": \"2.4.1\"\n}\n";
+        zip.add("Metadata/project_settings.config", (const unsigned char*)settings.data(), settings.size(), true);
+    }
     if (textured) {
         int length = 0;
         unsigned char* png = stbi_write_png_to_mem(texture->rgba, texture->size * 4, texture->size,

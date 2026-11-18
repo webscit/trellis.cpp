@@ -35,6 +35,8 @@ export interface GenParams {
   printBase?: string; // "auto" | "0" | fraction of the height
   printWall?: number; // mm, 0 = off
   printInterior?: PrintInterior;
+  /** Filament colours in the 3MF (server field print_colors): 0 = textured 3MF, else 2..32. */
+  printColors?: number;
   /** Older records: 0 = keep hollow, anything else = the then default. */
   printSeal?: number;
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
@@ -57,6 +59,7 @@ export const DEFAULT_PARAMS: GenParams = {
   printBase: "auto",
   printWall: 0.8,
   printInterior: "auto",
+  printColors: 0,
   blendTemp: 2,
   frontAxis: "-y",
 };
@@ -87,6 +90,8 @@ export interface PrintReport {
   wall: { target_mm: number; thinnest_1pct_mm: number; at_least: boolean; thin_area_pct: number };
   base: { flat: boolean; contact_mm2: number; stands: boolean; tip_angle_deg: number };
   overhang_pct: number;
+  /** Present when the 3MF carries filament colours: slot 1.. by surface share. */
+  colors?: { patches: number; palette: { slot: number; hex: string; share_pct: number }[] };
   warnings: string[];
 }
 

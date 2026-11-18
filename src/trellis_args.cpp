@@ -83,6 +83,15 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
         const std::string v = value;
         if (v != "auto" && v != "solid" && v != "hollow") { error = "print-interior must be auto, solid or hollow"; return false; }
         p.print_interior = v;
+    } else if (name == "print-colors") {
+        if (!number || n != std::floor(n) || n < 0 || n > 32 || n == 1) { error = "print-colors must be 0 (off) or 2..32"; return false; }
+        p.print_colors = (int)n;
+    } else if (name == "print-speck") {
+        if (!number || n < 0) { error = "print-speck must be a nonnegative area in mm2"; return false; }
+        p.print_speck = n;
+    } else if (name == "print-color-lift") {
+        if (!number || n < 0 || n > 2) { error = "print-color-lift must be from 0 to 2"; return false; }
+        p.print_color_lift = n;
     } else {
         if (!number || n < 0) { error = "print-wall must be a nonnegative number of millimetres"; return false; }
         p.print_wall = n;
@@ -299,6 +308,14 @@ void print_usage(const char* argv0, bool server) {
         "                          edges and strands thinner than this are grown, and joints\n"
         "                          between thick parts narrower than twice it are thickened.\n"
         "                          0 = off\n"
+        "      --print-colors N    3MF for multi-material printers: the texture reduced to N\n"
+        "                          filament colours (2..32), one per triangle, as Orca-family\n"
+        "                          paint plus standard 3MF colours; the filament list opens\n"
+        "                          with them (default 0 = textured 3MF)\n"
+        "      --print-speck MM2   with --print-colors: merge colour patches smaller than this\n"
+        "                          into a neighbour (default 4; 0 = keep every speck)\n"
+        "      --print-color-lift F  with --print-colors: lift baked-in shadows before choosing\n"
+        "                          the palette (default 0.3; 0 = the texture's own tones)\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
@@ -433,7 +450,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   else { fprintf(stderr, "[trellis] --normal-map must be on or off\n"); return false; } }
         else if (a == "--watertight")           { p.watertight = true; }
         else if (a == "--3mf")                  { const char* v = need(a.c_str()); if (!v) return false; p.out_3mf = v; p.watertight = true; }
-        else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-interior") {
+        else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-interior" ||
+                 a == "--print-colors" || a == "--print-speck" || a == "--print-color-lift") {
             const char* v = need(a.c_str()); if (!v) return false;
             std::string error;
             if (!parse_print_arg(a.substr(2), v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
@@ -480,6 +498,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         std::string error;
         if (!check_faces_compat(p, error) || !check_print_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
     }
+    if (p.print_colors > 0 && p.out_3mf.empty())
+        fprintf(stderr, "[trellis] warning: --print-colors only changes the 3MF; add --3mf PATH\n");
     if (!p.retopo && p.retopo_no_weld_fill) {
         fprintf(stderr,"[trellis] --retopo-no-weld-fill requires --retopo\n");
         return false;

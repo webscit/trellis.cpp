@@ -105,7 +105,11 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
 - ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
 - ☑ Studio export split button (GLB / 3MF); print options (size, flat base, minimum wall,
       interior) under the "3D print" toggle; print report under the preview
-- ☐ Per-vertex colour for slicers that ignore textures
+- ☑ Filament colours for multi-material printers: `--print-colors N` (2..32) reduces the
+      texture to N colours, one per triangle, written as Orca `paint_color` + basematerials
+      + the filament list; checked in Snapmaker Orca 2.4.1; Studio "3MF colours" + palette
+      in the report
+- ☐ Colour boundaries finer than the mesh (sub-triangle paint)
 
 ## Validation strategy
 Full reference env needs CUDA-only extensions (o-voxel, flash-attn, spconv, nvdiffrast) that

@@ -219,6 +219,16 @@ std::string print_report_text(const PrintReport& r) {
         r.flat_base ? "flat" : "NOT flat", r.base_area_mm2, r.stands ? "stands" : "FALLS OVER", r.tip_angle_deg,
         r.overhang_pct);
     std::string text = buffer;
+    if (!r.palette.empty()) {
+        std::snprintf(buffer, sizeof buffer, "    colours     %d filaments, %d patches:", (int)r.palette.size(), r.color_patches);
+        text += buffer;
+        for (size_t s = 0; s < r.palette.size(); ++s) {
+            std::snprintf(buffer, sizeof buffer, "%s %d #%06X %.1f%%", s % 4 == 0 && s ? "\n               " : "",
+                          (int)s + 1, (unsigned)r.palette[s], 100 * r.palette_share[s]);
+            text += buffer;
+        }
+        text += "\n";
+    }
     for (const std::string& w : r.warnings) text += "    warning     " + w + "\n";
     return text;
 }
@@ -239,12 +249,22 @@ std::string print_report_json(const PrintReport& r) {
         "\"watertight\":%s,\"shells\":%d,\"triangles\":%lld,"
         "\"wall\":{\"target_mm\":%.3f,\"thinnest_1pct_mm\":%.3f,\"at_least\":%s,\"thin_area_pct\":%.2f},"
         "\"base\":{\"flat\":%s,\"contact_mm2\":%.1f,\"stands\":%s,\"tip_angle_deg\":%.1f},"
-        "\"overhang_pct\":%.1f,\"warnings\":[",
+        "\"overhang_pct\":%.1f,",
         r.ok() ? "true" : "false", r.size_mm[0], r.size_mm[1], r.size_mm[2], r.volume_cm3, r.area_cm2,
         r.audit.watertight() ? "true" : "false", r.audit.components, (long long)r.audit.faces,
         r.wall_target_mm, r.wall_p1_mm, r.wall_capped ? "true" : "false", r.thin_area_pct,
         r.flat_base ? "true" : "false", r.base_area_mm2, r.stands ? "true" : "false", r.tip_angle_deg, r.overhang_pct);
     std::string json = buffer;
+    if (!r.palette.empty()) {
+        json += "\"colors\":{\"patches\":" + std::to_string(r.color_patches) + ",\"palette\":[";
+        for (size_t s = 0; s < r.palette.size(); ++s) {
+            std::snprintf(buffer, sizeof buffer, "%s{\"slot\":%d,\"hex\":\"#%06X\",\"share_pct\":%.2f}", s ? "," : "",
+                          (int)s + 1, (unsigned)r.palette[s], 100 * r.palette_share[s]);
+            json += buffer;
+        }
+        json += "]},";
+    }
+    json += "\"warnings\":[";
     for (size_t i = 0; i < r.warnings.size(); ++i) json += (i ? ",\"" : "\"") + escape(r.warnings[i]) + "\"";
     return json + "]}\n";
 }

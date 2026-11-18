@@ -107,6 +107,10 @@ struct TrellisParams {
                                 //   open; solid fills those too; hollow caps nothing
     float print_wall = 0.8f;    // --print-wall MM: minimum wall at print_size; features thinner
                                 //   than this are grown locally (0 = off)
+    int   print_colors = 0;     // --print-colors N: 3MF with N filament colours (2..32), one per
+                                //   triangle, instead of the texture (0 = off)
+    float print_speck = 4.0f;   // --print-speck MM2: colour patches smaller than this merge
+    float print_color_lift = 0.3f;  // --print-color-lift F: shadow lift before the palette (0 = off)
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast

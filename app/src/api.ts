@@ -139,6 +139,8 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
     fd.append("print_base", p.printBase ?? DEFAULT_PARAMS.printBase!);
     fd.append("print_wall", String(p.printWall ?? DEFAULT_PARAMS.printWall));
     fd.append("print_interior", p.printInterior ?? DEFAULT_PARAMS.printInterior!);
+    const colors = p.printColors ?? DEFAULT_PARAMS.printColors!;
+    if (colors > 0) fd.append("print_colors", String(colors));
   }
   return fd;
 }

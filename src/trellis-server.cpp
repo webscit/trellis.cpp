@@ -18,7 +18,9 @@
 //                      on = the GLB is one closed manifold solid, like --watertight),
 //                      "print_base" (0..0.5 or auto, flat base), "print_wall" (mm), "print_size"
 //                      (mm), "print_interior" (auto|solid|hollow), and "3mf" (on|off; on also builds a textured 3MF, served by
-//                      GET /jobs/{id}/3mf -- /jobs only).
+//                      GET /jobs/{id}/3mf -- /jobs only). "print_colors" (0 or 2..32) makes that
+//                      3MF carry N filament colours instead of the texture (needs 3mf=on); "print_speck" (mm2)
+//                      and "print_color_lift" tune it.
 //                      Returns model/gltf-binary.
 //
 //                    Multi-view (docs/spec/30-multiview.md): send several "image" parts
@@ -170,7 +172,8 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     }
     for (const auto& field : {std::pair<const char*, const char*>{"print_size", "print-size"},
                               {"print_base", "print-base"}, {"print_wall", "print-wall"},
-                              {"print_interior", "print-interior"}}) {
+                              {"print_interior", "print-interior"}, {"print_colors", "print-colors"},
+                              {"print_speck", "print-speck"}, {"print_color_lift", "print-color-lift"}}) {
         if (!req.has_file(field.first)) continue;
         std::string error;
         if (!trellis::parse_print_arg(field.second, req.get_file_value(field.first).content.c_str(), p, error)) {
@@ -185,6 +188,7 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
         else { bad_request(res, "3mf must be on or off"); return false; }
     } else p.out_3mf.clear();   // a launch-time --3mf path is not per-request state
     p.print_report.clear();     // likewise; make_job points it at the job's own file
+    if (p.print_colors > 0 && p.out_3mf.empty()) { bad_request(res, "print_colors needs 3mf=on"); return false; }
     {
         std::string error;
         if (!trellis::check_print_compat(p, error)) { bad_request(res, error); return false; }

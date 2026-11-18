@@ -244,6 +244,56 @@ why the warning keys on the thinnest percentile rather than on the share alone. 
 res 512, defaults plus `--print-base auto`: 81 × 50 × 100 mm, 75 cm³, thinnest 1 % at
 0.81 mm, stands at 15.5°, 12 % overhang, no warnings.
 
+### 2.7 Filament colours (`--print-colors N`)
+
+Most FDM slicers ignore a 3MF's texture. A multi-material printer needs each triangle tied
+to one filament, so `--print-colors N` (2..32) reduces the baked texture to N colours,
+one per triangle, after the bake (`quantize_print_colors`, `src/print_colors.cpp`):
+
+1. **Colour per triangle**: the mean of ten texture samples over the triangle, in linear
+   light. Areas are measured at the printed size.
+2. **Shadow lift** (`--print-color-lift`, default 0.3): generated textures carry baked-in
+   shading, and without this most of the palette went to near-blacks (goblin, 8 colours:
+   one near-black slot covered 38 % of the surface). L\* is stretched from its 1st..99th area
+   percentile up to at least 85, a gamma of 1/(1+lift) lifts the shadows, and a\*/b\* scale
+   with L\* (at most 1.5×) so hues and saturation hold. 0.6 already turned the goblin's
+   helmet pale blue and its skin neon; 0.3 stays close to the texture.
+3. **Palette**: k-means in CIELAB, k-means++ seeding with a fixed seed (the output is
+   deterministic). Each triangle weighs the square root of its area, so small distinct
+   colours (eyes, a buckle) win a slot against large areas of near-identical shades.
+4. **Speck merge** (`--print-speck`, default 4 mm²): a same-colour patch smaller than
+   this takes the colour it shares the longest border with, over welded positions (the
+   UV unwrap splits vertices). Smallest first; a patch that moves freezes its neighbours
+   for the round, otherwise two adjacent specks swap colours forever. A colour mixed by
+   layer alternation (Snapmaker's Full Spectrum) only reads over a stack of layers, so
+   tiny patches would not print as their colour anyway.
+5. **Slots** by surface share, largest first. A slot's colour is the area-weighted mean,
+   in linear light, of the triangles that had it before the merge: merged specks take the
+   colour, they do not tint it.
+
+The 3MF then carries the colours three ways, and no texture:
+
+- `paint_color` on every triangle: the Orca / PrusaSlicer triangle-selector code for a
+  whole triangle in state *s* (1 → `4`, 2 → `8`, 3 → `0C`, 5 → `2C`, 20 → `2FC`: below 3
+  the state times 4; from 3 on, read from the end, `C` then one `F` per 15 then the
+  rest). The codes were read from a cube painted with filaments 1–5 and 20 in Snapmaker
+  Orca 2.4.1.
+- `<basematerials>` with a `pid`/`p1` per triangle, the standard form. Snapmaker Orca
+  ignores it (a file with only this shows no colour); a file with both loads without
+  complaint.
+- `Metadata/project_settings.config` with only `filament_colour`, `filament_multi_colors`,
+  `filament_type` and `version`, the keys checked in Snapmaker Orca: the file opens with
+  N filaments in those colours, and the printer and process stay the user's.
+
+Checked in Snapmaker Orca 2.4.1 (a Snapmaker U1 profile) with prototype files of 8, 16
+and 32 colours: the model shows painted, the filament list comes from the file, and its
+colour-matching tool turns each slot into a mix of the four loaded filaments.
+
+Goblin, res 512, xatlas unwrap (the server / Studio path), 16 colours: 0.2 s, 446
+patches; 15.0 % near-black (shadowed armour and loincloth), four greys and a pale blue for
+the helmet, armour and axe head, six greens, two browns for the belt and the handle, gold
+for the eyes and the buckle.
+
 ## 3. Output formats
 
 - **GLB** — with `--watertight` the GLB *is* the solid: same texture bake, closed
@@ -256,6 +306,7 @@ res 512, defaults plus `--print-base auto`: 81 × 50 × 100 mm, 75 cm³, thinnes
   no unit, no colour, no shared vertices.
   Slicer support for the texture varies — the geometry always loads; full-colour
   workflows read `texture2dgroup`, most FDM slicers ignore it and use their own paint data.
+  With `--print-colors N` the texture is replaced by N filament colours (§2.7).
 
 ## 4. Interfaces
 
@@ -268,6 +319,9 @@ res 512, defaults plus `--print-base auto`: 81 × 50 × 100 mm, 75 cm³, thinnes
 | `--print-report PATH` | `GET /jobs/{id}/report` | the printability report as JSON |
 | `--print-interior M` | `print_interior` | `auto` (default): cap tears, keep wide openings open; `solid`: fill those too; `hollow`: cap nothing |
 | `--print-wall MM` | `print_wall` | minimum wall at `--print-size`, default 0.8; thinner features are grown locally, joints between thick parts narrower than twice it are thickened (0 = off) |
+| `--print-colors N` | `print_colors` | 3MF with N filament colours (2..32) instead of the texture (§2.7); 0 = off |
+| `--print-speck MM2` | `print_speck` | merge colour patches smaller than this, default 4 |
+| `--print-color-lift F` | `print_color_lift` | shadow lift before the palette, 0..2, default 0.3 |
 
 Not combinable with
 `--decim GRID` (cluster decimation tears the surface) or `--retopo`.
@@ -297,7 +351,12 @@ the result is not watertight.
 - Necks are found and fixed but not reported: the log says how many joints were
   thickened; the report (§2.6) measures walls, not joints.
 - Showcase models through `trellis-print`, `--interior solid` against `auto`: six of seven (axe, chest, drone, golem, knight, racer) are identical. The cottage loses 35 % of its volume: its mesh has no floor, so the flood enters from below and the walls are hollow either way; `solid` then fills the attic as a plug floating half-way up, `auto` releases it and leaves a consistent open-bottom shell with fillets in the roof corners. No necks at 1.6 mm on any of them. A lathed vase (neck 28 % of its height) with five 0.06 tears in its wall: `solid` fills it, `auto` keeps it hollow with the tears capped (one shell, genus 0) — the ball sweeps up to a tear from both sides but cannot pass through it.
-- Not done: hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
+- Filament colours: one colour per triangle, so boundaries follow the decimated mesh's
+  edges (the paint format can split triangles; not used yet). The palette is free: it is
+  not limited to what the loaded filaments can mix; the slicer's colour matching does
+  that. Shading baked into the texture still shows as darker slots after the lift.
+  Needs a texture: `--no-texture` and `trellis-print` write no colours.
+- Not done: hollowing with drain holes.
 
 ## 6. Tests
 
@@ -309,6 +368,11 @@ flood alone and solid with `seal = 3`; a shallow tray stays a tray); the open ba
 2.5 times as deep as it is wide, filled by the vote alone, stays hollow, also with a tear
 in its side; the torn box and the tray do not change); necks (§2.3d); the flat base (exact plane, expected volume); `make_printable` decimated to
 2 K faces; repair of a hole + fin + inverted winding; the 3MF package; thin-wall growth (sheet grown,
-thick box unchanged); the report and the stance (a top-heavy block falls over on a plain
+thick box unchanged); filament colours (the paint codes Snapmaker Orca writes for
+slots 1–5 and 20, plus 32; a cube with six known face colours gets them back exactly at
+6 and at 8 colours asked, and 3 slots at 3; a 25 mm² speck kept under a 20 mm² limit and
+merged under 30; two adjacent specks both merged into the surrounding colour, whose slot
+colour they do not tint; the colour 3MF has a `paint_color` and a `p1` on every triangle,
+six `<base>` entries, the filament list, no texture); the report and the stance (a top-heavy block falls over on a plain
 cut and stands on the automatic pedestal; a thin sheet is reported thin).
 With a mesh argument it runs the full path on it and requires a watertight result.

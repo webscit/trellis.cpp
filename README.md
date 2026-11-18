@@ -89,8 +89,9 @@ click → rotate the result.
    `<model-viewer>`); **Reset view** re-frames the camera and **Export to GLB** saves
    the model; the arrow beside it picks the format (GLB, or 3MF when "3D print" was on).
    With **3D print** set to *watertight solid*, the print size, flat base, minimum wall
-   and interior (auto / solid / hollow) appear under it, and a print report (size, walls,
-   stability, overhangs, warnings) shows under the preview.
+   interior (auto / solid / hollow) and 3MF colours (the texture, or 4 to 32 filament
+   colours for a multi-material printer) appear under it, and a print report (size,
+   walls, stability, overhangs, filament palette, warnings) shows under the preview.
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
    the app.
@@ -263,10 +264,11 @@ trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base
 | `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and joints between thick parts (a wrist, an ankle) narrower than twice it are thickened; the rest is not touched |
 | `--print-report PATH` | write the printability report (size, walls, base and stability, overhangs, warnings) as JSON; it is always logged |
 | `--print-interior M` | `auto` (default): cap the tears in the generated surface and keep wide openings (cups, vases) open; `solid`: fill those too; `hollow`: cap nothing |
+| `--print-colors N` | for multi-material printers: the 3MF carries N filament colours (2..32), one per triangle, instead of the texture. It is written in the paint format of the Orca family and opens painted in Snapmaker Orca, with those colours as the filament list (other slicers of the family share the format; not checked). `--print-speck MM2` (default 4) merges smaller colour patches; `--print-color-lift F` (default 0.3) lifts baked-in shadows first |
 
 `trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
 only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
-`print_base`, `print_wall` and `print_interior`, and serves the report at `GET /jobs/{id}/report`. Method, measurements and limits:
+`print_base`, `print_wall`, `print_interior`, `print_colors`, `print_speck` and `print_color_lift`, and serves the report at `GET /jobs/{id}/report`. Method, measurements and limits:
 [docs/spec/32-print-ready.md](docs/spec/32-print-ready.md).
 
 ### Mesh refinement

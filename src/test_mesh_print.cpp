@@ -12,6 +12,7 @@
 #include "tri_bvh.h"
 #include "uv_bake.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -90,6 +91,78 @@ static float slice_extent(const Mesh& m, float x0, float x1, int axis) {
         lo = std::fmin(lo, p[axis]); hi = std::fmax(hi, p[axis]);
     }
     return hi > lo ? hi - lo : 0.0f;
+}
+
+// One part of a ZIP written by write_3mf, inflated (stb_image's decoder): walks the local
+// headers. Empty when the part is missing.
+extern "C" char* stbi_zlib_decode_noheader_malloc(const char* buffer, int len, int* outlen);
+static std::string zip_part(const std::string& zip, const std::string& name) {
+    auto u16 = [&](size_t o) { return (uint32_t)(unsigned char)zip[o] | (uint32_t)(unsigned char)zip[o + 1] << 8; };
+    auto u32 = [&](size_t o) { return u16(o) | u16(o + 2) << 16; };
+    for (size_t o = 0; o + 30 <= zip.size() && u32(o) == 0x04034b50u;) {
+        const uint32_t method = u16(o + 8), packed = u32(o + 18), size = u32(o + 22), nlen = u16(o + 26), xlen = u16(o + 28);
+        const size_t data = o + 30 + nlen + xlen;
+        if (zip.compare(o + 30, nlen, name) == 0) {
+            if (method == 0) return zip.substr(data, size);
+            int length = 0;
+            // stb's decoder fails when its bit reader runs past the end; the next header is slack
+            const int slack = (int)std::min<size_t>(8, zip.size() - data - packed);
+            char* raw = stbi_zlib_decode_noheader_malloc(zip.data() + data, (int)packed + slack, &length);
+            std::string text = raw ? std::string(raw, (size_t)length) : std::string();
+            free(raw);
+            return text;
+        }
+        o = data + packed;
+    }
+    return {};
+}
+static size_t count_of(const std::string& text, const std::string& what) {
+    size_t n = 0;
+    for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+}
+
+// A cube whose six faces each sample their own block of a 48x48 texture (3 x 2 blocks of 16 x
+// 24 texels), UV-split per face like an unwrap: 24 vertices, 12 triangles.
+static const unsigned char kFaceColours[6][3] = {{220, 30, 30}, {30, 200, 40}, {40, 60, 220}, {240, 220, 40}, {250, 250, 250}, {40, 40, 40}};
+static void coloured_cube(Mesh& m, std::vector<float>& uv, std::vector<unsigned char>& rgba) {
+    static const int quads[6][4] = {{0, 4, 6, 2}, {1, 3, 7, 5}, {0, 1, 5, 4}, {2, 6, 7, 3}, {0, 2, 3, 1}, {4, 5, 7, 6}};
+    for (int q = 0; q < 6; ++q) {
+        const float u0 = (q % 3) / 3.0f, v0 = (q / 3) / 2.0f;
+        for (int k = 0; k < 4; ++k) {
+            const int i = quads[q][k];
+            for (int a = 0; a < 3; ++a) m.verts.push_back(i >> a & 1 ? 0.3f : -0.3f);
+            uv.push_back(u0 + (k == 1 || k == 2 ? 0.25f : 0.083f));
+            uv.push_back(v0 + (k >= 2 ? 0.4f : 0.1f));
+        }
+        for (int k : {0, 1, 2, 0, 2, 3}) m.faces.push_back(4 * q + k);
+    }
+    rgba.assign(48 * 48 * 4, 255);
+    for (int y = 0; y < 48; ++y)
+        for (int x = 0; x < 48; ++x)
+            for (int c = 0; c < 3; ++c) rgba[4 * (y * 48 + x) + c] = kFaceColours[(y / 24) * 3 + x / 16][c];
+}
+
+// A 20 x 20 grid of separate quads (0.05 apart, so 5 mm at 100 mm) in z = 0, every quad red
+// except the ones listed, which take the given texel colour index (0 red, 1 blue, 2 green).
+static void speck_sheet(Mesh& m, std::vector<float>& uv, std::vector<unsigned char>& rgba,
+                        const std::vector<std::array<int, 3>>& specks) {
+    rgba.assign(4 * 4 * 4, 255);
+    const unsigned char cols[3][3] = {{220, 30, 30}, {40, 60, 220}, {30, 200, 40}};
+    for (int i = 0; i < 3; ++i) for (int c = 0; c < 3; ++c) rgba[4 * i + c] = cols[i][c];   // texels (0..2, 0)
+    for (int j = 0; j < 20; ++j)
+        for (int i = 0; i < 20; ++i) {
+            int colour = 0;
+            for (const auto& s : specks) if (s[0] == i && s[1] == j) colour = s[2];
+            const int base = m.V();
+            for (int k = 0; k < 4; ++k) {
+                m.verts.push_back((i + (k == 1 || k == 2)) * 0.05f);
+                m.verts.push_back((j + (k >= 2)) * 0.05f);
+                m.verts.push_back(0.0f);
+                uv.push_back((colour + 0.5f) / 4); uv.push_back(0.5f / 4);
+            }
+            for (int k : {0, 1, 2, 0, 2, 3}) m.faces.push_back(base + k);
+        }
 }
 
 static MeshAudit audit(const Mesh& m) { return audit_mesh(m.verts.data(), m.V(), m.faces.data(), m.F()); }
@@ -344,6 +417,80 @@ int main(int argc, char** argv) {
         const MeshAudit a = audit(m);
         CHECK(a.watertight() && std::fabs(a.volume - 0.216) < 1e-5, "repaired: %s", audit_summary(a).c_str());
         CHECK(repair_for_print(m.verts, m.faces) == 0, "repair is not idempotent");
+    }
+
+    {   // Filament colours: paint codes as Snapmaker Orca 2.4.1 writes them (a cube painted
+        // with filaments 1..5 and 20), the palette of a cube with six known face colours, the
+        // speck merge, and the 3MF parts.
+        const int slots[] = {1, 2, 3, 4, 5, 20, 32};
+        const char* codes[] = {"4", "8", "0C", "1C", "2C", "2FC", "EFC"};
+        for (int i = 0; i < 7; ++i)
+            CHECK(paint_color_code(slots[i]) == codes[i], "paint code of %d: %s, expected %s", slots[i], paint_color_code(slots[i]).c_str(), codes[i]);
+
+        Mesh cube;
+        std::vector<float> uv;
+        std::vector<unsigned char> rgba;
+        coloured_cube(cube, uv, rgba);
+        const PrintTexture tex{uv.data(), rgba.data(), 48};
+        ColorOptions co;
+        co.lift = 0.0f;   // exact colours
+        for (int k : {6, 8}) {
+            co.count = k;
+            const PrintColors pc = quantize_print_colors(cube.verts.data(), cube.V(), cube.faces.data(), cube.F(), tex, 100.0f, co);
+            CHECK(pc.palette.size() == 6 && pc.patches == 6, "cube, %d colours asked: %zu slots, %d patches", k, pc.palette.size(), pc.patches);
+            bool exact = pc.face_slot.size() == 12;
+            for (int q = 0; q < 6 && exact; ++q) {
+                const int s = pc.face_slot[2 * q];
+                exact = pc.face_slot[2 * q + 1] == s && std::fabs(pc.share[s] - 1 / 6.0) < 1e-6;
+                for (int c = 0; c < 3; ++c)
+                    exact = exact && std::abs((int)(pc.palette[s] >> (16 - 8 * c) & 0xFF) - (int)kFaceColours[q][c]) <= 1;
+                for (int r = 0; r < q; ++r) exact = exact && pc.face_slot[2 * r] != s;
+            }
+            CHECK(exact, "cube, %d colours asked: faces do not get their own colour", k);
+        }
+        co.count = 3;
+        const PrintColors three = quantize_print_colors(cube.verts.data(), cube.V(), cube.faces.data(), cube.F(), tex, 100.0f, co);
+        CHECK(three.palette.size() == 3, "cube, 3 colours: %zu slots", three.palette.size());
+
+        // A 25 mm2 speck of blue in red: kept at speck 0 and at 20 mm2, merged at 30 mm2. Two
+        // adjacent specks (blue, green) under the limit both turn red instead of trading colours.
+        Mesh sheet; std::vector<float> suv; std::vector<unsigned char> srgba;
+        speck_sheet(sheet, suv, srgba, {{5, 5, 1}});
+        const PrintTexture stex{suv.data(), srgba.data(), 4};
+        co.count = 2;
+        for (float speck : {0.0f, 20.0f, 30.0f}) {
+            co.speck_mm2 = speck;
+            const PrintColors pc = quantize_print_colors(sheet.verts.data(), sheet.V(), sheet.faces.data(), sheet.F(), stex, 100.0f, co);
+            const size_t expect = speck > 25 ? 1 : 2;
+            CHECK(pc.palette.size() == expect && pc.patches == (int)expect, "speck %g: %zu slots, %d patches", speck, pc.palette.size(), pc.patches);
+        }
+        Mesh pair; std::vector<float> puv; std::vector<unsigned char> prgba;
+        speck_sheet(pair, puv, prgba, {{5, 5, 1}, {6, 5, 2}});
+        const PrintTexture ptex{puv.data(), prgba.data(), 4};
+        co.count = 3;
+        co.speck_mm2 = 30.0f;   // each speck 25 mm2, together 50
+        const PrintColors pc2 = quantize_print_colors(pair.verts.data(), pair.V(), pair.faces.data(), pair.F(), ptex, 100.0f, co);
+        CHECK(pc2.palette.size() == 1 && pc2.palette[0] == 0xDC1E1Eu, "two adjacent specks: %zu slots, first #%06X", pc2.palette.size(),
+              pc2.palette.empty() ? 0u : pc2.palette[0]);
+
+        // The package: paint codes per triangle, the standard colours, the filament list.
+        co.count = 6; co.speck_mm2 = 4.0f;
+        const PrintColors pc = quantize_print_colors(cube.verts.data(), cube.V(), cube.faces.data(), cube.F(), tex, 100.0f, co);
+        const std::string path = (std::filesystem::temp_directory_path() / "trellis-test-print-colors.3mf").string();
+        CHECK(write_3mf(path.c_str(), cube.verts.data(), cube.V(), cube.faces.data(), cube.F(), 100.0f, &tex, &pc), "write_3mf colours");
+        std::ifstream file(path, std::ios::binary);
+        const std::string zip((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const std::string model = zip_part(zip, "3D/3dmodel.model"), settings = zip_part(zip, "Metadata/project_settings.config");
+        CHECK(count_of(model, "paint_color=") == 12 && count_of(model, "<base ") == 6 && count_of(model, "pid=\"1\" p1=") == 12,
+              "colour 3MF model: %zu paint, %zu base", count_of(model, "paint_color="), count_of(model, "<base "));
+        for (int s = 1; s <= 6; ++s)
+            CHECK(count_of(model, "paint_color=\"" + paint_color_code(s) + "\"") == 2, "slot %d is not on exactly two triangles", s);
+        CHECK(model.find("texture2d") == std::string::npos && zip_part(zip, "3D/Textures/base_color.png").empty(), "colour 3MF still has the texture");
+        char hex[16];
+        std::snprintf(hex, sizeof hex, "\"#%06X\"", (unsigned)pc.palette[0]);
+        CHECK(settings.find("\"filament_colour\"") != std::string::npos && settings.find(hex) != std::string::npos,
+              "filament list missing or without %s: %s", hex, settings.c_str());
+        if (!g_fail) std::filesystem::remove(path);
     }
 
     CHECK(wall_cells_for(0, 100, 512, 1) == 0 && std::fabs(wall_cells_for(0.8f, 100, 512, 1) - 4.096f) < 1e-3f, "wall_cells_for");

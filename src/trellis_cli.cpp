@@ -66,9 +66,11 @@ static float print_extent(const vector<float>& v) {
     return e > 0 ? e : 1.0f;
 }
 // Printability report for the final geometry: always logged, also JSON with --print-report.
-static bool emit_print_report(const trellis::TrellisParams& cfg, const vector<float>& v, const vector<int32_t>& f, int up_axis) {
-    const trellis::PrintReport report = trellis::print_report(v.data(), (int64_t)v.size() / 3, f.data(), (int64_t)f.size() / 3,
-                                                              cfg.print_size, up_axis, cfg.print_wall);
+static trellis::PrintReport make_print_report(const trellis::TrellisParams& cfg, const vector<float>& v, const vector<int32_t>& f, int up_axis) {
+    return trellis::print_report(v.data(), (int64_t)v.size() / 3, f.data(), (int64_t)f.size() / 3,
+                                 cfg.print_size, up_axis, cfg.print_wall);
+}
+static bool emit_print_report(const trellis::TrellisParams& cfg, const trellis::PrintReport& report) {
     fputs(trellis::print_report_text(report).c_str(), stdout);
     if (cfg.print_report.empty()) return true;
     FILE* out = fopen(cfg.print_report.c_str(), "wb");
@@ -1208,6 +1210,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                                                           mesh.faces.data(), mesh.F(),
                                                           bvh, so.res, remesh_options);
         const bool solid = cfg.watertight && rm.F() > 0;
+        trellis::PrintReport solid_report;
+        bool report_pending = false;
         if (cfg.watertight && !solid) printf("  watertight: solid remesh produced nothing; falling back to the raw mesh\n");
         // Clean the narrow-band DC output (drop degenerate faces, unify winding), then drop
         // decode floaters (the reference is a single watertight component; ours shattered into
@@ -1285,7 +1289,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             if (fixed) printf("  watertight: repair pass changed %lld faces\n", (long long)fixed);
             printf("  watertight: mesh    %s\n",
                    trellis::audit_summary(trellis::audit_mesh(dv.data(), (int64_t)dv.size()/3, df.data(), (int64_t)df.size()/3)).c_str());
-            if (!emit_print_report(cfg, dv, df, print_up_axis)) return 1;
+            // Emitted after the bake, which may add the filament colours to it.
+            solid_report = make_print_report(cfg, dv, df, print_up_axis);
+            report_pending = true;
             fflush(stdout);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
@@ -1341,11 +1347,26 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             if (!cfg.out_3mf.empty()) {
                 const std::vector<float>& pv = bm.verts;   // already z-up (TRELLIS frame)
                 const trellis::PrintTexture ptex{bm.uv.data(), bm.base.data(), bm.T};
+                trellis::PrintColors pcol;
+                if (cfg.print_colors > 0) {
+                    const double tc0 = now();
+                    trellis::ColorOptions co;
+                    co.count = cfg.print_colors;
+                    co.speck_mm2 = cfg.print_speck;
+                    co.lift = cfg.print_color_lift;
+                    pcol = trellis::quantize_print_colors(pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
+                                                          (int64_t)bm.faces.size()/3, ptex, cfg.print_size, co);
+                    printf("  colours: %d filaments, %d patches (specks under %.1f mm2 merged, lift %.2f) in %.1fs\n",
+                           (int)pcol.palette.size(), pcol.patches, cfg.print_speck, cfg.print_color_lift, now() - tc0);
+                    if (report_pending) trellis::set_report_colors(solid_report, pcol);
+                }
                 if (trellis::write_3mf(cfg.out_3mf.c_str(), pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
-                                       (int64_t)bm.faces.size()/3, cfg.print_size, &ptex))
-                    printf("      3MF -> %s (%.0f mm, textured)\n", cfg.out_3mf.c_str(), cfg.print_size);
+                                       (int64_t)bm.faces.size()/3, cfg.print_size, &ptex, pcol.ok() ? &pcol : nullptr))
+                    printf("      3MF -> %s (%.0f mm, %s)\n", cfg.out_3mf.c_str(), cfg.print_size,
+                           pcol.ok() ? "filament colours" : "textured");
                 else { fprintf(stderr, "[trellis] cannot write %s\n", cfg.out_3mf.c_str()); return 1; }
             }
+            if (report_pending && !emit_print_report(cfg, solid_report)) return 1;
             textured = true;
             printf("      textured GLB (atlas %d, +%s%s)\n", bm.T, tex.c_str(), bm.nrm.empty() ? "" : ", +normal map");
         } else printf("      uv_bake failed; falling back to vertex colors\n");
@@ -1370,7 +1391,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             colors.clear();
             printf("  watertight: mesh    %s\n",
                    trellis::audit_summary(trellis::audit_mesh(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F())).c_str());
-            if (!emit_print_report(cfg, mesh.verts, mesh.faces, print_up_axis)) return 1;
+            if (!emit_print_report(cfg, make_print_report(cfg, mesh.verts, mesh.faces, print_up_axis))) return 1;
         } else printf("  watertight: solid remesh produced nothing; writing the raw mesh\n");
     }
     if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply
@@ -1384,7 +1405,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 fprintf(stderr, "[trellis] cannot write %s\n", cfg.out_3mf.c_str());
                 return 1;
             }
-            printf("      3MF -> %s (%.0f mm)\n", cfg.out_3mf.c_str(), cfg.print_size);
+            printf("      3MF -> %s (%.0f mm%s)\n", cfg.out_3mf.c_str(), cfg.print_size,
+                   cfg.print_colors > 0 ? "; no texture, so no filament colours" : "");
         }
     }
     std::string ply = outglb.substr(0, outglb.find_last_of('.')) + ".ply";

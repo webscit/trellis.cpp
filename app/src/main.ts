@@ -76,6 +76,7 @@ function readParams(): GenParams {
     printBase: ($("ctl-print-base") as HTMLSelectElement).value,
     printWall: readNumber("ctl-print-wall", DEFAULT_PARAMS.printWall!, 0, 20),
     printInterior: ($("ctl-print-interior") as HTMLSelectElement).value as PrintInterior,
+    printColors: parseInt(($("ctl-print-colors") as HTMLSelectElement).value, 10) || 0,
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
     mainAz,
@@ -107,6 +108,7 @@ function applyParams(p: GenParams): void {
   ($("ctl-print-base") as HTMLSelectElement).value = p.printBase ?? DEFAULT_PARAMS.printBase!;
   ($("ctl-print-wall") as HTMLInputElement).value = String(p.printWall ?? DEFAULT_PARAMS.printWall);
   ($("ctl-print-interior") as HTMLSelectElement).value = p.printInterior ?? (p.printSeal === 0 ? "hollow" : DEFAULT_PARAMS.printInterior!);
+  ($("ctl-print-colors") as HTMLSelectElement).value = String(p.printColors ?? DEFAULT_PARAMS.printColors);
   syncPrintOptions();
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
@@ -596,6 +598,25 @@ function showPrintReport(report: PrintReport | null | undefined): void {
       !report.base.flat || !report.base.stands || report.base.tip_angle_deg < 10);
   row("Overhangs", `${report.overhang_pct.toFixed(0)}% of the surface steeper than 45°`, report.overhang_pct > 25);
   row("Triangles", report.triangles.toLocaleString());
+  if (report.colors && report.colors.palette.length) {
+    // One swatch per filament slot, in slot order, with its share of the surface on hover.
+    const dt = document.createElement("dt");
+    dt.textContent = "Colours";
+    const dd = document.createElement("dd");
+    const note = document.createElement("div");
+    note.textContent = `${report.colors.palette.length} filaments · ${report.colors.patches.toLocaleString()} patches`;
+    const strip = document.createElement("div");
+    strip.className = "swatches";
+    for (const c of report.colors.palette) {
+      const s = document.createElement("span");
+      s.className = "swatch";
+      s.style.background = c.hex;
+      s.title = `slot ${c.slot} · ${c.hex} · ${c.share_pct.toFixed(1)}%`;
+      strip.append(s);
+    }
+    dd.append(note, strip);
+    rows.append(dt, dd);
+  }
 
   const list = $("print-report-warnings");
   list.replaceChildren(...report.warnings.map((text) => {

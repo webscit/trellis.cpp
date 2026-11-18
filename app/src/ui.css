@@ -199,6 +199,8 @@ body {
 .report-rows dt { color: var(--muted); }
 .report-rows dd { margin: 0; }
 .report-rows dd.bad { color: #e0a94a; }
+.swatches { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+.swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(127, 127, 127, 0.5); }
 .report-warnings { margin: 8px 0 0; padding-left: 18px; color: #e0a94a; }
 .report-warnings:empty { display: none; }
 

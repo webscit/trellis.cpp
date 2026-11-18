@@ -117,6 +117,7 @@ add_library(trellis_core STATIC
   src/mesh_print.cpp
   src/mesh_3mf.cpp
   src/print_report.cpp
+  src/print_colors.cpp
   src/decimate_qem.cpp
   src/mesh_shape.cpp
   src/quad_refinement.cpp

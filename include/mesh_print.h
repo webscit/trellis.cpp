@@ -107,6 +107,9 @@ struct PrintReport {
     bool   stands = false;           // centre of mass over the contact hull
     float  tip_angle_deg = 0;        // tilt needed to topple it
     double overhang_pct = 0;         // surface share facing down steeper than 45 degrees
+    std::vector<uint32_t> palette;   // filament colours (set_report_colors); empty = none
+    std::vector<double>   palette_share;
+    int    color_patches = 0;
     std::vector<std::string> warnings;
     bool ok() const { return warnings.empty(); }
 };
@@ -129,6 +132,32 @@ struct PrintTexture {
     bool ok() const { return uv && rgba && size > 0; }
 };
 
+// Filament colours for multi-material printers (--print-colors): the texture reduced to a
+// few colours, one per triangle. See docs/spec/32-print-ready.md §2.7.
+struct ColorOptions {
+    int   count = 0;          // palette size, 2..32; 0 = off
+    float speck_mm2 = 4.0f;   // colour patches smaller than this merge into a neighbour
+    float lift = 0.3f;        // shadow lift: 0 keeps the texture's tones; the levels are
+                              //   stretched and a gamma of 1/(1+lift) lifts baked-in shading
+};
+struct PrintColors {
+    std::vector<uint32_t> palette;   // 0xRRGGBB (sRGB); slot s+1 is palette[s], largest share first
+    std::vector<double>   share;     // surface share of each slot, 0..1
+    std::vector<uint8_t>  face_slot; // per input face, 0-based slot
+    int patches = 0;                 // connected same-colour regions after the speck merge
+    bool ok() const { return !palette.empty(); }
+};
+constexpr int kMaxPrintColors = 32;
+// verts/faces as for write_3mf (a UV-split buffer is fine: adjacency is taken over welded
+// positions); `size_mm` as for write_3mf, so speck_mm2 is on the printed part.
+PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                                  const PrintTexture& texture, float size_mm, const ColorOptions& options);
+// Orca / Prusa / Bambu triangle-selector code for a whole triangle painted with filament
+// `slot` (1-based): 1 -> "4", 2 -> "8", 3 -> "0C", 5 -> "2C", 20 -> "2FC".
+std::string paint_color_code(int slot);
+// Adds the palette (hex, share, patch count) to a report's text and JSON.
+void set_report_colors(PrintReport& report, const PrintColors& colors);
+
 // 3MF package (core spec + materials extension), laid out the way a slicer wants it:
 // millimetres, z-up, the lowest point on z = 0, centred on the origin in x/y, uniformly
 // scaled so the longest bounding-box side is size_mm (<= 0 keeps the mesh's own units).
@@ -138,7 +167,13 @@ struct PrintTexture {
 // closed manifold it is; with a texture the UVs go per triangle corner into a
 // texture2dgroup (PNG inside the package), which is how 3MF keeps a textured mesh
 // watertight. Unlike STL the file carries its unit and its colour.
+//
+// With `colors` (one slot per face, from quantize_print_colors) the texture is replaced by
+// filament colours: a basematerials group with a pid/p1 per triangle (the standard form),
+// Orca's per-triangle paint_color (what Orca-family slicers read), and the filament colours
+// in Metadata/project_settings.config so the slots open already coloured.
 bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* faces, int64_t F,
-               float size_mm = 100.0f, const PrintTexture* texture = nullptr);
+               float size_mm = 100.0f, const PrintTexture* texture = nullptr,
+               const PrintColors* colors = nullptr);
 
 }  // namespace trellis
