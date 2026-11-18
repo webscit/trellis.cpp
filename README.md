@@ -223,15 +223,19 @@ trellis-cli front.png out.glb --view top.png:top --view side.png:45:20  # names,
 
 `PATH:AZ:EL` gives the angles in degrees: 0 front, 90 the camera on the object's right as seen
 from the front, 180 back, 270 left, EL +90 top. AZ may also be a name
-(`front|back|left|right|top|bottom`). The positional image is view 0.
+(`front|back|left|right|top|bottom`), or `auto` to estimate it from the silhouettes. The
+positional image is view 0.
 
 | flag | meaning |
 |---|---|
 | `--view PATH[:AZ[:EL]]` | add a view (repeatable) |
-| `--blend-temp F` | blend sharpness (default 2.0) |
+| `--blend-temp F[,F,F]` | blend sharpness (default 2.0); three values set ss,shape,tex |
 | `--front-axis -y\|+y\|+x\|-x\|ref-z\|ref-x` | where the front lies on the latent grid (default `-y`; `ref-*` reproduce ComfyUI exactly) |
-| `--yaw-offset DEG` | added to every azimuth |
+| `--yaw-offset DEG\|auto` | added to every azimuth; `auto` picks 0/90/180/270 to match the model's own pose |
 | `--mv-stages ss,shape,tex` | which stages blend (default all) |
+| `--mv-ss blend\|union\|fill` | overall shape (default `fill`): `fill` = the blend plus the front view's voxels where the blend leaves holes in the front outline (fixes the slimmer outline, keeps the blended side views); `union` = front view OR blend |
+| `--mv-visibility` | texture: a view only steers the surface its camera can see |
+| `--check-views` | warn when a view's silhouette fits another azimuth better |
 
 Each extra view costs about one flow forward per step. All views share the negative CFG
 branch, so a guided step costs V+1 forwards, not 2V. Peak VRAM is unchanged. With a single

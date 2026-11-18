@@ -9,9 +9,12 @@
 //       selected view, forward count 12*V + guided steps with the shared negative.
 //   T3  (step_dir, from tools/ref_multiview_step.py) full multi-view trajectories vs the
 //       reference sampler maths over the same fake model.
-//   CLI --view / --front-axis / --mv-stages parsing and resolve_views.
+//   T4  pose checks (mv_pose.h) on an asymmetric synthetic voxel object: voxel silhouettes vs
+//       hand-built axis projections, azimuth and yaw recovery.
+//   CLI --view / --front-axis / --mv-stages / --yaw-offset / --mv-ss parsing and resolve_views.
 #include "flow_runner.h"
 #include "multiview.h"
+#include "mv_pose.h"
 #include "npy.h"
 #include "trellis_args.h"
 
@@ -261,7 +264,7 @@ static void test_cli() {
 
     TrellisParams p, base;
     CHECK(parse({ "a.png", "o.glb" }, base), "plain parse");
-    CHECK(base.views.empty() && base.blend_temp == 2.0f && base.front_axis == "-y" && base.mv_stages == 7u,
+    CHECK(base.views.empty() && base.blend_temp == 2.0f && base.front_axis == "-y" && base.mv_stages == 7u && base.mv_ss == 2,
           "defaults changed");
     vector<ViewSpec> vs; string err;
     CHECK(resolve_views(base, vs, err) && vs.size() == 1 && vs[0].image == "a.png", "resolve single");
@@ -298,6 +301,26 @@ static void test_cli() {
     CHECK(parse_mv_stages("none", st, err) && st == 0u, "none");
     CHECK(parse_mv_stages("ss", st, err) && st == 1u, "ss");
 
+    // Pose / union / per-stage temperature options.
+    CHECK(parse_view_spec("b.png:auto", vs.emplace_back(), err) && vs.back().auto_az && vs.back().image == "b.png"
+          && vs.back().az_deg == 0, "auto azimuth");
+    CHECK(parse_view_spec("b.png:auto:20", vs.emplace_back(), err) && vs.back().auto_az && vs.back().el_deg == 20,
+          "auto azimuth with elevation");
+    CHECK(parse_view_spec("b.png:90", vs.emplace_back(), err) && !vs.back().auto_az, "numeric azimuth not auto");
+    CHECK(parse({ "a.png", "--view", "b.png:auto", "--yaw-offset", "auto", "--mv-ss", "union",
+                  "--blend-temp", "2,,4", "--check-views" }, p), "pose options parse");
+    CHECK(p.yaw_auto && p.mv_ss == 1 && p.check_views && stage_blend_temp(p, 0) == 2 &&
+          stage_blend_temp(p, 1) == 2 && stage_blend_temp(p, 2) == 4, "pose option values");
+    CHECK(resolve_views(p, vs, err) && vs.size() == 2 && vs[1].auto_az, "auto view resolves");
+    CHECK(parse({ "--view", "a.png:auto", "--view", "b.png:90" }, p) && !resolve_views(p, vs, err),
+          "auto first view rejected");
+    CHECK(!parse({ "a.png", "--mv-ss", "max" }, p), "mv-ss max rejected");
+    CHECK(parse({ "a.png", "--mv-ss", "fill", "--mv-visibility" }, p) && p.mv_ss == 2 && p.mv_visibility,
+          "fill / visibility parse");
+    CHECK(!parse({ "a.png", "--mv-ss", "carve" }, p), "mv-ss carve rejected");
+    CHECK(!parse({ "a.png", "--blend-temp", "1,2" }, p), "two temperatures rejected");
+    CHECK(parse({ "a.png", "--blend-temp", "3" }, p) && stage_blend_temp(p, 2) == 3, "single temperature");
+
     // Directions: the default preset puts the front camera on grid -y and az=90 on grid +x.
     BlendParams bp;
     auto d0 = view_dir_grid(0, 0, bp), d90 = view_dir_grid(90, 0, bp), dt = view_dir_grid(0, 90, bp);
@@ -307,10 +330,114 @@ static void test_cli() {
     printf("CLI parse / resolve_views / directions: %s\n", g_fail ? "see failures" : "OK");
 }
 
+// ---------------------------------------------------------------- T4
+// An L-shaped object with a spur, asymmetric along every axis, on a 64^3 grid (default preset:
+// grid x = viewer right, grid y = toward the back, grid z = up).
+static vector<std::array<int,3>> lshape() {
+    vector<std::array<int,3>> c;
+    for (int x = 0; x < 64; ++x) for (int y = 0; y < 64; ++y) for (int z = 0; z < 64; ++z) {
+        const bool pillar = x >= 10 && x < 20 && y >= 10 && y < 20 && z >= 5 && z < 55;
+        const bool bar    = x >= 20 && x < 50 && y >= 10 && y < 20 && z >= 5 && z < 15;
+        const bool spur   = x >= 10 && x < 20 && y >= 20 && y < 45 && z >= 5 && z < 25;
+        if (pillar || bar || spur) c.push_back({x, y, z});
+    }
+    return c;
+}
+// Orthographic RGBA "photo" of the cells from a cardinal azimuth, built from the axes directly
+// (independent of voxel_silhouette): image column = the camera's right, row = 63 - z.
+static vector<unsigned char> axis_matte(const vector<std::array<int,3>>& cells, int az) {
+    vector<unsigned char> img(64 * 64 * 4, 0);
+    for (const auto& c : cells) {
+        const int col = az == 0 ? c[0] : az == 90 ? c[1] : az == 180 ? 63 - c[0] : 63 - c[1];
+        img[((size_t)(63 - c[2]) * 64 + col) * 4 + 3] = 255;
+    }
+    return img;
+}
+
+static void test_pose() {
+    const auto cells = lshape();
+    BlendParams bp;
+    vector<Silhouette> m(4);
+    for (int k = 0; k < 4; ++k) m[k] = matte_silhouette(axis_matte(cells, 90 * k).data(), 64, 64);
+    for (int k = 0; k < 4; ++k) {
+        const float same = silhouette_iou(m[k], voxel_silhouette(cells, 64, 90.0f * k, 0, bp));
+        const float mirror = silhouette_iou(m[k], voxel_silhouette(cells, 64, 90.0f * k + 180, 0, bp));
+        CHECK(same > 0.95f, "T4: az %d voxel silhouette IoU %.3f vs axis projection", 90 * k, same);
+        CHECK(mirror < 0.9f, "T4: az %d mirror view should not match (IoU %.3f)", 90 * k, mirror);
+    }
+    // Azimuth recovery: view 1's matte is really the az-90 view.
+    vector<ViewSpec> views = { {"f", 0, 0}, {"r", 0, 0, true} };
+    PoseTable t = pose_table(cells, 64, views, { m[0], m[1] }, FrontAxis::NegY);
+    CHECK(std::fabs(t.at(0, 0) - 1) < 0.05f, "T4: front IoU %.3f", t.at(0, 0));
+    AzChoice ac = choose_azimuth(t, 1, 0, { 0.0f });
+    CHECK(ac.az == 90, "T4: auto azimuth %g, want 90", ac.az);
+    // Yaw recovery: views say 0 / 90, but the object stands rotated so they are really 90 / 180.
+    views = { {"f", 0, 0}, {"r", 90, 0} };
+    t = pose_table(cells, 64, views, { m[1], m[2] }, FrontAxis::NegY);
+    YawChoice yc = choose_yaw(t, views, { true, true });
+    CHECK(yc.yaw == 90, "T4: yaw %g, want 90 (scores %.3f %.3f %.3f %.3f)", yc.yaw,
+          yc.scores[0], yc.scores[1], yc.scores[2], yc.scores[3]);
+    // Correct views keep yaw 0.
+    t = pose_table(cells, 64, views, { m[0], m[1] }, FrontAxis::NegY);
+    yc = choose_yaw(t, views, { true, true });
+    CHECK(yc.yaw == 0 && yc.score0 > 0.95f, "T4: yaw %g score0 %.3f, want 0", yc.yaw, yc.score0);
+    // A symmetric box: front and back tie, the supplied value (0) wins.
+    vector<std::array<int,3>> box;
+    for (int x = 20; x < 44; ++x) for (int y = 28; y < 36; ++y) for (int z = 10; z < 50; ++z) box.push_back({x, y, z});
+    const Silhouette bm = matte_silhouette(axis_matte(box, 0).data(), 64, 64);
+    t = pose_table(box, 64, { {"f", 0, 0} }, { bm }, FrontAxis::NegY);
+    yc = choose_yaw(t, { {"f", 0, 0} }, { true });
+    CHECK(yc.yaw == 0 && yc.ambiguous, "T4: symmetric box yaw %g ambiguous %d", yc.yaw, (int)yc.ambiguous);
+    printf("T4 pose checks (silhouettes, azimuth, yaw): %s\n", g_fail ? "see failures" : "OK");
+
+    // Fill: the blend lost the bar's right end; the front pass has it plus a spur behind the
+    // pillar. Only the bar's end is on an uncovered front line of sight.
+    {
+        vector<std::array<int,3>> bl;
+        for (const auto& c : cells) if (!(c[0] >= 40 && c[2] < 15)) bl.push_back(c);
+        const auto add = front_fill(bl, cells, 64, 0, 0, BlendParams{});
+        bool only_bar_end = !add.empty();
+        for (size_t i : add) only_bar_end = only_bar_end && cells[i][0] >= 40 && cells[i][2] < 15;
+        CHECK(only_bar_end && add.size() == 10 * 10 * 10, "T4 fill: %zu cells added", add.size());
+    }
+    // Visibility: plate A in front (y = 10), plate B behind it (y = 30); front (az 0) and back
+    // (az 180) views. B is hidden from the front camera by A, so the back view takes it over even
+    // though B sits slightly on the front half (direction weights favour the front there).
+    {
+        vector<std::array<int,3>> c2;
+        for (int x = 20; x < 40; ++x) for (int z = 20; z < 40; ++z) {
+            c2.push_back({x, 10, z});
+            c2.push_back({x, 30, z});
+        }
+        vector<ViewSpec> fb = { {"f", 0, 0}, {"b", 180, 0} };
+        vector<float> w = view_weights_sparse(c2, 64, fb, BlendParams{});
+        const vector<float> w0 = w;
+        const auto mv = apply_visibility(w, c2, 64, fb, BlendParams{}, 0.05f, 0);
+        const size_t N = c2.size();
+        // A cell on B's front face (y = 30), centre of the block: seen only from the back.
+        size_t nb = 0, na = 0;
+        for (size_t n = 0; n < N; ++n) {
+            if (c2[n][0] == 30 && c2[n][2] == 30 && c2[n][1] == 30) nb = n;
+            if (c2[n][0] == 30 && c2[n][2] == 30 && c2[n][1] == 10) na = n;
+        }
+        CHECK(w[nb] < 0.1f && w0[nb] > w[nb], "T4 vis: hidden face front weight %.3f (was %.3f)", w[nb], w0[nb]);
+        CHECK(w[na] > 0.9f, "T4 vis: visible front face weight %.3f", w[na]);
+        double sum_err = 0;
+        for (size_t n = 0; n < N; ++n) sum_err = std::max(sum_err, (double)std::fabs(w[n] + w[N + n] - 1));
+        CHECK(sum_err < 1e-5, "T4 vis: rows do not sum to 1 (%.2e)", sum_err);
+        // Single view: untouched.
+        vector<float> w1(N, 1.0f);
+        apply_visibility(w1, c2, 64, { {"f", 0, 0} }, BlendParams{});
+        CHECK(w1[nb] == 1.0f, "T4 vis: single view changed");
+        printf("T4 visibility: hidden face front weight %.3f -> %.3f, mean vis %.2f / %.2f\n", w0[nb], w[nb], mv[0], mv[1]);
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_cli();
     test_sampler_fake();
+    test_pose();
     if (argc > 1) test_weights(argv[1]); else printf("T1 skipped (no weights dir)\n");
     if (argc > 2) test_step_parity(argv[2]); else printf("T3 skipped (no step dir)\n");
     printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL OK", g_fail, g_fail == 1 ? "" : "s");

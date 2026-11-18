@@ -28,7 +28,7 @@ bool parse_float(const std::string& s, float& out) {
 
 bool view_name(const std::string& s, float& az, float& el) {
     struct N { const char* n; float az, el; };
-    static const N names[] = { {"front", 0, 0}, {"back", 180, 0}, {"left", 270, 0},
+    static const N names[] = { {"auto", 0, 0}, {"front", 0, 0}, {"back", 180, 0}, {"left", 270, 0},
                                {"right", 90, 0}, {"top", 0, 90}, {"bottom", 0, -90} };
     for (const N& n : names)
         if (s == n.n) { az = n.az; el = n.el; return true; }
@@ -131,6 +131,11 @@ bool parse_view_spec(const std::string& s, ViewSpec& out, std::string& error) {
         error = "view elevation must be within [-90, 90] degrees: " + s;
         return false;
     }
+    // "auto" is accepted only as the azimuth piece: "<path>:auto" or "<path>:auto:<el>".
+    if (path.size() < s.size()) {
+        const std::string rest = s.substr(path.size() + 1);
+        v.auto_az = rest == "auto" || rest.rfind("auto:", 0) == 0;
+    }
     v.image = path;
     out = v;
     return true;
@@ -192,6 +197,63 @@ std::vector<float> view_weights_dense(int R, const std::vector<ViewSpec>& views,
                 softmax_token(score, V, bp.temperature, w.data(), N, n);
             }
     return w;
+}
+
+std::vector<double> apply_visibility(std::vector<float>& w, const std::vector<std::array<int,3>>& coords,
+                                     int grid, const std::vector<ViewSpec>& views, const BlendParams& bp,
+                                     float eps, int blur) {
+    const size_t N = coords.size();
+    const int V = (int)views.size();
+    std::vector<double> mean(V, 0.0);
+    if (V <= 1 || N == 0 || w.size() != (size_t)V * N) return mean;
+    const int G = grid;
+    auto idx = [G](int x, int y, int z) { return ((size_t)x * G + y) * G + z; };
+    std::vector<int32_t> slot((size_t)G * G * G, -1);
+    for (size_t n = 0; n < N; ++n) {
+        const auto& c = coords[n];
+        if (c[0] >= 0 && c[1] >= 0 && c[2] >= 0 && c[0] < G && c[1] < G && c[2] < G) slot[idx(c[0], c[1], c[2])] = (int32_t)n;
+    }
+    const auto d = grid_dirs(views, bp);
+    std::vector<float> vis((size_t)V * N), tmp(N);
+    for (int v = 0; v < V; ++v) {
+        const double dx = d[v][0], dy = d[v][1], dz = d[v][2];
+        for (size_t n = 0; n < N; ++n) {
+            const double x0 = coords[n][0] + 0.5, y0 = coords[n][1] + 0.5, z0 = coords[n][2] + 0.5;
+            float seen = 1.0f;
+            // Start 1.5 cells out so the token's own cell and its face neighbours (the surface
+            // shell itself) do not self-occlude at grazing angles.
+            for (double t = 1.5; t < 2.0 * G; t += 0.5) {
+                const int x = (int)std::floor(x0 + t * dx), y = (int)std::floor(y0 + t * dy), z = (int)std::floor(z0 + t * dz);
+                if (x < 0 || y < 0 || z < 0 || x >= G || y >= G || z >= G) break;
+                if (slot[idx(x, y, z)] >= 0) { seen = 0.0f; break; }
+            }
+            vis[(size_t)v * N + n] = seen;
+        }
+        // Smooth across occupied neighbours (avoids seams along occlusion edges).
+        for (int it = 0; it < blur; ++it) {
+            float* vv = vis.data() + (size_t)v * N;
+            for (size_t n = 0; n < N; ++n) {
+                double s = 0; int c = 0;
+                for (int a = -1; a <= 1; ++a) for (int b = -1; b <= 1; ++b) for (int e = -1; e <= 1; ++e) {
+                    const int x = coords[n][0] + a, y = coords[n][1] + b, z = coords[n][2] + e;
+                    if (x < 0 || y < 0 || z < 0 || x >= G || y >= G || z >= G) continue;
+                    const int32_t m = slot[idx(x, y, z)];
+                    if (m >= 0) { s += vv[m]; ++c; }
+                }
+                tmp[n] = c ? (float)(s / c) : vv[n];
+            }
+            std::copy(tmp.begin(), tmp.end(), vv);
+        }
+        double s = 0;
+        for (size_t n = 0; n < N; ++n) s += vis[(size_t)v * N + n];
+        mean[v] = s / N;
+    }
+    for (size_t n = 0; n < N; ++n) {
+        double sum = 0;
+        for (int v = 0; v < V; ++v) { float& x = w[(size_t)v * N + n]; x *= eps + vis[(size_t)v * N + n]; sum += x; }
+        if (sum > 0) for (int v = 0; v < V; ++v) w[(size_t)v * N + n] = (float)(w[(size_t)v * N + n] / sum);
+    }
+    return mean;
 }
 
 std::vector<double> mean_view_weights(const std::vector<float>& w, int V) {

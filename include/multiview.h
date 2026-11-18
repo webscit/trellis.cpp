@@ -25,6 +25,7 @@ struct ViewSpec {
     std::string image;
     float az_deg = 0.0f;   // 0 front, 90 camera on viewer +X ("right"), 180 back, 270 left
     float el_deg = 0.0f;   // +90 top, -90 bottom
+    bool  auto_az = false; // azimuth given as "auto": estimated from silhouettes (mv_pose.h)
 };
 
 enum class FrontAxis { NegY, PosY, PosX, NegX, RefZ, RefX };
@@ -41,7 +42,8 @@ constexpr int kMaxViews = 12;
 // "path[:az[:el]]". Parsed from the RIGHT: at most two trailing ":<token>" pieces are stripped,
 // and only when they parse as an angle, so "C:\dir\a.png" and "C:\dir\a.png:180" both work.
 // az may be a name: front|back|left|right|top|bottom = (0,0) (180,0) (270,0) (90,0) (0,90)
-// (0,-90); an explicit elevation after a name overrides the name's own.
+// (0,-90); an explicit elevation after a name overrides the name's own. az may also be "auto"
+// (estimated from the silhouettes after the sparse-structure stage, see mv_pose.h).
 bool parse_view_spec(const std::string& s, ViewSpec& out, std::string& error);
 // -y (default) | +y | +x | -x | ref-z | ref-x
 bool parse_front_axis(const std::string& s, FrontAxis& out);
@@ -62,6 +64,15 @@ std::vector<float> view_weights_sparse(const std::vector<std::array<int,3>>& coo
 // Dense R^3 grid, token n = x*R*R + y*R + z (matches make_dense_runner). ref-* presets use the
 // reference's endpoint-inclusive linspace(-1, 1, R).
 std::vector<float> view_weights_dense(int R, const std::vector<ViewSpec>& views, const BlendParams& bp);
+
+// Occlusion-aware weights (texture stage, --mv-visibility): w[v] *= (eps + vis_v), renormalised,
+// where vis_v is 1 when the straight line from the token toward view v's camera leaves the
+// occupied set (`coords` on `grid`) without crossing another occupied cell, then smoothed by
+// `blur` passes of 3x3x3 averaging over occupied neighbours. Tokens no view sees keep exactly
+// their direction weights (all factors equal eps). Returns the mean visibility per view.
+std::vector<double> apply_visibility(std::vector<float>& w, const std::vector<std::array<int,3>>& coords,
+                                     int grid, const std::vector<ViewSpec>& views, const BlendParams& bp,
+                                     float eps = 0.05f, int blur = 1);
 
 // Mean weight per view over all tokens (a cheap sanity signal for logs).
 std::vector<double> mean_view_weights(const std::vector<float>& w, int V);

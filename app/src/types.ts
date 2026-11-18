@@ -3,13 +3,17 @@
 export type Resolution = 512 | 1024 | 1536;
 export type BgRemoval = "auto" | "birefnet" | "threshold";
 export type Uv = "xatlas" | "box";
+export type SsMode = "blend" | "union" | "fill";
 export type FrontAxis = "-y" | "+y" | "+x" | "-x" | "ref-z" | "ref-x";
 
 /** The server accepts at most this many images per request (front + extra views). */
 export const MAX_VIEWS = 12;
 
+/** Azimuth value meaning "estimate it from the silhouettes" (server azimuth "auto"). */
+export const AUTO_AZ = -1;
+
 /** An additional photo of the same object, taken from another direction.
- *  az: 0 front, 90 right, 180 back, 270 left; el: +90 top, -90 bottom. */
+ *  az: 0 front, 90 right, 180 back, 270 left, or AUTO_AZ; el: +90 top, -90 bottom. */
 export interface ExtraView {
   image: Blob;
   name: string;
@@ -29,6 +33,12 @@ export interface GenParams {
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
   frontAxis: FrontAxis;
+  /** Multi-view: pick the yaw offset from the silhouettes (server yaw_offset=auto). */
+  autoYaw?: boolean;
+  /** Multi-view: how the overall shape uses the views (server mv_ss; default fill). */
+  ssMode?: SsMode;
+  /** Multi-view: a view only steers the texture it can see (server mv_visibility=on). */
+  visibility?: boolean;
   /** Camera direction of the main image (only sent with extra views; default 0, 0). */
   mainAz?: number;
   mainEl?: number;
