@@ -95,6 +95,7 @@ add_library(trellis_core STATIC
   src/dit.cpp
   src/flow_runner.cpp
   src/multiview.cpp
+  src/mv_pose.cpp
   src/mesh_io.cpp
   src/mesh_voxelize.cpp
   src/ss_decoder.cpp

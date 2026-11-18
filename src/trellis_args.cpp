@@ -138,6 +138,46 @@ bool parse_mv_stages(const std::string& value, unsigned& out, std::string& error
     return true;
 }
 
+bool parse_blend_temps(const std::string& value, TrellisParams& p, std::string& error) {
+    std::vector<std::string> parts;
+    size_t b = 0;
+    while (b <= value.size()) {
+        size_t e = value.find(',', b);
+        if (e == std::string::npos) e = value.size();
+        parts.push_back(value.substr(b, e - b));
+        b = e + 1;
+    }
+    if (parts.size() != 1 && parts.size() != 3) {
+        error = "blend-temp expects one value or three (ss,shape,tex), got '" + value + "'";
+        return false;
+    }
+    float vals[3] = {0, 0, 0};
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (parts.size() == 3 && parts[i].empty()) continue;
+        char* end = nullptr;
+        const float f = std::strtof(parts[i].c_str(), &end);
+        if (end == parts[i].c_str() || *end || !std::isfinite(f) || f <= 0) {
+            error = "blend-temp values must be positive numbers, got '" + value + "'";
+            return false;
+        }
+        vals[i] = f;
+    }
+    if (parts.size() == 1) { p.blend_temp = vals[0]; for (float& t : p.blend_temp_stage) t = 0; }
+    else for (int i = 0; i < 3; ++i) p.blend_temp_stage[i] = vals[i];
+    return true;
+}
+
+float stage_blend_temp(const TrellisParams& p, int stage) {
+    return p.blend_temp_stage[stage] > 0 ? p.blend_temp_stage[stage] : p.blend_temp;
+}
+
+bool parse_mv_ss(const std::string& value, int& out) {
+    if (value == "blend") { out = 0; return true; }
+    if (value == "union") { out = 1; return true; }
+    if (value == "fill")  { out = 2; return true; }
+    return false;
+}
+
 bool blend_params_of(const TrellisParams& p, BlendParams& out, std::string& error) {
     BlendParams bp;
     if (!(p.blend_temp > 0.0f) || !std::isfinite(p.blend_temp)) {
@@ -170,6 +210,11 @@ bool resolve_views(const TrellisParams& p, std::vector<ViewSpec>& out, std::stri
     }
     BlendParams bp;
     if (!blend_params_of(p, bp, error)) return false;
+    if (v[0].auto_az) {
+        error = "the first view is the reference (front) and cannot have an auto azimuth: " + v[0].image;
+        return false;
+    }
+    if (v.size() == 1) v[0].auto_az = false;
     if (p.family == ModelFamily::Pixal3D && (v.size() > 1 || !p.refine_mesh.empty())) {
         error = "--model pixal3d does not support multi-view conditioning (--view) or --refine-mesh yet;"
                 " use --model trellis, or pass a single image.";
@@ -202,16 +247,35 @@ void print_usage(const char* argv0, bool server) {
         "                          conditioning). AZ/EL in degrees: 0 front, 90 camera on the\n"
         "                          object's right as seen from the front (viewer +X), 180 back,\n"
         "                          270 left; EL +90 top. AZ may be a name: front|back|left|\n"
-        "                          right|top|bottom. The positional/--image input is view 0\n"
+        "                          right|top|bottom, or auto (estimated from the silhouettes after\n"
+        "                          the sparse-structure stage; front/back is ambiguous on\n"
+        "                          symmetric objects). The positional/--image input is view 0\n"
         "                          (front). Up to 12 views; each costs one flow forward per step.\n"
         "                            trellis-cli front.png out.glb --view back.png:180\n"
         "                            trellis-cli --view f.png:0 --view r.png:90 --view b.png:180\n"
         "                                        --view l.png:270 -o out.glb\n"
-        "      --blend-temp F      multi-view blend sharpness (softmax temperature, default 2.0)\n"
+        "      --blend-temp F[,F,F]  multi-view blend sharpness (softmax temperature, default 2.0);\n"
+        "                          three values set ss,shape,tex separately (empty = the default)\n"
         "      --front-axis NAME   where the object's front lies on the latent grid: -y (default,\n"
         "                          TRELLIS canonical) | +y | +x | -x | ref-z | ref-x (the last two\n"
         "                          reproduce ComfyUI-Trellis2's front_axis 'z' / 'x' exactly)\n"
-        "      --yaw-offset DEG    added to every view's azimuth (default 0)\n"
+        "      --yaw-offset DEG|auto  added to every view's azimuth (default 0). auto: run the\n"
+        "                          sparse-structure stage on the front view, then pick 0/90/180/270\n"
+        "                          by matching the occupancy's silhouettes to the views' mattes\n"
+        "                          (the model imposes its own canonical pose; this re-expresses the\n"
+        "                          views in it). Front/back ties keep 0.\n"
+        "      --check-views       compare every view's matte with the front-view occupancy and\n"
+        "                          warn when another azimuth fits clearly better (implied by\n"
+        "                          --yaw-offset auto and by --view PATH:auto)\n"
+        "      --mv-ss MODE        how the sparse-structure stage (overall shape) uses the views:\n"
+        "                          blend (per-token velocity blend) | union (occupancy of\n"
+        "                          the front-view pass OR the blended pass: keeps the single-view\n"
+        "                          outline, adds what the other views show) | fill (the blend, plus\n"
+        "                          the front view's cells only where the blend leaves a hole in the\n"
+        "                          front silhouette: front outline kept, side views stay blended;\n"
+        "                          default, costs one extra front-view pass)\n"
+        "      --mv-visibility     texture stage: a view only steers the regions its camera can\n"
+        "                          see (unseen regions keep the direction-only blend)\n"
         "      --mv-stages LIST    stages that blend views: ss,shape,tex | all | none (default all;\n"
         "                          the others use the first view only)\n"
         "      --refine-mesh PATH  re-generate an existing mesh (.glb/.gltf/.obj) from the view(s):\n"
@@ -373,14 +437,19 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   if (!parse_view_spec(v, vs, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
                                                   p.views.push_back(vs); }
         else if (a == "--blend-temp")           { const char* v = need(a.c_str()); if (!v) return false;
-                                                  char* end = nullptr; const float f = std::strtof(v, &end);
-                                                  if (end == v || *end || !std::isfinite(f) || f <= 0) { fprintf(stderr, "[trellis] --blend-temp must be a positive number\n"); return false; }
-                                                  p.blend_temp = f; }
+                                                  std::string error;
+                                                  if (!parse_blend_temps(v, p, error)) { fprintf(stderr, "[trellis] --%s\n", error.c_str()); return false; } }
+        else if (a == "--mv-ss")                { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (!parse_mv_ss(v, p.mv_ss)) { fprintf(stderr, "[trellis] --mv-ss must be blend, union or fill\n"); return false; } }
+        else if (a == "--mv-visibility")        { p.mv_visibility = true; }
+        else if (a == "--check-views")          { p.check_views = true; }
         else if (a == "--front-axis")           { const char* v = need(a.c_str()); if (!v) return false;
                                                   FrontAxis fa;
                                                   if (!parse_front_axis(v, fa)) { fprintf(stderr, "[trellis] --front-axis must be one of -y, +y, +x, -x, ref-z, ref-x\n"); return false; }
                                                   p.front_axis = v; }
         else if (a == "--yaw-offset")           { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (std::strcmp(v, "auto") == 0) { p.yaw_auto = true; p.yaw_offset = 0; continue; }
+                                                  p.yaw_auto = false;
                                                   char* end = nullptr; const float f = std::strtof(v, &end);
                                                   if (end == v || *end || !std::isfinite(f)) { fprintf(stderr, "[trellis] --yaw-offset must be a number of degrees\n"); return false; }
                                                   p.yaw_offset = f; }

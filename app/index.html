@@ -147,6 +147,28 @@
                 <option value="ref-x">ref-x (ComfyUI compatible)</option>
               </select>
             </label>
+            <label class="ctl">
+              <span>Pose (the model picks its own orientation; auto turns the directions to match it)</span>
+              <select id="ctl-yaw">
+                <option value="given" selected>Directions as given</option>
+                <option value="auto">Auto-detect from silhouettes</option>
+              </select>
+            </label>
+            <label class="ctl">
+              <span>Overall shape</span>
+              <select id="ctl-ss">
+                <option value="blend">Blend all views</option>
+                <option value="union">Front view + blend (keeps the outline)</option>
+                <option value="fill" selected>Blend, front outline restored (default)</option>
+              </select>
+            </label>
+            <label class="ctl">
+              <span>Texture</span>
+              <select id="ctl-vis">
+                <option value="off" selected>Blend by direction</option>
+                <option value="on">Only from views that can see the surface</option>
+              </select>
+            </label>
           </details>
         </div>
 

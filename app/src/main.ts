@@ -5,7 +5,7 @@ import { renderSettings } from "./settings";
 import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphemeral, newId, put } from "./store";
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
-import { DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
+import { AUTO_AZ, DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -79,6 +79,9 @@ function readParams(): GenParams {
     printColors: parseInt(($("ctl-print-colors") as HTMLSelectElement).value, 10) || 0,
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
+    autoYaw: ($("ctl-yaw") as HTMLSelectElement).value === "auto",
+    ssMode: ($("ctl-ss") as HTMLSelectElement).value as GenParams["ssMode"],
+    visibility: ($("ctl-vis") as HTMLSelectElement).value === "on",
     mainAz,
     mainEl,
   };
@@ -113,6 +116,9 @@ function applyParams(p: GenParams): void {
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
   ($("ctl-front") as HTMLSelectElement).value = p.frontAxis ?? DEFAULT_PARAMS.frontAxis;
+  ($("ctl-yaw") as HTMLSelectElement).value = p.autoYaw ? "auto" : "given";
+  ($("ctl-ss") as HTMLSelectElement).value = p.ssMode ?? "fill";
+  ($("ctl-vis") as HTMLSelectElement).value = p.visibility ? "on" : "off";
   mainAz = p.mainAz ?? 0;
   mainEl = p.mainEl ?? 0;
 }
@@ -179,10 +185,13 @@ function directionControls(
   el0: number,
   onAz: (az: number) => void,
   onEl: (el: number) => void,
+  allowAuto = false,
 ): [HTMLSelectElement, HTMLInputElement] {
   const az = document.createElement("select");
   az.title = "Azimuth: where the camera was, going around the object";
   for (const [deg, label] of AZIMUTHS) az.add(new Option(`${label} · ${deg}°`, String(deg)));
+  // Estimated by the server from the silhouettes (front/back can be ambiguous on symmetric objects).
+  if (allowAuto) az.add(new Option("auto (estimate)", String(AUTO_AZ)));
   if (!AZIMUTHS.some(([deg]) => deg === az0)) az.add(new Option(`${az0}°`, String(az0)));
   az.value = String(az0);
   az.addEventListener("change", () => onAz(parseFloat(az.value)));
@@ -203,6 +212,7 @@ function directionControls(
 }
 
 function azLabel(az: number): string {
+  if (az === AUTO_AZ) return "auto";
   return `${AZIMUTHS.find(([deg]) => deg === az)?.[1] ?? "view"} · ${az}°`;
 }
 
@@ -254,7 +264,8 @@ function renderViews(): void {
 
     const [az, el] = directionControls(v.az, v.el,
       (a) => (extraViews[i].az = a),
-      (e) => (extraViews[i].el = e));
+      (e) => (extraViews[i].el = e),
+      true);
     row.append(az, el);
 
     const del = document.createElement("button");

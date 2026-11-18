@@ -25,11 +25,13 @@
 //
 //                    Multi-view (docs/spec/30-multiview.md): send several "image" parts
 //                    of the same object plus "azimuths" (comma list, one per image in
-//                    the same order; degrees or front|back|left|right|top|bottom) and
-//                    optionally "elevations" (default 0). "azimuths" is required with
-//                    more than one image. Also "blend_temp", "front_axis"
-//                    (-y|+y|+x|-x|ref-z|ref-x) and "yaw_offset". One image and no angle
-//                    fields is exactly the single-image request.
+//                    the same order; degrees, front|back|left|right|top|bottom, or auto)
+//                    and optionally "elevations" (default 0). "azimuths" is required with
+//                    more than one image. Also "blend_temp" (one value or ss,shape,tex),
+//                    "front_axis" (-y|+y|+x|-x|ref-z|ref-x), "yaw_offset" (degrees or
+//                    auto), "mv_ss" (blend|union|fill), "mv_visibility"
+//                    and "check_views" (on|off). One image and
+//                    no angle fields is exactly the single-image request.
 //   POST /refine      multipart/form-data with a "mesh" file part (GLB or OBJ, detected by
 //                    magic) and one or more "image" parts plus every /generate field
 //                    (angles, blend, seed, resolution, texture, faces, atlas, ...), and
@@ -200,11 +202,23 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     }
     // Multi-view blend knobs (meaningful with several images).
     if (req.has_file("blend_temp")) {
-        const std::string& v = req.get_file_value("blend_temp").content;
-        char* end = nullptr;
-        const float f = std::strtof(v.c_str(), &end);
-        if (end == v.c_str() || *end || !std::isfinite(f) || f <= 0) { bad_request(res, "blend_temp must be a positive number"); return false; }
-        p.blend_temp = f;
+        std::string error;
+        if (!trellis::parse_blend_temps(req.get_file_value("blend_temp").content, p, error)) {
+            bad_request(res, error.replace(0, 10, "blend_temp")); return false;
+        }
+    }
+    if (req.has_file("mv_ss")) {
+        if (!trellis::parse_mv_ss(req.get_file_value("mv_ss").content, p.mv_ss)) {
+            bad_request(res, "mv_ss must be blend, union or fill"); return false;
+        }
+    }
+    if (req.has_file("mv_visibility")) {
+        const std::string& v = req.get_file_value("mv_visibility").content;
+        p.mv_visibility = v == "on" || v == "1" || v == "true";
+    }
+    if (req.has_file("check_views")) {
+        const std::string& v = req.get_file_value("check_views").content;
+        p.check_views = v == "on" || v == "1" || v == "true";
     }
     if (req.has_file("front_axis")) {
         const std::string& v = req.get_file_value("front_axis").content;
@@ -214,10 +228,15 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     }
     if (req.has_file("yaw_offset")) {
         const std::string& v = req.get_file_value("yaw_offset").content;
-        char* end = nullptr;
-        const float f = std::strtof(v.c_str(), &end);
-        if (end == v.c_str() || *end || !std::isfinite(f)) { bad_request(res, "yaw_offset must be a number of degrees"); return false; }
-        p.yaw_offset = f;
+        p.yaw_auto = v == "auto";
+        if (p.yaw_auto) {
+            p.yaw_offset = 0;
+        } else {
+            char* end = nullptr;
+            const float f = std::strtof(v.c_str(), &end);
+            if (end == v.c_str() || *end || !std::isfinite(f)) { bad_request(res, "yaw_offset must be a number of degrees"); return false; }
+            p.yaw_offset = f;
+        }
     }
     return true;
 }
@@ -258,6 +277,8 @@ bool parse_view_angles(const httplib::Request& req, size_t n, std::vector<trelli
             }
             out[i].az_deg = v.az_deg;
             out[i].el_deg = v.el_deg;   // a name like "top" carries its elevation
+            out[i].auto_az = v.auto_az; // "auto": estimated from the silhouettes
+            if (i == 0 && v.auto_az) { error = "the first image is the reference view; its azimuth cannot be auto"; return false; }
         }
     }
     if (has_el) {
@@ -404,7 +425,7 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
         for (size_t i = 0; i < images.size(); ++i) {
             job->staged.push_back(stem + "_v" + std::to_string(i) + ".png");
             job->bytes.push_back(images[i].content);
-            p.views.push_back(trellis::ViewSpec{ job->staged.back(), angles[i].az_deg, angles[i].el_deg });
+            p.views.push_back(trellis::ViewSpec{ job->staged.back(), angles[i].az_deg, angles[i].el_deg, angles[i].auto_az });
         }
     } else {
         p.image = stem + ".png";

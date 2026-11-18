@@ -153,8 +153,13 @@ struct TrellisParams {
     std::vector<ViewSpec> views;  // --view PATH[:AZ[:EL]] (repeatable). `image` (positional or
                                   //   --image) is the front view and comes first.
     float       blend_temp = 2.0f;   // --blend-temp: softmax temperature of the per-token blend
+    float       blend_temp_stage[3] = {0, 0, 0};   // --blend-temp SS,SHAPE,TEX (0 = blend_temp)
     std::string front_axis = "-y";   // --front-axis -y|+y|+x|-x|ref-z|ref-x
     float       yaw_offset = 0.0f;   // --yaw-offset DEG, added to every view's azimuth
+    bool        yaw_auto   = false;  // --yaw-offset auto: pick 0/90/180/270 from the silhouettes
+    int         mv_ss      = 2;      // --mv-ss blend (0) | union (1) | fill (2, default)
+    bool        mv_visibility = false; // --mv-visibility: occlusion-aware texture-stage weights
+    bool        check_views = false; // --check-views: silhouette check of the supplied angles
     unsigned    mv_stages  = 7;      // --mv-stages ss,shape,tex (bit0 ss, bit1 shape, bit2 tex)
 
     // ---- mesh refinement (--refine-mesh, docs/spec/31-mesh-refine.md) ----
@@ -181,6 +186,13 @@ bool parse_camera_arg(const std::string& name, const char* value, TrellisParams&
 
 // Multi-view stage list ("ss,shape,tex", "all", "none") -> TrellisParams::mv_stages bits.
 bool parse_mv_stages(const std::string& value, unsigned& out, std::string& error);
+// "--blend-temp" value: one temperature, or three ("SS,SHAPE,TEX"; an empty slot keeps the
+// single value). Fills blend_temp / blend_temp_stage.
+bool parse_blend_temps(const std::string& value, TrellisParams& p, std::string& error);
+// The blend temperature of stage 0 (ss), 1 (shape) or 2 (tex).
+float stage_blend_temp(const TrellisParams& p, int stage);
+// "--mv-ss": blend | union | fill.
+bool parse_mv_ss(const std::string& value, int& out);
 // The ordered view list of a run: `image` (when set) is view 0 at az 0 / el 0, then `views`.
 // Shared by trellis-cli and trellis-server. Fails on no view, more than kMaxViews, a bad
 // --blend-temp / --front-axis, or a view list the selected family cannot use.
