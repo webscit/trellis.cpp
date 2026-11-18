@@ -1,5 +1,6 @@
 #include "mesh_print.h"
 #include "remesh_dc.h"
+#include <string>
 #include "tri_bvh.h"
 #include "uv_bake.h"
 
@@ -272,6 +273,32 @@ float wall_cells_for(float wall_mm, float size_mm, int res, float model_extent) 
     return wall_mm / size_mm * model_extent * (float)res;
 }
 
+float open_ball_cells_for(int res) {
+    return res > 0 ? (float)res / 12.0f : 0.0f;
+}
+
+bool parse_print_interior(const char* text, PrintInterior& out) {
+    const std::string t = text ? text : "";
+    if (t == "auto")   { out = PrintInterior::Auto;   return true; }
+    if (t == "solid")  { out = PrintInterior::Solid;  return true; }
+    if (t == "hollow") { out = PrintInterior::Hollow; return true; }
+    return false;
+}
+
+const char* print_interior_name(PrintInterior interior) {
+    return interior == PrintInterior::Solid ? "solid" : interior == PrintInterior::Hollow ? "hollow" : "auto";
+}
+
+void set_print_interior(RemeshOptions& remesh, PrintInterior interior, int res) {
+    remesh.seal = interior == PrintInterior::Hollow ? 0 : 3;
+    remesh.open_ball_cells = interior == PrintInterior::Auto ? open_ball_cells_for(res) : 0.0f;
+}
+
+void set_print_walls(RemeshOptions& remesh, float wall_cells) {
+    remesh.min_wall_cells = wall_cells > 0 ? wall_cells : 0.0f;
+    remesh.min_neck_cells = wall_cells > 0 ? 2.0f * wall_cells : 0.0f;
+}
+
 void set_print_base(RemeshOptions& remesh, const float* verts, int64_t V, int up_axis, float base) {
     if (base == 0) return;
     remesh.base_axis = up_axis;
@@ -298,8 +325,8 @@ Mesh make_printable(const Mesh& in, const PrintOptions& options) {
     RemeshOptions remesh;
     remesh.band = std::max(1, options.band);
     remesh.solid = true;
-    remesh.seal = options.seal;
-    remesh.min_wall_cells = options.wall_cells;
+    set_print_interior(remesh, options.interior, options.res);
+    set_print_walls(remesh, options.wall_cells);
     set_print_base(remesh, source.verts.data(), source.V(), options.up_axis, options.base);
     const auto t0 = std::chrono::steady_clock::now();
     auto lap = [&t0]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };

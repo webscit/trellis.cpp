@@ -62,6 +62,36 @@ static Mesh flat_sheet(bool vertical) {
     return m;
 }
 
+// A rectangle in the plane `axis` = c with a rectangular hole: four quads between the
+// outer (lo, hi) and inner (ilo, ihi) rectangles, in the two other axes' order.
+static void add_frame(Mesh& m, int axis, float c, const float lo[2], const float hi[2], const float ilo[2], const float ihi[2]) {
+    const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+    const float ring[8][2] = {{lo[0], lo[1]}, {hi[0], lo[1]}, {hi[0], hi[1]}, {lo[0], hi[1]},
+                              {ilo[0], ilo[1]}, {ihi[0], ilo[1]}, {ihi[0], ihi[1]}, {ilo[0], ihi[1]}};
+    const int base = m.V();
+    for (const auto& p : ring) {
+        float v[3];
+        v[axis] = c; v[a] = p[0]; v[b] = p[1];
+        m.verts.insert(m.verts.end(), v, v + 3);
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int j = (i + 1) % 4;
+        for (int k : {i, j, 4 + j, i, 4 + j, 4 + i}) m.faces.push_back(base + k);
+    }
+}
+
+// Extent along `axis` of the vertices whose x lies in [x0, x1]: the thickness of a bar
+// running along x, measured on a slice across it.
+static float slice_extent(const Mesh& m, float x0, float x1, int axis) {
+    float lo = 1e30f, hi = -1e30f;
+    for (int v = 0; v < m.V(); ++v) {
+        const float* p = &m.verts[3 * (size_t)v];
+        if (p[0] < x0 || p[0] > x1) continue;
+        lo = std::fmin(lo, p[axis]); hi = std::fmax(hi, p[axis]);
+    }
+    return hi > lo ? hi - lo : 0.0f;
+}
+
 static MeshAudit audit(const Mesh& m) { return audit_mesh(m.verts.data(), m.V(), m.faces.data(), m.F()); }
 
 static Mesh remesh(const Mesh& m, int res, const RemeshOptions& options) {
@@ -140,13 +170,14 @@ int main(int argc, char** argv) {
         CHECK(a.volume > 0.5 * wall && a.volume < 2.0 * wall, "cup volume %g, expected about %g", a.volume, wall);
     }
 
-    {   // A torn surface: a third of the lid is missing. The flood alone walks in (a cup);
+    {   // A torn surface: a 0.12 hole in the lid (wider than any tear measured on decoded
+        // models, about 0.1 of the grid, and narrower than the open ball). The flood alone walks in (a cup);
         // the openness vote caps the tear and the box is solid again. A shallow tray, whose
         // floor sees the sky in every upward direction, must stay a tray.
         Mesh torn;
         add_box(torn, std::array<float, 3>{-0.3f, -0.3f, -0.3f}.data(), std::array<float, 3>{0.3f, 0.3f, 0.3f}.data(), 5);
         const int base = torn.V();   // lid with a 0.2 x 0.2 hole in the middle
-        const float o = 0.3f, h = 0.1f;
+        const float o = 0.3f, h = 0.06f;
         const float ring[8][2] = {{-o, -o}, {o, -o}, {o, o}, {-o, o}, {-h, -h}, {h, -h}, {h, h}, {-h, h}};
         for (const auto& p : ring) { torn.verts.push_back(p[0]); torn.verts.push_back(p[1]); torn.verts.push_back(0.3f); }
         for (int i = 0; i < 4; ++i) {
@@ -188,6 +219,66 @@ int main(int argc, char** argv) {
         const MeshAudit open_tray = audit(remesh(tray, res, sealing));
         const double slab = 0.6 * 0.6 * 0.1;
         CHECK(open_tray.watertight() && open_tray.volume < 0.6 * slab, "tray was filled: volume %g of slab %g", open_tray.volume, slab);
+
+        // Vessels. A deep cup's floor sees the sky through one narrow cone only, so the vote
+        // shuts it like the inside of a torn figurine and the cup comes out filled. With the
+        // open ball the mouth, wider than any tear, lets it back out: the cup stays hollow,
+        // also with a tear in its side, while the torn box and the tray do not change.
+        RemeshOptions vessel = sealing;
+        vessel.open_ball_cells = open_ball_cells_for(res);
+        const float clo[3] = {-0.15f, -0.15f, -0.40f}, chi[3] = {0.15f, 0.15f, 0.35f};
+        Mesh cup;
+        add_box(cup, clo, chi, 5);
+        const double full = 0.3 * 0.3 * 0.75;
+        const MeshAudit filled_cup = audit(remesh(cup, res, sealing)), hollow_cup = audit(remesh(cup, res, vessel));
+        CHECK(filled_cup.watertight() && filled_cup.volume > 0.8 * full, "the vote alone no longer fills the deep cup (%g of %g): fixture too shallow",
+              filled_cup.volume, full);
+        CHECK(hollow_cup.watertight() && hollow_cup.components == 1 && hollow_cup.volume < 0.6 * full, "deep cup was filled: %s (full %g)",
+              audit_summary(hollow_cup).c_str(), full);
+        Mesh torn_cup;   // the same cup with a 0.08 tear low in its -x side
+        add_box(torn_cup, clo, chi, 5);
+        torn_cup.faces.erase(torn_cup.faces.begin(), torn_cup.faces.begin() + 6);   // drop the -x side ...
+        add_frame(torn_cup, 0, -0.15f, std::array<float, 2>{-0.15f, -0.40f}.data(), std::array<float, 2>{0.15f, 0.35f}.data(),
+                  std::array<float, 2>{-0.04f, -0.30f}.data(), std::array<float, 2>{0.04f, -0.22f}.data());   // ... and put it back torn
+        const MeshAudit torn_hollow = audit(remesh(torn_cup, res, vessel));
+        CHECK(torn_hollow.watertight() && torn_hollow.components == 1 && torn_hollow.volume < 0.6 * full, "torn cup: %s",
+              audit_summary(torn_hollow).c_str());
+        const MeshAudit torn_box = audit(remesh(torn, res, vessel)), tray_vessel = audit(remesh(tray, res, vessel));
+        CHECK(torn_box.watertight() && torn_box.components == 1 && std::fabs(torn_box.volume - capped.volume) < 0.01 * capped.volume,
+              "the open ball changed the torn box: %g vs %g", torn_box.volume, capped.volume);
+        CHECK(tray_vessel.watertight() && std::fabs(tray_vessel.volume - open_tray.volume) < 0.05 * open_tray.volume,
+              "the open ball changed the tray: %g vs %g", tray_vessel.volume, open_tray.volume);
+    }
+
+    {   // Necks. Two thick blocks joined by a short bar thinner than the target: the bar is too
+        // short for the thin-wall rule (every point of it is near thick material), so only the
+        // neck rule grows it, to about the target diameter. Joined instead by a plate as wide
+        // as the blocks, they are not bridged: the joint's cross-section is large.
+        const float neck = 12.0f;   // cells
+        RemeshOptions wall = solid;
+        wall.min_wall_cells = 6.0f;
+        RemeshOptions necks = wall;
+        necks.min_neck_cells = neck;
+        Mesh bell;
+        add_box(bell, std::array<float, 3>{-0.40f, -0.17f, -0.17f}.data(), std::array<float, 3>{-0.06f, 0.17f, 0.17f}.data());
+        add_box(bell, std::array<float, 3>{0.06f, -0.17f, -0.17f}.data(), std::array<float, 3>{0.40f, 0.17f, 0.17f}.data());
+        add_box(bell, std::array<float, 3>{-0.08f, -0.03f, -0.03f}.data(), std::array<float, 3>{0.08f, 0.03f, 0.03f}.data());
+        const Mesh thin = remesh(bell, res, wall), thick = remesh(bell, res, necks);
+        const float t0 = slice_extent(thin, -0.02f, 0.02f, 1) / cell, t1 = slice_extent(thick, -0.02f, 0.02f, 1) / cell;
+        const float u1 = slice_extent(thick, -0.02f, 0.02f, 2) / cell;
+        printf("neck fixture: bar %.1f cells thick with the thin-wall rule alone, %.1f x %.1f with the neck rule (target %.0f)\n", t0, t1, u1, neck);
+        CHECK(t0 < 0.7f * neck, "the bar is already %g cells thick without the neck rule: fixture too thick", t0);
+        CHECK(audit(thick).watertight() && audit(thick).components == 1 && t1 > 0.8f * neck && u1 > 0.8f * neck && t1 < 1.6f * neck,
+              "neck grown to %g x %g cells (target %g, was %g): %s", t1, u1, neck, t0, audit_summary(audit(thick)).c_str());
+
+        Mesh plated;
+        add_box(plated, std::array<float, 3>{-0.40f, -0.40f, -0.17f}.data(), std::array<float, 3>{-0.06f, 0.40f, 0.17f}.data());
+        add_box(plated, std::array<float, 3>{0.06f, -0.40f, -0.17f}.data(), std::array<float, 3>{0.40f, 0.40f, 0.17f}.data());
+        add_box(plated, std::array<float, 3>{-0.08f, -0.40f, -0.02f}.data(), std::array<float, 3>{0.08f, 0.40f, 0.02f}.data());
+        const double p0 = audit(remesh(plated, res, wall)).volume, p1 = audit(remesh(plated, res, necks)).volume;
+        CHECK(std::fabs(p1 - p0) < 0.01 * p0, "a wide plate was bridged as a neck: volume %g vs %g", p1, p0);
+        const double b0 = audit(remesh(box(0.3f), res, wall)).volume, b1 = audit(remesh(box(0.3f), res, necks)).volume;
+        CHECK(std::fabs(b1 - b0) < 0.001 * b0, "a thick box changed under min_neck_cells: %g vs %g", b1, b0);
     }
 
     // Flat base: the bottom 25 % goes, the cut is one exact plane, the solid stays closed.

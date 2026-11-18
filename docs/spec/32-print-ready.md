@@ -57,7 +57,7 @@ the goblin comes out as a closed but hollow shell (volume 0.0100). A closing rad
 tried and rejected — sealing a 50-cell tear needs a radius that also fills the gap
 between two legs.
 
-### 2.1b Openness vote (`RemeshOptions::seal`, `--print-seal N`, default 3)
+### 2.1b Openness vote (`RemeshOptions::seal`, default 3)
 
 A point deep inside a torn shell sees surface in nearly every direction; a point in a
 real concavity sees a cone of open space. On a coarse copy of the wall (step `res/256`)
@@ -78,10 +78,35 @@ Volume against the threshold on the goblin: 0 → 0.0100 (hollow), 2 → 0.0694,
 3 → 0.0702, 5 → 0.0727. The plateau is the filled figure; the slow rise is concave
 detail being bridged.
 
-**Limit.** 26 rays cannot tell a deep vase from a torn figurine: below roughly one
-opening-radius of depth, a container's interior sees only the vertical ray and is
-filled. A shallow tray stays open (tested). Use `--print-seal 0` for hollow objects —
-then tears are not capped either, and the part is a thin shell wherever the flood got in.
+26 rays cannot tell a deep vase from a torn figurine: below roughly one opening-radius
+of depth, a container's interior sees only the vertical ray and is shut. Finer angular
+sampling would not help much — the floor of a deep cup and the inside of a figurine behind
+a wide tear subtend similar solid angles. §2.1c separates them by the width of the opening.
+
+### 2.1c Open ball (`RemeshOptions::open_ball_cells`, `--print-interior auto`)
+
+What tells a cup from a torn figurine is how wide the opening is. Free space that a ball
+of radius `R` can reach from outside without touching the wall is exterior: a mouth wider
+than `2R` lets the ball in, a tear narrower than that does not. On the vote's coarse grid,
+padded by `R` so a ball fits above a model that fills the grid: an exact distance
+transform of the wall, a flood from the padding through the voxels at least `R` from the
+wall (the ball's possible centres), a second distance transform from what the flood
+reached (the space the ball sweeps), and every shut voxel within `R` of it is released.
+Releasing is all it does: it never fills anything, so the gap between two legs and other
+concavities the vote already leaves open are untouched.
+
+`R = res / 12` (43 cells at res 512): an opening must be about a sixth of the grid wide to
+count. On the goblin's replay at res 512 a ball of radius 16 (32 cells across) already
+does not reach the interior, although its widest tears measure 40–50 cells: the band and
+the coarse wall (a coarse voxel is wall if any fine vertex in it is) narrow the effective
+opening. At 43 cells the result is identical to no ball (volume 0.07547, nothing
+released). Inner corners of a vessel keep a fillet of radius `R`
+the ball cannot reach. A vase whose neck is narrower than `2R` is still filled.
+
+`--print-interior` picks the behaviour: `auto` (default) = vote + open ball; `solid` =
+vote only, every deep concavity filled, vessels included; `hollow` = no vote, only what
+the band closes by itself is solid (tears are not capped either, and the part is a thin
+shell wherever the flood got in).
 
 ### 2.2 Manifold extraction
 
@@ -154,6 +179,35 @@ Needs one byte per grid vertex (1.1 GB at res 1024); skipped above that. At res 
 whole solid remesh — vote, flood, 4 thickening passes, base search, extraction and 96
 smoothing passes — takes 68 s on the goblin (5–10 s at res 512).
 
+### 2.3d Necks (twice `--print-wall`)
+
+The thin-wall rule leaves alone anything within reach of thick material, so a short pinch
+between two thick parts — a wrist, an ankle, a head on a thin neck — is never grown, and
+it is where a print breaks. With `R` = half the target diameter (the target is twice the
+wall: 1.6 mm at the default 0.8), on a grid of step `max(1, res/512)` restricted to the
+solid's bounding box:
+
+- `core`: solid farther than `R` from the exterior (exact distance transform);
+- `parts`: 26-connected components of the core, ignoring those smaller than a ball of
+  radius `R` (a part has to be at least twice the neck to count);
+- `joints`: geodesic fronts grown breadth-first from every part at once through the
+  shallow solid; where fronts from two parts meet is the joint between them, and its
+  face count is its cross-section. Under `π·R²` (a disc of the target diameter) it is a
+  neck; a plate as wide as the blocks it joins is not;
+- `fix`: a tube of radius `R` stamped along the shortest path from one part, through the
+  joint, to the other; the flood runs again. The path runs on the sub-grid, so at res 1024
+  the tube can sit one sub-grid cell (2 cells) off the joint's centre: the dumbbell at
+  res 1024 with a 120-cell target comes out 119 cells thick, centred to 2 cells.
+
+Tests: two blocks joined by a short bar 4 cells thick come out joined by one 12.2 × 12.2
+cells thick against a 12-cell target, where the thin-wall rule alone left it at 5.7 (the
+cap smoothing does not take it back); joined by a plate as wide as the blocks they are
+unchanged, as is a thick box. On the goblin at res 512
+with the default wall: the core is one part, no joints, nothing stamped — also printed at 40 mm, where the target is 20 cells. With a 30–40-cell target the core splits into two parts whose joint is wider than the disc, so nothing is stamped either. The pass costs about 5 s and 640 MB at res 512. Res 1024: one part, no joints; the whole replay (vote, open ball, walls, necks, base, extraction, decimation) took 264 s with a 4.8 GB peak.
+
+Memory: one int32 label, one int32 owner, one uint16 distance and (transiently) one
+float per sub-grid voxel of the bounding box.
+
 ### 2.4 Topology-preserving decimation
 
 `decimate_qem(..., keep_topology = true)` rejects every collapse that fails the link
@@ -212,13 +266,13 @@ res 512, defaults plus `--print-base auto`: 81 × 50 × 100 mm, 75 cm³, thinnes
 | `--print-size MM` | `print_size` | longest side of the 3MF, default 100 |
 | `--print-base F\|auto` | `print_base` | flat base, fraction of height, 0..0.5; `auto` = lowest stable cut, else a pedestal (implies watertight) |
 | `--print-report PATH` | `GET /jobs/{id}/report` | the printability report as JSON |
-| `--print-seal N` | `print_seal` | openness threshold for capping tears, 0..26, default 3 (0 = flood only) |
-| `--print-wall MM` | `print_wall` | minimum wall at `--print-size`, default 0.8; thinner features are grown locally (0 = off) |
+| `--print-interior M` | `print_interior` | `auto` (default): cap tears, keep wide openings open; `solid`: fill those too; `hollow`: cap nothing |
+| `--print-wall MM` | `print_wall` | minimum wall at `--print-size`, default 0.8; thinner features are grown locally, joints between thick parts narrower than twice it are thickened (0 = off) |
 
 Not combinable with
 `--decim GRID` (cluster decimation tears the surface) or `--retopo`.
 
-`trellis-print in.glb out.3mf [--res --faces --size --base --wall --band --glb]` runs
+`trellis-print in.glb out.3mf [--res --faces --size --base --wall --band --interior --glb]` runs
 the geometry path on any existing GLB / glTF / OBJ, CPU only, no models. It exits 2 if
 the result is not watertight.
 
@@ -240,15 +294,20 @@ the result is not watertight.
 - Floating parts: components under 2 % of the largest are dropped; anything larger that
   is not attached to the body is kept and reported as `shells > 1`.
 - Overhangs, supports and orientation are left to the slicer.
-- Not done: finer openness sampling, hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
+- Necks are found and fixed but not reported: the log says how many joints were
+  thickened; the report (§2.6) measures walls, not joints.
+- Showcase models through `trellis-print`, `--interior solid` against `auto`: six of seven (axe, chest, drone, golem, knight, racer) are identical. The cottage loses 35 % of its volume: its mesh has no floor, so the flood enters from below and the walls are hollow either way; `solid` then fills the attic as a plug floating half-way up, `auto` releases it and leaves a consistent open-bottom shell with fillets in the roof corners. No necks at 1.6 mm on any of them. A lathed vase (neck 28 % of its height) with five 0.06 tears in its wall: `solid` fills it, `auto` keeps it hollow with the tears capped (one shell, genus 0) — the ball sweeps up to a tear from both sides but cannot pass through it.
+- Not done: hollowing with drain holes, per-vertex colour 3MF for slicers that ignore textures.
 
 ## 6. Tests
 
 `trellis-test-mesh-print [mesh.glb]` — audit counts on fixtures (open box, inside-out,
 pinch); solid remesh of a closed box (plain remesh gives two shells, solid one, volume
 within 10 % of the grown box), of a box with internal geometry and with a pinhole, of an
-open cup; the openness vote (a box with a third of its lid torn out is hollow with the
-flood alone and solid with `seal = 3`; a shallow tray stays a tray); the flat base (exact plane, expected volume); `make_printable` decimated to
+open cup; the openness vote (a box with a 0.12 hole in its lid is hollow with the
+flood alone and solid with `seal = 3`; a shallow tray stays a tray); the open ball (a cup
+2.5 times as deep as it is wide, filled by the vote alone, stays hollow, also with a tear
+in its side; the torn box and the tray do not change); necks (§2.3d); the flat base (exact plane, expected volume); `make_printable` decimated to
 2 K faces; repair of a hole + fin + inverted winding; the 3MF package; thin-wall growth (sheet grown,
 thick box unchanged); the report and the stance (a top-heavy block falls over on a plain
 cut and stands on the automatic pedestal; a thin sheet is reported thin).

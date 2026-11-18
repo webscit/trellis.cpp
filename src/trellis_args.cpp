@@ -79,9 +79,10 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
         if (!number || n < 0 || n > 0.5f) { error = "print-base must be a fraction from 0 to 0.5, or auto"; return false; }
         p.print_base = n;
         if (n > 0) p.watertight = true;
-    } else if (name == "print-seal") {
-        if (!number || n < 0 || n > 26 || n != std::floor(n)) { error = "print-seal must be an integer from 0 to 26"; return false; }
-        p.print_seal = (int)n;
+    } else if (name == "print-interior") {
+        const std::string v = value;
+        if (v != "auto" && v != "solid" && v != "hollow") { error = "print-interior must be auto, solid or hollow"; return false; }
+        p.print_interior = v;
     } else {
         if (!number || n < 0) { error = "print-wall must be a nonnegative number of millimetres"; return false; }
         p.print_wall = n;
@@ -291,13 +292,13 @@ void print_usage(const char* argv0, bool server) {
         "                          degrees to spare, else a pedestal under it\n"
         "      --print-report PATH write the printability report (size, walls, base, overhangs,\n"
         "                          warnings) as JSON; it is always printed with --watertight\n"
-        "      --print-seal N      how hard to close tears in the generated surface: a point\n"
-        "                          that sees open space along fewer than N of 26 directions is\n"
-        "                          filled (default 3). 0 = off, for vases and other deep\n"
-        "                          hollow objects, which the default fills from the bottom up\n"
+        "      --print-interior M  auto (default): close the tears in the generated surface and\n"
+        "                          keep wide openings (cups, vases) open; solid: fill those too;\n"
+        "                          hollow: close nothing\n"
         "      --print-wall MM     minimum wall thickness at --print-size (default 0.8): fins,\n"
-        "                          edges and strands thinner than this are grown, and only\n"
-        "                          they are. 0 = off\n"
+        "                          edges and strands thinner than this are grown, and joints\n"
+        "                          between thick parts narrower than twice it are thickened.\n"
+        "                          0 = off\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
@@ -432,7 +433,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   else { fprintf(stderr, "[trellis] --normal-map must be on or off\n"); return false; } }
         else if (a == "--watertight")           { p.watertight = true; }
         else if (a == "--3mf")                  { const char* v = need(a.c_str()); if (!v) return false; p.out_3mf = v; p.watertight = true; }
-        else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-seal") {
+        else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-interior") {
             const char* v = need(a.c_str()); if (!v) return false;
             std::string error;
             if (!parse_print_arg(a.substr(2), v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }

@@ -18,6 +18,9 @@ export interface ExtraView {
 }
 
 /** Generation knobs mapped onto trellis-server's POST /generate form fields. */
+/** --print-interior: what is sealed inside the model. */
+export type PrintInterior = "auto" | "solid" | "hollow";
+
 export interface GenParams {
   resolution: Resolution;
   seed: number;
@@ -31,7 +34,9 @@ export interface GenParams {
   printSize?: number; // mm, longest side
   printBase?: string; // "auto" | "0" | fraction of the height
   printWall?: number; // mm, 0 = off
-  printSeal?: number; // 3 = seal tears, 0 = keep hollow
+  printInterior?: PrintInterior;
+  /** Older records: 0 = keep hollow, anything else = the then default. */
+  printSeal?: number;
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
   blendTemp: number;
   /** Multi-view front axis (server field front_axis; only sent with extra views). */
@@ -51,7 +56,7 @@ export const DEFAULT_PARAMS: GenParams = {
   printSize: 100,
   printBase: "auto",
   printWall: 0.8,
-  printSeal: 3,
+  printInterior: "auto",
   blendTemp: 2,
   frontAxis: "-y",
 };

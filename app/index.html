@@ -101,15 +101,16 @@
                 <option value="0">none</option>
               </select>
             </label>
-            <label class="ctl" title="Fins, edges and strands thinner than this are thickened; the rest of the model is not touched. 0 turns it off.">
+            <label class="ctl" title="Fins, edges and strands thinner than this are thickened, and so are joints between thick parts (a wrist, an ankle) narrower than twice it; the rest of the model is not touched. 0 turns it off.">
               <span>Minimum wall (mm)</span>
               <input id="ctl-print-wall" type="number" min="0" max="20" step="0.1" value="0.8" />
             </label>
-            <label class="ctl" title="Generated surfaces have tears. Sealing them makes the model solid, but also fills deep hollow shapes from the bottom up.">
+            <label class="ctl" title="Generated surfaces have tears. Auto seals them and keeps wide openings (the mouth of a cup or a vase) open. Solid fills those too. Hollow seals nothing.">
               <span>Interior</span>
-              <select id="ctl-print-seal">
-                <option value="3" selected>solid · seal tears</option>
-                <option value="0">keep hollow · vases, cups</option>
+              <select id="ctl-print-interior">
+                <option value="auto" selected>auto · seal tears, keep cups open</option>
+                <option value="solid">solid · fill everything</option>
+                <option value="hollow">hollow · seal nothing</option>
               </select>
             </label>
           </div>

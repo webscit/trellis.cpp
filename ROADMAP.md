@@ -94,11 +94,13 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
       in the decoded surface), marching cubes by cycles (closed 2-manifold by construction),
       link-condition QEM, audit of the mesh and of the GLB buffer (spec 32)
 - ☑ `--3mf`: textured 3MF in mm, z-up, on the plate; `--print-size`, `--print-base` (exact
-      planar base), `--print-wall`, `--print-seal`; server fields + `/jobs/{id}/3mf`;
+      planar base), `--print-wall`, `--print-interior`; server fields + `/jobs/{id}/3mf`;
       `trellis-print` for existing meshes; Studio "3D print" toggle
 - ☑ Thin walls grown locally to `--print-wall`; `--print-base auto` (stability search, pedestal
       fallback); printability report (log, `--print-report`, `/jobs/{id}/report`)
-- ☐ Finer openness sampling (26 rays cannot tell a deep vase from a torn figurine)
+- ☑ Vessels stay open: an open ball tells a cup's mouth from a tear (`--print-interior auto`,
+      default; `solid` / `hollow` force either way)
+- ☑ Necks: joints between thick parts narrower than twice `--print-wall` are thickened
 - ☑ Cap smoothing: membrane relaxation of the vertices the field does not determine
 - ☐ GPU link-condition QEM (the watertight decimation runs on the CPU)
 - ☑ Studio export split button (GLB / 3MF); print options (size, flat base, minimum wall,

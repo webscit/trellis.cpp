@@ -5,7 +5,7 @@ import { renderSettings } from "./settings";
 import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphemeral, newId, put } from "./store";
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
-import { DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintReport } from "./types";
+import { DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -75,7 +75,7 @@ function readParams(): GenParams {
     printSize: readNumber("ctl-print-size", DEFAULT_PARAMS.printSize!, 5, 2000),
     printBase: ($("ctl-print-base") as HTMLSelectElement).value,
     printWall: readNumber("ctl-print-wall", DEFAULT_PARAMS.printWall!, 0, 20),
-    printSeal: parseInt(($("ctl-print-seal") as HTMLSelectElement).value, 10) === 0 ? 0 : 3,
+    printInterior: ($("ctl-print-interior") as HTMLSelectElement).value as PrintInterior,
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
     mainAz,
@@ -106,7 +106,7 @@ function applyParams(p: GenParams): void {
   ($("ctl-print-size") as HTMLInputElement).value = String(p.printSize ?? DEFAULT_PARAMS.printSize);
   ($("ctl-print-base") as HTMLSelectElement).value = p.printBase ?? DEFAULT_PARAMS.printBase!;
   ($("ctl-print-wall") as HTMLInputElement).value = String(p.printWall ?? DEFAULT_PARAMS.printWall);
-  ($("ctl-print-seal") as HTMLSelectElement).value = String(p.printSeal ?? DEFAULT_PARAMS.printSeal);
+  ($("ctl-print-interior") as HTMLSelectElement).value = p.printInterior ?? (p.printSeal === 0 ? "hollow" : DEFAULT_PARAMS.printInterior!);
   syncPrintOptions();
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);

@@ -1194,11 +1194,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::RemeshOptions remesh_options;
         if (cfg.watertight) {
             remesh_options.solid = true;
-            remesh_options.seal = cfg.print_seal;
-            remesh_options.min_wall_cells = trellis::wall_cells_for(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts));
+            trellis::PrintInterior interior = trellis::PrintInterior::Auto;
+            trellis::parse_print_interior(cfg.print_interior.c_str(), interior);
+            trellis::set_print_interior(remesh_options, interior, so.res);
+            trellis::set_print_walls(remesh_options, trellis::wall_cells_for(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts)));
             trellis::set_print_base(remesh_options, mesh.verts.data(), mesh.V(), print_up_axis, cfg.print_base);
-            printf("  watertight: solid remesh, band %d, minimum wall %.2f mm (%.1f cells) on a %.0f mm print\n", remesh_band,
-                   cfg.print_wall, remesh_options.min_wall_cells, cfg.print_size);
+            printf("  watertight: solid remesh, band %d, minimum wall %.2f mm (%.1f cells), neck %.2f mm, interior %s, on a %.0f mm print\n",
+                   remesh_band, cfg.print_wall, remesh_options.min_wall_cells, 2.0f * cfg.print_wall, cfg.print_interior.c_str(),
+                   cfg.print_size);
         }
         remesh_options.band = remesh_band;
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
@@ -1359,7 +1362,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         po.wall_cells = trellis::wall_cells_for(cfg.print_wall, cfg.print_size, so.res, print_extent(mesh.verts));
         po.faces = cfg.decim == 0 ? 0 : trellis::qem_face_target(cfg);
         po.base = cfg.print_base;
-        po.seal = cfg.print_seal;
+        trellis::parse_print_interior(cfg.print_interior.c_str(), po.interior);
         po.up_axis = print_up_axis;
         trellis::Mesh printable = trellis::make_printable(mesh, po);
         if (printable.F() > 0) {

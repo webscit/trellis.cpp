@@ -1,7 +1,7 @@
 // trellis-print — make an existing mesh 3D-printable. CPU only, no models needed.
 //
 //   trellis-print <in.glb|in.gltf|in.obj> <out.3mf> [--res N] [--faces N] [--size MM]
-//                 [--base FRACTION] [--wall MM] [--band N] [--seal N] [--glb out.glb]
+//                 [--base FRACTION] [--wall MM] [--band N] [--interior M] [--glb out.glb]
 //
 // Loads the mesh, rebuilds it as one closed solid (exterior flood fill + marching tetrahedra,
 // docs/spec/32-print-ready.md), decimates without changing the topology, and writes a 3MF in
@@ -31,10 +31,11 @@ static void usage() {
         "                      0..0.5 (default 0 = off); auto = the lowest cut the model stands\n"
         "                      on, else a pedestal under it\n"
         "      --wall MM       minimum wall thickness at --size (default 0.8): thinner fins and\n"
-        "                      edges are grown, and only they are. 0 = off\n"
+        "                      edges are grown, and joints between thick parts narrower than\n"
+        "                      twice it are thickened. 0 = off\n"
         "      --band N        remesh band width in cells (default 1)\n"
-        "      --seal N        close tears: fill points that see open space along fewer than N\n"
-        "                      of 26 directions (default 3; 0 = off, for deep hollow objects)\n"
+        "      --interior M    auto (default): close tears, keep wide openings (cups, vases)\n"
+        "                      open; solid: fill those too; hollow: close nothing\n"
         "      --glb PATH      also write the solid as an untextured GLB\n");
 }
 
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
         else if (a == "--base")  { if (!number(0, 0.5f, options.base)) return 1; }
         else if (a == "--wall")  { if (!number(0, 1e6f, wall_mm)) return 1; }
         else if (a == "--band")  { if (!number(1, 8, n)) return 1; band = (int)n; }
-        else if (a == "--seal")  { if (!number(0, 26, n)) return 1; options.seal = (int)n; }
+        else if (a == "--interior" && v && parse_print_interior(v, options.interior)) { ++i; }
         else if (a == "--glb" && v) { glb = v; ++i; }
         else { fprintf(stderr, "[trellis-print] unknown or incomplete option: %s\n", a.c_str()); usage(); return 1; }
     }
@@ -86,8 +87,8 @@ int main(int argc, char** argv) {
     // normalize_mesh_trellis scales the longest side to ~1, so the model extent is 1.
     options.band = band > 0 ? band : 1;
     options.wall_cells = wall_cells_for(wall_mm, size_mm, options.res, 1.0f);
-    printf("solid remesh @res %d, band %d, minimum wall %.2f mm (%.1f cells) at %.0f mm\n", options.res, options.band,
-           wall_mm, options.wall_cells, size_mm);
+    printf("solid remesh @res %d, band %d, minimum wall %.2f mm (%.1f cells), neck %.2f mm, interior %s, at %.0f mm\n",
+           options.res, options.band, wall_mm, options.wall_cells, 2.0f * wall_mm, print_interior_name(options.interior), size_mm);
     fflush(stdout);
 
     Mesh solid = make_printable(mesh, options);

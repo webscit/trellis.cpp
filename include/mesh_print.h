@@ -10,6 +10,8 @@
 
 namespace trellis {
 
+struct RemeshOptions;
+
 class TriBvh;
 
 // What a slicer needs to be true of a mesh. Edges are counted over the index buffer, so
@@ -52,6 +54,23 @@ int64_t repair_for_print(std::vector<float>& verts, std::vector<int32_t>& faces)
 // (RemeshOptions::min_wall_cells). model_extent is the model's longest side in mesh units.
 float wall_cells_for(float wall_mm, float size_mm, int res, float model_extent);
 
+// RemeshOptions::open_ball_cells for a grid of `res`: the radius of the ball that tells a
+// real opening (the mouth of a cup) from a tear in the decoded surface, which is narrower.
+float open_ball_cells_for(int res);
+
+// What happens inside the model (--print-interior):
+//   Auto   tears are capped, wide openings (cups, vases) stay open -- the default;
+//   Solid  tears are capped and every deep concavity is filled, vessels included;
+//   Hollow nothing is capped: only what the band closes by itself is solid.
+enum class PrintInterior { Auto, Solid, Hollow };
+bool parse_print_interior(const char* text, PrintInterior& out);
+const char* print_interior_name(PrintInterior interior);
+void set_print_interior(RemeshOptions& remesh, PrintInterior interior, int res);
+
+// Minimum wall and minimum neck from the wall in cells: features thinner than the wall are
+// grown, and joints between thick parts narrower than twice the wall are thickened.
+void set_print_walls(RemeshOptions& remesh, float wall_cells);
+
 // Complete geometry-only path for an arbitrary triangle mesh in the TRELLIS frame
 // ([-0.5, 0.5]^3, as normalize_mesh_trellis leaves it): weld, solid remesh at `res`,
 // topology-preserving QEM to `faces`, repair. Used by trellis-print and the tests; trellis-cli
@@ -64,7 +83,7 @@ struct PrintOptions {
                                 //   < 0 = automatic: the lowest stable cut, else a pedestal
     float wall_cells = 0.0f;    // RemeshOptions::min_wall_cells (see wall_cells_for); 0 = off
     int   up_axis = 2;          // axis the base is perpendicular to (TRELLIS: z)
-    int   seal = 3;             // RemeshOptions::seal: cap tears in the surface; 0 = flood only
+    PrintInterior interior = PrintInterior::Auto;   // see set_print_interior
 };
 Mesh make_printable(const Mesh& in, const PrintOptions& options);
 

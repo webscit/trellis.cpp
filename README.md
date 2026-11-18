@@ -89,7 +89,7 @@ click → rotate the result.
    `<model-viewer>`); **Reset view** re-frames the camera and **Export to GLB** saves
    the model; the arrow beside it picks the format (GLB, or 3MF when "3D print" was on).
    With **3D print** set to *watertight solid*, the print size, flat base, minimum wall
-   and interior (solid / keep hollow) appear under it, and a print report (size, walls,
+   and interior (auto / solid / hollow) appear under it, and a print report (size, walls,
    stability, overhangs, warnings) shows under the preview.
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
@@ -260,13 +260,13 @@ trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base
 | `--3mf PATH` | 3MF: mm, z-up, lowest point on the plate, base-colour texture embedded |
 | `--print-size MM` | longest side of the 3MF (default 100) |
 | `--print-base F\|auto` | slice the lowest fraction `F` of the height off for a flat base (e.g. `0.02`); `auto` picks the lowest cut the model stands on with 15° to spare, or adds a pedestal |
-| `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and only they are |
+| `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and joints between thick parts (a wrist, an ankle) narrower than twice it are thickened; the rest is not touched |
 | `--print-report PATH` | write the printability report (size, walls, base and stability, overhangs, warnings) as JSON; it is always logged |
-| `--print-seal N` | how hard to cap tears in the generated surface (default 3). `0` for vases and other deep hollow objects, which the default fills from the bottom up |
+| `--print-interior M` | `auto` (default): cap the tears in the generated surface and keep wide openings (cups, vases) open; `solid`: fill those too; `hollow`: cap nothing |
 
 `trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
 only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
-`print_base`, `print_wall` and `print_seal`, and serves the report at `GET /jobs/{id}/report`. Method, measurements and limits:
+`print_base`, `print_wall` and `print_interior`, and serves the report at `GET /jobs/{id}/report`. Method, measurements and limits:
 [docs/spec/32-print-ready.md](docs/spec/32-print-ready.md).
 
 ### Mesh refinement

@@ -47,6 +47,11 @@ struct RemeshOptions {
     // lattice rays leaving the grid unobstructed counts as interior even if the flood could
     // reach it (see remesh_dc.cpp). 0 = flood only; higher fills deeper concavities.
     int   seal = 0;
+    // Solid with seal: openings a ball of this radius (grid cells) can pass through from
+    // outside are real (the mouth of a cup or a vase), and the free space that ball reaches
+    // stays exterior even where the vote would shut it. Tears are narrower and stay capped.
+    // 0 = off: every point the vote shuts is filled. See open_ball_cells_for (mesh_print.h).
+    float open_ball_cells = 0.0f;
     // Solid only: relax the vertices whose position the field does not determine (the caps
     // over sealed tears and filled pockets) as a membrane pinned to the measured surface.
     bool  smooth_caps = true;
@@ -64,6 +69,10 @@ struct RemeshOptions {
     // Solid only: minimum wall thickness in grid cells. Features thinner than this (and
     // only those) are grown; 0 = off. The band already guarantees 2*band cells.
     float min_wall_cells = 0.0f;
+    // Solid only: minimum neck diameter in grid cells. Where two thick parts of the model
+    // are joined only through a cross-section smaller than a disc of this diameter (a
+    // wrist, an ankle, a head on a thin neck), the joint is thickened to it; 0 = off.
+    float min_neck_cells = 0.0f;
 };
 Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
                            const TriBvh& bvh, int res, const RemeshOptions& options);

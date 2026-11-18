@@ -17,7 +17,7 @@
 //                      3D printing (docs/spec/32-print-ready.md): "watertight" (on|off;
 //                      on = the GLB is one closed manifold solid, like --watertight),
 //                      "print_base" (0..0.5 or auto, flat base), "print_wall" (mm), "print_size"
-//                      (mm), "print_seal" (0..26), and "3mf" (on|off; on also builds a textured 3MF, served by
+//                      (mm), "print_interior" (auto|solid|hollow), and "3mf" (on|off; on also builds a textured 3MF, served by
 //                      GET /jobs/{id}/3mf -- /jobs only).
 //                      Returns model/gltf-binary.
 //
@@ -170,7 +170,7 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     }
     for (const auto& field : {std::pair<const char*, const char*>{"print_size", "print-size"},
                               {"print_base", "print-base"}, {"print_wall", "print-wall"},
-                              {"print_seal", "print-seal"}}) {
+                              {"print_interior", "print-interior"}}) {
         if (!req.has_file(field.first)) continue;
         std::string error;
         if (!trellis::parse_print_arg(field.second, req.get_file_value(field.first).content.c_str(), p, error)) {

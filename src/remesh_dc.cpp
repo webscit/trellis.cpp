@@ -45,6 +45,49 @@ void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn) {
     for (auto& t : ts) t.join();
 }
 
+// Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher), in place on a
+// dx*dy*dz box (z fastest): on entry 0 at the sources and kEdtFar elsewhere, on return the
+// squared distance in voxels to the nearest source.
+constexpr float kEdtFar = 1e18f;
+
+void edt_sq(std::vector<float>& g, int64_t dx, int64_t dy, int64_t dz) {
+    const int64_t dims[3] = {dx, dy, dz};
+    const int64_t stride[3] = {dy * dz, dz, 1};
+    for (int axis = 2; axis >= 0; --axis) {
+        const int64_t len = dims[axis], st = stride[axis];
+        const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+        const int64_t lines = dims[a] * dims[b];
+        parallel_for(lines, [&](int64_t lb, int64_t le) {
+            std::vector<float> f((size_t)len), d((size_t)len), z((size_t)len + 1);
+            std::vector<int64_t> v((size_t)len);
+            for (int64_t line = lb; line < le; ++line) {
+                const int64_t base = (line / dims[b]) * stride[a] + (line % dims[b]) * stride[b];
+                bool any = false;
+                for (int64_t q = 0; q < len; ++q) { f[(size_t)q] = g[(size_t)(base + q * st)]; any |= f[(size_t)q] < kEdtFar; }
+                if (!any) continue;
+                int64_t k = 0;
+                v[0] = 0; z[0] = -kEdtFar; z[1] = kEdtFar;
+                auto meet = [&](int64_t q, int64_t p) {   // where parabolas q and p cross
+                    return ((f[(size_t)q] + (float)(q * q)) - (f[(size_t)p] + (float)(p * p))) / (float)(2 * (q - p));
+                };
+                for (int64_t q = 1; q < len; ++q) {
+                    float s = meet(q, v[(size_t)k]);
+                    while (s <= z[(size_t)k]) { --k; s = meet(q, v[(size_t)k]); }   // z[0] = -far stops it
+                    ++k;
+                    v[(size_t)k] = q; z[(size_t)k] = s; z[(size_t)k + 1] = kEdtFar;
+                }
+                k = 0;
+                for (int64_t q = 0; q < len; ++q) {
+                    while (z[(size_t)k + 1] < (float)q) ++k;
+                    const int64_t p = v[(size_t)k];
+                    d[(size_t)q] = std::min(kEdtFar, (float)((q - p) * (q - p)) + f[(size_t)p]);
+                }
+                for (int64_t q = 0; q < len; ++q) g[(size_t)(base + q * st)] = d[(size_t)q];
+            }
+        });
+    }
+}
+
 }  // namespace
 
 Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* ifaces, int64_t iF,
@@ -262,7 +305,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         // rays are shut to the flood. Under a tear only the ray through it is open, so the
         // tear is capped; a real opening (a cup, the gap between two legs) shows a cone of
         // sky and stays open.
-        int64_t shut_coarse = 0;
+        int64_t shut_coarse = 0, released_coarse = 0;
         if (options.seal > 0) {
             const int step = std::max(1, res / 256);
             const int m = (int)((n + step - 1) / step);
@@ -314,11 +357,67 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 for (const auto& count : counts)
                     for (size_t v = 0; v < m3; ++v) open[v] += count[v];
             }
-            // wall := wall | shut
+            std::vector<uint8_t> occupied;   // the coarse wall, before it becomes the shut mask
+            if (options.open_ball_cells > 0) occupied = coarse;
             for (size_t v = 0; v < m3; ++v) {
                 coarse[v] = open[v] < options.seal;
                 shut_coarse += coarse[v];
             }
+            std::vector<uint8_t>().swap(open);
+
+            // Vessels. The floor of a deep cup sees the sky through one narrow cone, like the
+            // inside of a figurine behind a tear, and the vote shuts both. What tells them
+            // apart is the width of the opening: free space that a ball of radius R can reach
+            // from outside without touching the wall is exterior, so a mouth wider than 2R
+            // lets the ball in and a tear narrower than that does not. On the coarse grid,
+            // padded so a ball fits above a model that fills the grid: ball centres are the
+            // free voxels at least R from the wall, flooded from the padding; the space they
+            // sweep (centres dilated by R) is released from the shut mask. Inner corners keep
+            // a fillet of radius R that the ball cannot reach.
+            if (options.open_ball_cells > 0) {
+                const float R = options.open_ball_cells / (float)step;   // coarse cells
+                const int64_t P = (int64_t)std::ceil(R) + 1, M = m + 2 * P;
+                const size_t M3 = (size_t)(M * M * M);
+                auto at = [M](int64_t x, int64_t y, int64_t z) { return (size_t)((x * M + y) * M + z); };
+                std::vector<float> d(M3, kEdtFar);
+                for (int64_t x = 0; x < m; ++x)
+                    for (int64_t y = 0; y < m; ++y)
+                        for (int64_t z = 0; z < m; ++z)
+                            if (occupied[((size_t)x * m + (size_t)y) * m + (size_t)z]) d[at(x + P, y + P, z + P)] = 0.0f;
+                edt_sq(d, M, M, M);
+                // Flood the centres from the padding's corner (free, and R+1 from everything).
+                const float R2 = R * R;
+                std::vector<uint8_t> reached(M3, 0);
+                std::vector<int64_t> stack{0};
+                reached[0] = 1;
+                while (!stack.empty()) {
+                    const int64_t s = stack.back();
+                    stack.pop_back();
+                    const int64_t x = s / (M * M), y = (s / M) % M, z = s % M;
+                    const int64_t nb[6][3] = {{x-1,y,z},{x+1,y,z},{x,y-1,z},{x,y+1,z},{x,y,z-1},{x,y,z+1}};
+                    for (const auto& q : nb) {
+                        if (q[0] < 0 || q[0] >= M || q[1] < 0 || q[1] >= M || q[2] < 0 || q[2] >= M) continue;
+                        const size_t t = at(q[0], q[1], q[2]);
+                        if (reached[t] || d[t] < R2) continue;
+                        reached[t] = 1;
+                        stack.push_back((int64_t)t);
+                    }
+                }
+                for (size_t v = 0; v < M3; ++v) d[v] = reached[v] ? 0.0f : kEdtFar;
+                std::vector<uint8_t>().swap(reached);
+                edt_sq(d, M, M, M);
+                int64_t released = 0;
+                for (int64_t x = 0; x < m; ++x)
+                    for (int64_t y = 0; y < m; ++y)
+                        for (int64_t z = 0; z < m; ++z) {
+                            const size_t v = ((size_t)x * m + (size_t)y) * m + (size_t)z;
+                            if (coarse[v] && !occupied[v] && d[at(x + P, y + P, z + P)] <= R2) { coarse[v] = 0; ++released; }
+                        }
+                shut_coarse -= released;
+                released_coarse = released;
+            }
+
+            // wall := wall | shut
             for (int64_t x = 0; x < n; ++x)
                 for (int64_t y = 0; y < n; ++y) {
                     const uint8_t* row = &coarse[((size_t)(x / step) * m + (size_t)(y / step)) * m];
@@ -478,6 +577,171 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 }
                 if (thickened) fill_unreachable();
             }
+        }
+
+        // Necks. The thin-wall rule leaves alone anything near thick material, so a short
+        // pinch between two thick parts (a wrist, an ankle, a head on a thin neck) is never
+        // grown, and it is where a print breaks. With R = half the target diameter:
+        //   core    = solid deeper than R (exact distance to the exterior);
+        //   parts   = connected components of the core, ignoring those smaller than a ball
+        //             of radius 2R minus the erosion (a part at least twice the neck);
+        //   joints  = where the geodesic fronts grown from different parts through the
+        //             shallow solid meet; a joint whose cross-section is under a disc of
+        //             radius R is a neck (a wide plate between two blocks is not);
+        //   fix     = a tube of radius R along the shortest path from one part, through the
+        //             joint, to the other.
+        // On a grid of step max(1, res/512), restricted to the solid's bounding box.
+        int necks_found = 0, necks_fixed = 0;
+        if (options.min_neck_cells > 0) {
+            const int s = std::max(1, res / 512);
+            const float R = 0.5f * options.min_neck_cells / (float)s;   // sub-grid cells
+            int64_t lo[3] = {n, n, n}, hi[3] = {-1, -1, -1};
+            for (size_t w = 0; w < wall.size(); ++w) {
+                uint64_t bits = wall[w];
+                while (bits) {
+                    const int64_t b = (int64_t)(w << 6) | ctz64(bits);
+                    bits &= bits - 1;
+                    const int64_t c[3] = {b / (n * n), (b / n) % n, b % n};
+                    for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], c[k]); hi[k] = std::max(hi[k], c[k]); }
+                }
+            }
+            int64_t o[3], dim[3];
+            for (int k = 0; k < 3; ++k) {   // sub-grid box with one exterior voxel all round
+                o[k] = std::max<int64_t>(0, lo[k] / s - 1);
+                dim[k] = std::min<int64_t>((n - 1) / s, hi[k] / s + 1) - o[k] + 1;
+            }
+            const size_t N3 = (size_t)(dim[0] * dim[1] * dim[2]);
+            auto sid = [&](int64_t x, int64_t y, int64_t z) { return (size_t)((x * dim[1] + y) * dim[2] + z); };
+            auto fine_solid = [&](int64_t x, int64_t y, int64_t z) {
+                return is_solid((int)((x + o[0]) * s), (int)((y + o[1]) * s), (int)((z + o[2]) * s));
+            };
+            std::vector<int32_t> label(N3);   // -1 exterior, 0 shallow, k > 0 part k
+            {
+                std::vector<float> d(N3);
+                parallel_for(dim[0], [&](int64_t xb, int64_t xe) {
+                    for (int64_t x = xb; x < xe; ++x)
+                        for (int64_t y = 0; y < dim[1]; ++y)
+                            for (int64_t z = 0; z < dim[2]; ++z)
+                                d[sid(x, y, z)] = fine_solid(x, y, z) ? kEdtFar : 0.0f;
+                });
+                edt_sq(d, dim[0], dim[1], dim[2]);
+                const float R2 = R * R;
+                for (size_t v = 0; v < N3; ++v) label[v] = d[v] == 0.0f ? -1 : d[v] > R2 ? -2 : 0;   // -2: core, unlabelled
+            }
+            // Parts: 26-connected core components.
+            const double min_part = 4.0 / 3.0 * 3.14159265 * std::pow(std::max(1.0f, R), 3.0);   // ball of radius 2R, eroded by R
+            std::vector<int64_t> part_size{0};
+            std::vector<int64_t> stack;
+            auto for_nb26 = [&](int64_t v, const std::function<void(int64_t)>& f) {
+                const int64_t x = v / (dim[1] * dim[2]), y = (v / dim[2]) % dim[1], z = v % dim[2];
+                for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
+                    if (!dx && !dy && !dz) continue;
+                    const int64_t X = x + dx, Y = y + dy, Z = z + dz;
+                    if (X < 0 || X >= dim[0] || Y < 0 || Y >= dim[1] || Z < 0 || Z >= dim[2]) continue;
+                    f((int64_t)sid(X, Y, Z));
+                }
+            };
+            for (size_t v0 = 0; v0 < N3; ++v0) {
+                if (label[v0] != -2) continue;
+                const int32_t k = (int32_t)part_size.size();
+                int64_t count = 0;
+                label[v0] = k;
+                stack.assign(1, (int64_t)v0);
+                while (!stack.empty()) {
+                    const int64_t v = stack.back();
+                    stack.pop_back();
+                    ++count;
+                    for_nb26(v, [&](int64_t q) { if (label[(size_t)q] == -2) { label[(size_t)q] = k; stack.push_back(q); } });
+                }
+                part_size.push_back(count);
+            }
+            // Small parts count as shallow solid. Fronts: breadth-first from every part at
+            // once through the shallow solid (6-connected); owner and distance per voxel.
+            std::vector<int32_t> owner(N3, 0);
+            std::vector<uint16_t> dist(N3, 0);
+            std::vector<int64_t> front, next;
+            int parts = 0;
+            for (size_t k = 1; k < part_size.size(); ++k) parts += (double)part_size[k] >= min_part;
+            for (size_t v = 0; v < N3; ++v) {
+                if (label[v] <= 0) continue;
+                if ((double)part_size[(size_t)label[v]] < min_part) { label[v] = 0; continue; }
+                owner[v] = label[v];
+            }
+            for (size_t v = 0; v < N3; ++v) {   // the parts' surfaces start the fronts
+                if (owner[v] <= 0) continue;
+                bool edge = false;
+                for_nb26((int64_t)v, [&](int64_t q) { edge |= label[(size_t)q] == 0; });
+                if (edge) front.push_back((int64_t)v);
+            }
+            const int64_t step6[6] = {dim[1] * dim[2], -dim[1] * dim[2], dim[2], -dim[2], 1, -1};
+            for (uint16_t dd = 1; !front.empty() && dd < 65535; ++dd) {
+                next.clear();
+                for (const int64_t v : front)
+                    for (const int64_t st : step6) {
+                        const int64_t q = v + st;
+                        if (q < 0 || q >= (int64_t)N3 || label[(size_t)q] != 0 || owner[(size_t)q]) continue;
+                        owner[(size_t)q] = owner[(size_t)v];
+                        dist[(size_t)q] = dd;
+                        next.push_back(q);
+                    }
+                front.swap(next);
+            }
+            // Joints: 6-adjacent shallow voxels owned by different parts. Per pair, the
+            // number of such faces (the joint's cross-section) and the shortest crossing.
+            struct Joint { int64_t faces = 0; int64_t a = -1, b = -1; int best = 1 << 30; };
+            std::unordered_map<uint64_t, Joint> joints;
+            for (size_t v = 0; v < N3; ++v) {
+                if (label[v] != 0 || owner[v] <= 0) continue;
+                for (int k = 0; k < 6; k += 2) {   // + directions only: each face once
+                    const int64_t q = (int64_t)v + step6[k];
+                    if (q >= (int64_t)N3 || label[(size_t)q] != 0 || owner[(size_t)q] <= 0 || owner[(size_t)q] == owner[v]) continue;
+                    int64_t a = (int64_t)v, b = q;
+                    if (owner[(size_t)a] > owner[(size_t)b]) std::swap(a, b);
+                    Joint& j = joints[((uint64_t)(uint32_t)owner[(size_t)a] << 32) | (uint32_t)owner[(size_t)b]];
+                    ++j.faces;
+                    const int len = (int)dist[(size_t)a] + (int)dist[(size_t)b];
+                    if (len < j.best) { j.best = len; j.a = a; j.b = b; }
+                }
+            }
+            const double max_faces = 3.14159265 * R * R;
+            const float Rf = 0.5f * options.min_neck_cells;   // tube radius, fine cells
+            const int ri = (int)std::ceil(Rf);
+            int64_t stamped = 0;
+            auto stamp = [&](int64_t v) {   // a ball of radius Rf at sub-grid voxel v
+                const int64_t cx = (v / (dim[1] * dim[2]) + o[0]) * s, cy = ((v / dim[2]) % dim[1] + o[1]) * s, cz = (v % dim[2] + o[2]) * s;
+                for (int dx = -ri; dx <= ri; ++dx) for (int dy = -ri; dy <= ri; ++dy) for (int dz = -ri; dz <= ri; ++dz) {
+                    if ((float)(dx * dx + dy * dy + dz * dz) > Rf * Rf) continue;
+                    const int64_t x = cx + dx, y = cy + dy, z = cz + dz;
+                    if (x < 1 || x > n - 2 || y < 1 || y > n - 2 || z < 1 || z > n - 2) continue;   // keep the boundary free
+                    const int64_t b = vbit((int)x, (int)y, (int)z);
+                    if (!((wall[(size_t)(b >> 6)] >> (b & 63)) & 1)) { wall[(size_t)(b >> 6)] |= 1ull << (b & 63); ++stamped; }
+                }
+            };
+            auto walk_home = [&](int64_t v) {   // down the distance field to the owning part
+                for (;;) {
+                    stamp(v);
+                    if (label[(size_t)v] > 0) return;
+                    int64_t best = -1;
+                    for (const int64_t st : step6) {
+                        const int64_t q = v + st;
+                        if (q < 0 || q >= (int64_t)N3 || owner[(size_t)q] != owner[(size_t)v]) continue;
+                        if (label[(size_t)q] > 0) { best = q; break; }
+                        if (label[(size_t)q] == 0 && dist[(size_t)q] + 1 == dist[(size_t)v]) best = q;
+                    }
+                    if (best < 0) return;
+                    v = best;
+                }
+            };
+            for (const auto& kv : joints) {
+                ++necks_found;
+                if ((double)kv.second.faces >= max_faces) continue;   // a plate, not a neck
+                walk_home(kv.second.a);
+                walk_home(kv.second.b);
+                ++necks_fixed;
+            }
+            if (stamped) fill_unreachable();
+            printf("  remesh_solid: necks under %.1f cells: %d parts, %d joints, %d thickened (%lld vertices)\n",
+                   options.min_neck_cells, parts, necks_found, necks_fixed, (long long)stamped);
         }
 
         // Flat base: the solid was classified on the whole object first (cutting before
@@ -657,6 +921,8 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         printf("  remesh_solid: %lld vertices filled, %lld cells outside the band (caps%s)",
                (long long)filled, (long long)extra_cells, base_axis >= 0 ? ", base" : "");
         if (options.seal > 0) printf("; openness < %d of 26 shut (%lld coarse vertices)", options.seal, (long long)shut_coarse);
+        if (options.seal > 0 && options.open_ball_cells > 0)
+            printf("; %lld released by a %.1f-cell open ball", (long long)released_coarse, options.open_ball_cells);
         if (thickened) printf("; thin walls grown by %lld vertices in %d passes", (long long)thickened, thicken_passes);
         if (base_axis >= 0)
             printf("; flat base on axis %d at %.4f (%lld vertices cut)", base_axis,

@@ -102,9 +102,9 @@ struct TrellisParams {
                                 //   the lowest cut the model stands on, else a pedestal.
                                 //   Implies watertight.
     std::string print_report;   // --print-report PATH: write the printability report as JSON
-    int   print_seal = 3;       // --print-seal N: cap tears in the decoded surface -- a point with
-                                //   fewer than N of 26 unobstructed lattice rays is interior
-                                //   (0 = off, for hollow objects such as vases; default 3)
+    std::string print_interior = "auto";   // --print-interior auto|solid|hollow: auto caps tears
+                                //   in the decoded surface and keeps wide openings (cups, vases)
+                                //   open; solid fills those too; hollow caps nothing
     float print_wall = 0.8f;    // --print-wall MM: minimum wall at print_size; features thinner
                                 //   than this are grown locally (0 = off)
     bool f32      = false;      // f32 sparse-conv compute
@@ -206,7 +206,7 @@ bool parse_faces_arg(const char* value, TrellisParams& p, std::string& error);
 bool check_faces_compat(const TrellisParams& p, std::string& error);
 
 // ---- 3D printing (--watertight & co / server fields) ----
-// name is print-size | print-base | print-wall | print-seal. Shared by the CLI and trellis-server.
+// name is print-size | print-base | print-wall | print-interior. Shared by the CLI and trellis-server.
 bool parse_print_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error);
 // Watertight output needs the QEM path (or --decim 0): cluster decimation tears the surface.
 bool check_print_compat(const TrellisParams& p, std::string& error);
