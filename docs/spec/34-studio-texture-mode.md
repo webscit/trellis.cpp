@@ -1,0 +1,155 @@
+# 34 — Studio: paint a mesh
+
+Status: planned.
+
+Brings texture-only mode (spec 33, `POST /jobs` with `task=texture`) to Trellis Studio. The
+user drops an STL / OBJ / GLB and a photo, turns the mesh until the photo's side faces the
+front, and gets the mesh back painted, as a GLB and optionally as a coloured 3MF of its own
+triangles. Refine mode (`task=refine`) stays out of Studio for now.
+
+Decisions (from the brainstorm):
+
+- **A.** A mode switch at the top of the left panel; dropping a mesh file switches to it.
+- **B.** The bare mesh is previewed before generating, with snapped orientation controls
+  (up axis + quarter turns) and a server-side `mesh_yaw`.
+- **D.** The print options become "3MF of this mesh": size from the file, colours, colour
+  detail (`print_color_res`). Colour detail is also added to the normal print options.
+- **E.** Resolution 512 (default) or 1024; a too-dense error offers "Retry at 512".
+
+## Why orientation matters
+
+With one image the pipeline conditions on the photo globally: the azimuth is ignored
+(`V > 1` gates every per-view stage in `trellis_run`), and the texture flow paints the mesh as
+if the photo shows its canonical front. Which side of the input is the front therefore comes
+only from the file's axes. A CAD part exported lying down, or facing +x, gets the photo's
+front on the wrong face. Extra views have azimuths relative to that same front.
+
+The canonical front is grid −y (`front_axis` default `-y`, z up). A z-up STL maps to the grid
+with the identity (spec 33), so the front is the STL's −y side. In glTF (y up) that is +z,
+which is where `<model-viewer>`'s default camera sits: **the preview's default view is the
+side the photo is painted on.** Phase 1 checks this end to end before the UI relies on it
+(spec 33's still-open orientation test).
+
+## Server / CLI: orientation of the input mesh
+
+`--mesh-up` today takes `auto|y|z`. It becomes the full set of snapped orientations:
+
+- `--mesh-up auto|x|-x|y|-y|z|-z`: the axis of the file that points up. `auto` stays z for
+  `.stl`, y otherwise. Server field `mesh_up`, same values.
+- `--mesh-yaw 0|90|180|270`: then a turn about the up axis, counter-clockwise seen from
+  above, in degrees. Server field `mesh_yaw`. Other values are refused (a quarter turn is an
+  exact axis permutation with sign changes, so the geometry stays bit-identical).
+
+Both apply to `--texture-mesh` and `--refine-mesh`. Implementation:
+
+1. `load_mesh` already maps the file's up axis to glTF y. It gets a general
+   `MeshOrient { int up; int yaw; }` and applies one signed axis permutation `P` to the
+   vertices (with det `P` = +1, so the winding is unchanged).
+2. Everything downstream runs as now. After `restore_mesh_transform` (the two call sites,
+   the 3MF mesh `bm` and the GLB `mesh`), the inverse permutation `Pᵀ` is applied, so the
+   output keeps the file's orientation, as today with `--mesh-up`: a z-up STL comes back as a
+   y-up GLB and a z-up 3MF, the input triangles unchanged.
+3. The `[texture-mesh]` log line prints the orientation and which file axis faces the front.
+
+Tests (`trellis-test-mesh-io`): every one of the 24 orientations maps a marked cube's face
+to the expected grid side, and `P` then `Pᵀ` returns the input bit for bit. `trellis-test-multiview`:
+the argument rules (bad axis, bad yaw, yaw without a mesh is refused).
+
+## Studio
+
+### A. Mode switch
+
+A segmented control at the top of the left panel: **Generate from image | Paint a mesh**.
+
+- In "Paint a mesh", a **Mesh** drop zone sits above the photo drop zone (STL, OBJ, GLB,
+  glTF binary). Below it one line: `part.stl · 6,156 triangles · 60 × 40 × 56 mm` (STL / OBJ
+  read as millimetres, GLB as metres, as the server does).
+- Dropping a mesh file on either drop zone, or anywhere on the window, switches to "Paint a
+  mesh" and loads it. Dropping an image keeps the mode.
+- The photo zone and "Extra views" stay as they are. The button reads **Paint mesh**; it is
+  enabled with a mesh and a photo.
+- The last mode and each mode's own settings (resolution, print) are remembered in
+  `localStorage` (wrapped in try/catch), so switching back restores them.
+
+### B. Mesh preview and orientation
+
+Before generating, the viewer shows the mesh untextured:
+
+- **Conversion in the browser** (`meshpreview.ts`, new, no dependency): STL (binary by size
+  `84 + 50n`, else ASCII) and OBJ (`v` / `f` lines, polygons fanned, negative indices) are
+  turned into a minimal untextured GLB (positions + flat normals, one grey material). GLB files
+  are shown as they are. Parse errors are shown before anything is sent to the server.
+- **Orientation** under the viewer, two snapped controls:
+  - **Up:** Auto · +Z · +Y · +X · −Z · −Y · −X (Auto = +Z for STL, +Y otherwise).
+  - **Turn:** ⟲ 90° and ⟳ 90° buttons, and the current value (0°, 90°, 180°, 270°).
+  The preview applies the same rotation through `<model-viewer>`'s `orientation` attribute
+  (no re-conversion), and resets the camera to the front.
+- **Front marker:** a `<model-viewer>` hotspot at the front of the bounding box with the
+  photo's thumbnail and the label "photo side". The caption reads "The photo is painted on
+  the side facing you."
+- The values go to the server as `mesh_up` and `mesh_yaw` (Auto sends nothing).
+- When the result arrives, the viewer shows the painted GLB in the file's orientation; the
+  orientation controls are hidden until the user goes back to editing (any input change).
+
+### D. Print options
+
+In "Paint a mesh" the "3D print" select becomes **3MF** with `off` / `3MF of this mesh`:
+
+- **Size (mm):** a checkbox "from file" (checked by default, field disabled and showing the
+  file's size); unchecking it enables the number field and sends `print_size`.
+- **3MF colours:** as today.
+- **Colour detail** (new, both modes): `0.5 mm` · `1 mm · default` · `2 mm` · `whole
+  triangles`. Sent as `print_color_res` (0.5, 1, 2, 0) when colours are on. Tooltip: "Large
+  triangles are painted in parts down to this size (Orca split painting); the triangles
+  themselves are not changed."
+- Hidden in this mode: flat base, minimum wall, interior, and the Texture on/off select. The
+  request sends `3mf=on` without `watertight`; the server's rules refuse the rest anyway.
+- The printability report panel works unchanged (the server returns one for texture jobs
+  with a 3MF). Its wording for an open mesh says "your mesh", not "the model".
+
+### E. Resolution and limits
+
+- In "Paint a mesh" the resolution select has `512 · fast` (default) and `1024 · detailed`;
+  1536 is hidden.
+- When a job fails with the token limit (the server's error contains `--res 512`), the error
+  toast has a **Retry at 512** button that sets 512 and resubmits.
+- The stage text uses the server's stages as today; the encode stage reads "Reading your
+  mesh".
+
+### Requests
+
+`api.ts`: `toForm` gains the mesh branch. With a mesh it sends `task=texture`, the `mesh`
+part (named with the file's extension, so the server's sniffing and the log are right),
+`mesh_up` / `mesh_yaw` when set, and the print fields above. Image and view fields are as for
+generation. `waitForJob` is unchanged (result, 3MF, report).
+
+### Records and gallery
+
+- `GenParams` gains `mode: "image" | "mesh"` (absent = image), `meshUp`, `meshYaw`,
+  `printSizeFromFile`, `printColorRes`.
+- `GenRecord` gains `mesh?: Blob` and `meshName?: string`; resuming a pending job and opening
+  a gallery item restore the mesh and its orientation.
+- Gallery thumbnails of painted meshes get a small "mesh" badge; the caption shows the file
+  name.
+
+## Phases
+
+1. **Orientation in the CLI / server** (`mesh_up` signed axes, `mesh_yaw`, the inverse on
+   output, tests). Verify the front: a z-up STL box with one red face in the photo, at each
+   of the four turns, comes back with red on the face the turn put at the front (rendered
+   with the spec-30 renderer and in `<model-viewer>`).
+2. **Studio mode switch, mesh drop zone, browser conversion, preview with orientation
+   controls and the front marker.** Check STL binary / ASCII, OBJ with quads and negative
+   indices, GLB, and a malformed file.
+3. **Requests, records, print options (D, both modes' colour detail), resolution and the
+   retry.** End to end against `trellis-server`: the torus-on-block STL at 512 with 4 colours
+   gives a GLB in the file's orientation, a 3MF at the file's size, and a report.
+4. **Docs:** `docs/getting-started.md` gets a "Paint a mesh" section; the README's Studio
+   lines and `app/README.md` mention it.
+
+## Open questions
+
+- Whether "Auto" should try to guess a front for CAD parts (for example, the largest face
+  turned away from the build plate). Not planned; the snapped controls are the answer for now.
+- A "Repaint" action on generated gallery items (brainstorm idea C) reuses all of this and
+  is left for later.
