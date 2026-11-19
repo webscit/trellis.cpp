@@ -27,11 +27,33 @@
 
     <main class="workspace">
       <section class="panel panel-left">
+        <div class="mode-switch" role="tablist" aria-label="What to make">
+          <button id="mode-image" type="button" role="tab" data-mode="image" aria-selected="true">Generate from image</button>
+          <button id="mode-mesh" type="button" role="tab" data-mode="mesh" aria-selected="false"
+                  title="Paint an STL, OBJ or GLB you already have from a photo, keeping its triangles">Paint a mesh</button>
+        </div>
+
+        <div id="mesh-zone" class="meshzone hidden" tabindex="0">
+          <div id="mesh-hint" class="mesh-hint">
+            <b>Drop a mesh</b><span class="muted">STL, OBJ or GLB · or click to browse</span>
+          </div>
+          <div id="mesh-info" class="mesh-info hidden">
+            <span class="mesh-icon">◇</span>
+            <div class="mesh-text" title="Show the mesh and its orientation">
+              <b id="mesh-name"></b>
+              <span id="mesh-stats" class="muted"></span>
+            </div>
+            <button id="mesh-change" class="link-btn" type="button" title="Pick another mesh">Change</button>
+            <button id="mesh-clear" class="mesh-clear" type="button" title="Remove the mesh">✕</button>
+          </div>
+          <input id="mesh-input" type="file" accept=".stl,.obj,.glb" hidden />
+        </div>
+
         <div id="dropzone" class="dropzone" tabindex="0">
           <img id="input-preview" class="input-preview hidden" alt="input" />
           <div id="dropzone-hint" class="dropzone-hint">
             <div class="dz-icon">⬆</div>
-            <div>Drop an image here</div>
+            <div id="dropzone-text">Drop an image here</div>
             <div class="muted">or click to browse</div>
           </div>
           <span id="front-tag" class="front-tag hidden">main · front · 0°</span>
@@ -184,6 +206,19 @@
 
       <section class="panel viewer-panel">
         <div id="viewer-mount" class="viewer-mount"></div>
+        <div id="orient-bar" class="orient-bar hidden">
+          <label class="orient-up" title="The axis of the file that points up">
+            <span>Up</span>
+            <select id="orient-up"></select>
+          </label>
+          <div class="orient-turn">
+            <span>Turn</span>
+            <button id="turn-ccw" class="tool-btn" type="button" title="Turn 90° counter-clockwise, seen from above">⟲ 90°</button>
+            <span id="turn-value" class="turn-value">0°</span>
+            <button id="turn-cw" class="tool-btn" type="button" title="Turn 90° clockwise, seen from above">⟳ 90°</button>
+          </div>
+          <span class="orient-hint muted">Turn the mesh so the side in the photo faces you.</span>
+        </div>
         <details id="print-report" class="print-report hidden">
           <summary>
             <span id="print-report-badge" class="report-badge"></span>

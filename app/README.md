@@ -17,7 +17,10 @@ src/            web UI (Vite + TypeScript, framework-free)
   store.ts      IndexedDB gallery (input + GLB + thumbnail blobs)
   config.ts     resolves server host/port/models (Tauri command or localStorage)
   settings.ts   models dir / gpu / port panel
-  main.ts       wires the generate flow, gallery, status polling
+  main.ts       wires the generate flow, gallery, status polling, the "Paint a mesh" mode
+  orient.ts     mesh orientation (up axis + quarter turns), mirroring the server's mesh_io
+  meshpreview.ts STL / OBJ / GLB reading and the untextured, turned preview GLB
+tests/          node --test unit tests (npm test) for orient.ts and meshpreview.ts
 src-tauri/      Rust shell
   src/server.rs spawns & supervises trellis-server, forwards stdout as
                 `server-log` events, kills it on exit
@@ -31,6 +34,8 @@ write `config.json`; the app reads it, launches the server, and connects. The sa
 web UI also runs in a plain browser against a manually-started server.
 
 ## Develop
+
+`npm test` runs the unit tests with Node's built-in runner (Node 22.6+ strips the types).
 
 ```bash
 npm install

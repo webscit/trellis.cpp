@@ -1,6 +1,8 @@
 # 34 — Studio: paint a mesh
 
-Status: phase 1 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below). Phases 2–4 open.
+Status: phases 1–2 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below; the Studio
+mode switch, mesh slot and turned preview). Phases 3–4 open: until phase 3 the "Paint mesh"
+button stays disabled.
 
 Brings texture-only mode (spec 33, `POST /jobs` with `task=texture`) to Trellis Studio. The
 user drops an STL / OBJ / GLB and a photo, turns the mesh until the photo's side faces the
@@ -162,8 +164,17 @@ generation. `waitForJob` is unchanged (result, 3MF, report).
    of the four turns, comes back with red on the face the turn put at the front (rendered
    with the spec-30 renderer and in `<model-viewer>`).
 2. **Studio mode switch, mesh drop zone, browser conversion, preview with orientation
-   controls and the front marker.** Check STL binary / ASCII, OBJ with quads and negative
-   indices, GLB, and a malformed file.
+   controls and the front marker** (done). `app/src/orient.ts` mirrors `mesh_io`'s maps (the
+   preview shows `load ∘ native⁻¹`, so it is drawn in the file's own convention like the
+   result); `app/src/meshpreview.ts` reads the files and writes the turn as a root node's
+   rotation in the GLB's JSON (exact, and no reliance on `<model-viewer>`'s Euler order).
+   `npm test` (Node's runner, 9 tests): every orientation's up / front / turn direction and its
+   quaternion, the fronts trellis-cli logged in phase 1, STL binary (with a "solid" header) /
+   ASCII and OBJ (quads, `v/vt/vn`, negative indices) giving the same box, GLB pass-through and
+   the root node, and nine malformed files failing with a message. In headless Chromium: the
+   wedge STL reads `40 × 20 × 30 mm` with `-y` at the front, ⟲ gives `-x` and `20 × 40 × 30`,
+   up −Z shows it upside down; the marker sits on the front face; an OBJ dropped on the
+   gallery switches modes; a junk STL keeps the previous mesh with an error.
 3. **Requests, records, print options (D, both modes' colour detail), resolution and the
    retry.** End to end against `trellis-server`: the torus-on-block STL at 512 with 4 colours
    gives a GLB in the file's orientation, a 3MF at the file's size, and a report.

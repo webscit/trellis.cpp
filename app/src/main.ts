@@ -5,6 +5,8 @@ import { renderSettings } from "./settings";
 import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphemeral, newId, put } from "./store";
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
+import { MESH_EXT, orientGlb, readMesh, type MeshFile } from "./meshpreview";
+import { MESH_UPS, frontAxis, nativeUp, previewMap, quaternion, type MeshUp, type MeshYaw } from "./orient";
 import { AUTO_AZ, DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -37,6 +39,13 @@ const addViewBtn = $<HTMLButtonElement>("add-view");
 const viewInput = $<HTMLInputElement>("view-input");
 const clearViewsBtn = $("clear-views");
 const mvAdv = $("mv-adv");
+const modeBtns = Array.from(document.querySelectorAll<HTMLButtonElement>(".mode-switch button[data-mode]"));
+const meshZone = $("mesh-zone");
+const meshInput = $<HTMLInputElement>("mesh-input");
+const meshHint = $("mesh-hint");
+const meshInfo = $("mesh-info");
+const orientBar = $("orient-bar");
+const orientUp = $<HTMLSelectElement>("orient-up");
 
 // ---- state ----
 const viewer = new Viewer($("viewer-mount"));
@@ -60,6 +69,24 @@ let extraViews: ExtraView[] = [];
 let mainAz = 0;
 let mainEl = 0;
 let viewUrls: string[] = [];
+// "Paint a mesh" (docs/spec/34-studio-texture-mode.md): the mesh, its orientation, and
+// whether the viewer shows its untextured preview (rather than a result).
+type Mode = "image" | "mesh";
+let mode: Mode = "image";
+try {
+  if (localStorage.getItem("studio-mode") === "mesh") mode = "mesh";
+} catch { /* storage unavailable: start in image mode */ }
+interface InputMesh extends MeshFile {
+  blob: Blob;
+  name: string;
+}
+let inputMesh: InputMesh | null = null;
+let meshUp: MeshUp = "auto";
+let meshYaw: MeshYaw = 0;
+let previewing = false;
+let previewSeq = 0; // a newer preview (or leaving it) makes an older load's result stale
+let markerUrl: string | null = null;
+let resultCaption = ""; // the caption of the result in the viewer, restored after a preview
 
 // ---- controls -> params ----
 function readParams(): GenParams {
@@ -140,6 +167,7 @@ function setInput(blob: Blob, name: string): void {
   inputPreview.classList.remove("hidden");
   dropHint.classList.add("hidden");
   renderViews(); // the main-image row shows the new thumbnail
+  if (previewing) viewer.setFrontMarker(frontMarker()); // the marker shows the photo
   updateGenerateEnabled();
 }
 
@@ -286,7 +314,8 @@ function renderViews(): void {
   clearViewsBtn.classList.toggle("hidden", !multi);
   mvAdv.classList.toggle("hidden", !multi);
   addViewBtn.disabled = extraViews.length + 1 >= MAX_VIEWS;
-  generateBtn.textContent = multi ? `Generate 3D · ${extraViews.length + 1} views` : "Generate 3D";
+  const verb = mode === "mesh" ? "Paint mesh" : "Generate 3D";
+  generateBtn.textContent = multi ? `${verb} · ${extraViews.length + 1} views` : verb;
 }
 
 addViewBtn.addEventListener("click", () => viewInput.click());
@@ -310,7 +339,7 @@ viewsEl.addEventListener("dragleave", (e) => {
 viewsEl.addEventListener("drop", (e) => {
   e.preventDefault();
   viewsEl.classList.remove("drag");
-  addViews(Array.from((e as DragEvent).dataTransfer?.files ?? []));
+  takeFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []), "views");
 });
 
 dropzone.addEventListener("click", () => fileInput.click());
@@ -329,12 +358,36 @@ fileInput.addEventListener("change", () => {
 // swallows the drop on Windows/WebView2 and the page never sees the files.
 
 // A file dropped anywhere outside the drop zone must not make the webview
-// navigate to it (which would replace the whole app with the image).
+// navigate to it (which would replace the whole app with the image). A mesh dropped
+// anywhere is taken (and switches to "Paint a mesh"); the drop zones handle their own.
 window.addEventListener("dragover", (e) => e.preventDefault());
-window.addEventListener("drop", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => {
+  if (e.defaultPrevented) return; // a drop zone took it
+  e.preventDefault();
+  const files = Array.from(e.dataTransfer?.files ?? []);
+  if (files.some(isMesh)) takeFiles(files, "main");
+});
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i;
 const isImage = (f: File) => f.type.startsWith("image/") || IMAGE_EXT.test(f.name);
+const isMesh = (f: File) => MESH_EXT.test(f.name);
+
+/**
+ * Dropped or picked files: a mesh becomes the mesh to paint (switching to "Paint a mesh"),
+ * images become the main image and extra views ("views": all of them extra views).
+ */
+function takeFiles(files: File[], where: "main" | "views"): void {
+  const mesh = files.find(isMesh);
+  const images = files.filter((f) => !isMesh(f) && isImage(f));
+  for (const f of files)
+    if (!isMesh(f) && !isImage(f)) toast(`"${f.name}" isn't an image or a mesh (STL, OBJ, GLB) — skipped.`, "err");
+  if (mesh) void setMesh(mesh);
+  if (!images.length) return;
+  if (where === "views") return addViews(images);
+  setInput(images[0], images[0].name);
+  // several images at once: the first is the front, the rest extra views
+  if (images.length > 1) addViews(images.slice(1));
+}
 
 ["dragenter", "dragover"].forEach((ev) =>
   dropzone.addEventListener(ev, (e) => {
@@ -350,13 +403,7 @@ dropzone.addEventListener("dragleave", (e) => {
 dropzone.addEventListener("drop", (e) => {
   e.preventDefault();
   dropzone.classList.remove("drag");
-  const files = Array.from((e as DragEvent).dataTransfer?.files ?? []);
-  const f = files[0];
-  if (!f) return;
-  if (isImage(f)) setInput(f, f.name);
-  else toast(`"${f.name}" isn't an image — drop a PNG, JPEG or WebP.`, "err");
-  // several files dropped at once: the first is the front, the rest extra views
-  if (files.length > 1) addViews(files.slice(1));
+  takeFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []), "main");
 });
 window.addEventListener("paste", async (e: ClipboardEvent) => {
   for (const item of e.clipboardData?.items ?? []) {
@@ -375,6 +422,183 @@ window.addEventListener("paste", async (e: ClipboardEvent) => {
   }
 });
 
+// ---- "Paint a mesh": mode, mesh, orientation preview (docs/spec/34-studio-texture-mode.md) ----
+
+/** The panel for `m`, without touching the viewer. */
+function applyModeUi(m: Mode): void {
+  mode = m;
+  try { localStorage.setItem("studio-mode", m); } catch { /* ignore */ }
+  for (const b of modeBtns) b.setAttribute("aria-selected", String(b.dataset.mode === m));
+  meshZone.classList.toggle("hidden", m !== "mesh");
+  $("dropzone-text").textContent = m === "mesh" ? "Drop a photo of the object" : "Drop an image here";
+  renderViews(); // the button's verb
+  updateGenerateEnabled();
+}
+
+function setMode(m: Mode): void {
+  applyModeUi(m);
+  if (m === "mesh" && inputMesh) void showMeshPreview();
+  else leavePreview(true);
+}
+for (const b of modeBtns) b.addEventListener("click", () => setMode(b.dataset.mode as Mode));
+
+async function setMesh(file: File): Promise<void> {
+  let m: MeshFile;
+  try {
+    m = await readMesh(await file.arrayBuffer(), file.name);
+  } catch (e) {
+    toast((e as Error).message, "err");
+    return;
+  }
+  inputMesh = { ...m, blob: file, name: file.name };
+  meshUp = "auto";
+  meshYaw = 0;
+  renderMeshInfo(null);
+  if (mode !== "mesh") applyModeUi("mesh");
+  await showMeshPreview();
+}
+
+function clearMesh(): void {
+  inputMesh = null;
+  renderMeshInfo(null);
+  leavePreview(true);
+  updateGenerateEnabled();
+}
+
+/** The mesh line: name, triangles, and the size as turned (width × depth × height). */
+function renderMeshInfo(dims: { x: number; y: number; z: number } | null): void {
+  meshHint.classList.toggle("hidden", !!inputMesh);
+  meshInfo.classList.toggle("hidden", !inputMesh);
+  if (!inputMesh) return;
+  $("mesh-name").textContent = inputMesh.name;
+  const mm = (v: number) => {
+    const m = v * 1000;
+    return m < 0.05 ? "0" : m.toFixed(m < 10 ? 1 : 0);
+  };
+  // the size kept on one line (non-breaking spaces)
+  $("mesh-stats").textContent = `${inputMesh.triangles.toLocaleString()} triangles` +
+    (dims ? ` · ${[mm(dims.x), mm(dims.z), mm(dims.y)].join(" × ")} mm` : "");
+  $("mesh-stats").title = dims ? "width × depth × height, as turned (STL / OBJ units read as millimetres)" : "";
+}
+
+/** The pin on the preview's front face: the photo's thumbnail, labelled. */
+function frontMarker(): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "front-marker";
+  if (markerUrl) URL.revokeObjectURL(markerUrl);
+  markerUrl = null;
+  if (inputImage) {
+    markerUrl = URL.createObjectURL(inputImage);
+    const img = document.createElement("img");
+    img.src = markerUrl;
+    img.alt = "";
+    el.append(img);
+  }
+  const label = document.createElement("span");
+  label.textContent = inputImage ? "photo side" : "front";
+  el.append(label);
+  return el;
+}
+
+/** Show the mesh untextured, turned as set, with the orientation controls and the marker. */
+async function showMeshPreview(): Promise<void> {
+  if (!inputMesh) return;
+  const seq = ++previewSeq;
+  previewing = true;
+  orientBar.classList.remove("hidden");
+  showPrintReport(null);
+  setViewerTools(false);
+  resetViewBtn.disabled = false;
+  syncOrientControls();
+  const { kind, preview } = inputMesh;
+  const glb = orientGlb(preview, quaternion(previewMap(kind, meshUp, meshYaw)));
+  try {
+    await viewer.load(new Blob([glb], { type: "model/gltf-binary" }));
+  } catch (e) {
+    if (seq === previewSeq) toast(`The mesh preview couldn't render: ${(e as Error).message}`, "err");
+    return;
+  }
+  if (seq !== previewSeq) return;
+  viewer.resetView();
+  renderMeshInfo(viewer.dimensions());
+  viewer.setFrontMarker(frontMarker());
+  viewerCaption.textContent = `${inputMesh.name} · its ${frontAxis(kind, meshUp, meshYaw)} side faces you`;
+}
+
+/** Back from the preview; `restore` puts the last result (or nothing) back in the viewer. */
+function leavePreview(restore: boolean): void {
+  if (!previewing) return;
+  previewing = false;
+  ++previewSeq;
+  orientBar.classList.add("hidden");
+  viewer.setFrontMarker(null);
+  if (!restore) return;
+  if (currentGlb) {
+    viewer.load(currentGlb).catch(() => {});
+    setViewerTools(true);
+    viewerCaption.textContent = resultCaption;
+  } else {
+    viewer.clear();
+    setViewerTools(false);
+    viewerCaption.textContent = "";
+  }
+}
+
+function setResultCaption(text: string): void {
+  resultCaption = text;
+  viewerCaption.textContent = text;
+}
+
+function syncOrientControls(): void {
+  if (!inputMesh) return;
+  const native = nativeUp(inputMesh.kind).toUpperCase();
+  orientUp.replaceChildren(...MESH_UPS.map((u) =>
+    new Option(u === "auto" ? `Auto · ${native}` : u.toUpperCase().replace("-", "−"), u)));
+  orientUp.value = meshUp;
+  $("turn-value").textContent = `${meshYaw}°`;
+}
+
+orientUp.addEventListener("change", () => {
+  meshUp = orientUp.value as MeshUp;
+  void showMeshPreview();
+});
+const turn = (deg: number) => {
+  meshYaw = (((meshYaw + deg) % 360) + 360) % 360 as MeshYaw;
+  void showMeshPreview();
+};
+$("turn-ccw").addEventListener("click", () => turn(90));
+$("turn-cw").addEventListener("click", () => turn(-90));
+
+meshZone.addEventListener("click", (e) => {
+  if ((e.target as HTMLElement).closest("#mesh-clear, #mesh-change")) return;
+  if (inputMesh) void showMeshPreview(); // back to the orientation
+  else meshInput.click();
+});
+meshZone.addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") meshInput.click();
+});
+$("mesh-change").addEventListener("click", () => meshInput.click());
+$("mesh-clear").addEventListener("click", clearMesh);
+meshInput.addEventListener("change", () => {
+  const f = meshInput.files?.[0];
+  if (f) void setMesh(f);
+  meshInput.value = "";
+});
+["dragenter", "dragover"].forEach((ev) =>
+  meshZone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    meshZone.classList.add("drag");
+  }),
+);
+meshZone.addEventListener("dragleave", (e) => {
+  if (!meshZone.contains((e as DragEvent).relatedTarget as Node | null)) meshZone.classList.remove("drag");
+});
+meshZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  meshZone.classList.remove("drag");
+  takeFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []), "main");
+});
+
 // ---- generate ----
 function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -382,7 +606,8 @@ function fmtElapsed(ms: number): string {
 }
 
 function updateGenerateEnabled(): void {
-  generateBtn.disabled = !(serverOnline && inputImage && !generating);
+  // "Paint a mesh" sends its request from phase 3 of spec 34 on.
+  generateBtn.disabled = !(serverOnline && inputImage && !generating && mode === "image");
 }
 
 function describeJob(s: JobStatus | null): string {
@@ -492,14 +717,15 @@ async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob, report?:
     return;
   }
   toast(savedPath ? `Saved to ${savedPath}` : "Generation complete", "ok");
+  leavePreview(false);
   currentGlb = glb;
   current3mf = model3mf ?? null;
   showPrintReport(rec.report);
   currentName = stem;
   activeId = rec.id;
   setViewerTools(true);
-  viewerCaption.textContent =
-    `${rec.params.resolution}${viewsLabel(nViews)} · seed ${rec.params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`;
+  setResultCaption(
+    `${rec.params.resolution}${viewsLabel(nViews)} · seed ${rec.params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`);
   await refreshGallery();
 
   // 3) Best-effort 3D preview + gallery thumbnail — never blocks the save above.
@@ -720,12 +946,15 @@ async function loadRecord(id: string): Promise<void> {
     return;
   }
   if (generating) browsedAway = true;
+  leavePreview(false);
   try {
     await viewer.load(rec.glb);
   } catch (e) {
     toast((e as Error).message, "err");
     return;
   }
+  // Gallery records are image generations until spec 34 phase 3 stores painted meshes.
+  applyModeUi("image");
   inputImage = rec.input;
   inputName = rec.name;
   inputPreview.src = URL.createObjectURL(rec.input);
@@ -740,8 +969,7 @@ async function loadRecord(id: string): Promise<void> {
   currentName = rec.name.replace(/\.[^.]+$/, "") || "model";
   activeId = rec.id;
   setViewerTools(true);
-  viewerCaption.textContent =
-    `${rec.name} · ${rec.params.resolution}${viewsLabel(rec.views?.length ?? 0)} · seed ${rec.params.seed}`;
+  setResultCaption(`${rec.name} · ${rec.params.resolution}${viewsLabel(rec.views?.length ?? 0)} · seed ${rec.params.seed}`);
   updateGenerateEnabled();
   await refreshGallery();
 }
@@ -844,6 +1072,8 @@ listen<string>("server-log", (line) => {
 // ---- boot ----
 async function boot(): Promise<void> {
   setViewerTools(false);
+  applyModeUi(mode);
+  renderMeshInfo(null);
   await refreshGallery();
   await pollHealth();
   window.setInterval(pollHealth, 4000);
