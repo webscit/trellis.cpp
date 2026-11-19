@@ -300,7 +300,7 @@ static void test_cli() {
     // --texture-mesh (docs/spec/33-texture-only.md): --3mf no longer implies the watertight
     // rebuild, and every option that would change the geometry is refused.
     CHECK(parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--3mf", "o.3mf", "--mesh-up", "z" }, p) &&
-          p.texture_mesh == "m.stl" && !p.watertight && !p.out_3mf.empty() && p.mesh_up == 1 && !p.print_size_set,
+          p.texture_mesh == "m.stl" && !p.watertight && !p.out_3mf.empty() && p.mesh_up == "z" && !p.print_size_set,
           "texture-mesh + 3mf: no watertight rebuild");
     CHECK(parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--print-size", "80" }, p) &&
           p.print_size_set && p.print_size == 80.0f, "texture-mesh print-size");
@@ -314,7 +314,15 @@ static void test_cli() {
     }
     CHECK(parse({ "-o", "x.glb", "--texture-mesh", "m.stl" }, p) && !resolve_views(p, vs, err) &&
           err.find("--texture-mesh") != string::npos, "texture-mesh without a view: %s", err.c_str());
-    CHECK(!parse({ "a.png", "--mesh-up", "x" }, p), "mesh-up x rejected");
+    CHECK(!parse({ "a.png", "--mesh-up", "w" }, p), "mesh-up w rejected");
+    CHECK(!parse({ "a.png", "o.glb", "--mesh-up", "x" }, p), "mesh-up without a mesh rejected");
+    CHECK(!parse({ "a.png", "o.glb", "--mesh-yaw", "90" }, p), "mesh-yaw without a mesh rejected");
+    for (const char* bad : { "45", "-90", "360", "x", "" })
+        CHECK(!parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--mesh-yaw", bad }, p), "mesh-yaw %s accepted", bad);
+    CHECK(parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--mesh-up", "-x", "--mesh-yaw", "270" }, p) &&
+          p.mesh_up == "-x" && p.mesh_yaw == 270, "texture-mesh mesh-up -x yaw 270");
+    CHECK(parse({ "a.png", "o.glb", "--refine-mesh", "m.glb", "--mesh-yaw", "180" }, p) && p.mesh_yaw == 180,
+          "refine-mesh mesh-yaw 180");
     CHECK(parse({ "a.png", "o.glb" }, p) && p.print_color_res == 1.0f, "print-color-res default");
     CHECK(parse({ "a.png", "o.glb", "--print-color-res", "0" }, p) && p.print_color_res == 0.0f, "print-color-res 0");
     CHECK(parse({ "a.png", "o.glb", "--print-color-res", "0.4" }, p) && p.print_color_res == 0.4f, "print-color-res 0.4");

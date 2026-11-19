@@ -1,4 +1,5 @@
 #include "trellis_args.h"
+#include "mesh_io.h"
 
 #include <cerrno>
 #include <climits>
@@ -103,7 +104,16 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
     return true;
 }
 
+bool parse_mesh_yaw(const std::string& s, int& out) {
+    if (s == "0" || s == "90" || s == "180" || s == "270") { out = std::stoi(s); return true; }
+    return false;
+}
+
 bool apply_texture_mesh_rules(TrellisParams& p, std::string& error) {
+    if ((p.mesh_yaw != 0 || p.mesh_up != "auto") && p.texture_mesh.empty() && p.refine_mesh.empty()) {
+        error = "--mesh-up / --mesh-yaw need --texture-mesh or --refine-mesh";
+        return false;
+    }
     if (p.texture_mesh.empty()) return true;
     const char* bad = nullptr;
     if (!p.refine_mesh.empty())              bad = "--refine-mesh (pick one: --refine-mesh re-generates the shape, --texture-mesh keeps it)";
@@ -312,8 +322,11 @@ void print_usage(const char* argv0, bool server) {
         "                          keeping its triangles (needs shape_enc.gguf). --res 512 uses the\n"
         "                          512 texture flow, otherwise 1024. --3mf writes the input triangles\n"
         "                          (no watertight rebuild) at the file's size unless --print-size\n"
-        "      --mesh-up A         up axis of the input mesh: auto (default: z for .stl, y for\n"
-        "                          .glb/.gltf/.obj) | y | z\n"
+        "      --mesh-up A         the input mesh's axis that points up: auto (default: z for .stl,\n"
+        "                          y for .glb/.gltf/.obj) | x | -x | y | -y | z | -z\n"
+        "      --mesh-yaw DEG      then turn it about the up axis, counter-clockwise seen from above:\n"
+        "                          0 (default) | 90 | 180 | 270. One image is painted on the side\n"
+        "                          facing the front; the output keeps the file's orientation\n"
         "      --copyright TEXT    glTF asset.copyright metadata\n"
         "  -m, --models DIR        GGUF model directory\n"
         "      --model FAMILY      trellis (default) | pixal3d — which flow weights the model\n"
@@ -490,10 +503,11 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--refine-mesh")          { const char* v = need(a.c_str()); if (!v) return false; p.refine_mesh = v; }
         else if (a == "--texture-mesh")         { const char* v = need(a.c_str()); if (!v) return false; p.texture_mesh = v; }
         else if (a == "--mesh-up")              { const char* v = need(a.c_str()); if (!v) return false;
-                                                  if      (std::strcmp(v, "auto") == 0) p.mesh_up = -1;
-                                                  else if (std::strcmp(v, "y") == 0)    p.mesh_up = 0;
-                                                  else if (std::strcmp(v, "z") == 0)    p.mesh_up = 1;
-                                                  else { fprintf(stderr, "[trellis] --mesh-up must be auto, y or z\n"); return false; } }
+                                                  MeshUp up;
+                                                  if (!parse_mesh_up(v, up)) { fprintf(stderr, "[trellis] --mesh-up must be auto, x, -x, y, -y, z or -z\n"); return false; }
+                                                  p.mesh_up = v; }
+        else if (a == "--mesh-yaw")             { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (!parse_mesh_yaw(v, p.mesh_yaw)) { fprintf(stderr, "[trellis] --mesh-yaw must be 0, 90, 180 or 270\n"); return false; } }
         else if (a == "--refine-coords")        { const char* v = need(a.c_str()); if (!v) return false;
                                                   if      (std::strcmp(v, "auto") == 0)    p.refine_coords = -1;
                                                   else if (std::strcmp(v, "voxel") == 0)   p.refine_coords = 0;

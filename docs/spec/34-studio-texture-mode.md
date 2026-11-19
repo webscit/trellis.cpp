@@ -1,6 +1,6 @@
 # 34 — Studio: paint a mesh
 
-Status: planned.
+Status: phase 1 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below). Phases 2–4 open.
 
 Brings texture-only mode (spec 33, `POST /jobs` with `task=texture`) to Trellis Studio. The
 user drops an STL / OBJ / GLB and a photo, turns the mesh until the photo's side faces the
@@ -27,8 +27,26 @@ front on the wrong face. Extra views have azimuths relative to that same front.
 The canonical front is grid −y (`front_axis` default `-y`, z up). A z-up STL maps to the grid
 with the identity (spec 33), so the front is the STL's −y side. In glTF (y up) that is +z,
 which is where `<model-viewer>`'s default camera sits: **the preview's default view is the
-side the photo is painted on.** Phase 1 checks this end to end before the UI relies on it
-(spec 33's still-open orientation test).
+front the photo is matched to.**
+
+Measured in phase 1 (`--res 512`, seed 1, one front photo: a red face with a white disc, a
+yellow top; the share of white texels per side of the output, named by the STL's axes):
+
+| mesh | turn | front (log) | white on the photo's face | elsewhere |
+|---|---|---|---|---|
+| cube 30 mm | 0°, 90° | −y, −x | disc on 5 of the 6 sides | — |
+| box 40 × 20 × 30 | 0° | −y (wide side) | 10.5% on −y | 10.6% on +y (the back) |
+| box 40 × 20 × 30 | 90° | −x (narrow side) | 0% | 0% everywhere |
+| wedge, tall face −y | 0° | −y | 10.7% on −y | 0% |
+| wedge, tall face −y | 180° | +y | 10.5% on −y | 0% |
+
+So the front is where the spec says (a z-up STL's −y, at turn 0), and the top lands on the up
+axis every time. But the texture model also matches the photo to the shape: a symmetric cube
+gets the disc everywhere, the box's back mirrors its front, and the wedge's distinctive tall
+face gets the disc even turned to the back. Where the shape at the front does not match the
+photo (the box at 90°), the photo's details are lost. The turn therefore matters, but as
+"help the model", not as "the photo lands on this face": Studio's wording says to turn the
+mesh so the side in the photo faces you.
 
 ## Server / CLI: orientation of the input mesh
 
@@ -49,11 +67,15 @@ Both apply to `--texture-mesh` and `--refine-mesh`. Implementation:
    the 3MF mesh `bm` and the GLB `mesh`), the inverse permutation `Pᵀ` is applied, so the
    output keeps the file's orientation, as today with `--mesh-up`: a z-up STL comes back as a
    y-up GLB and a z-up 3MF, the input triangles unchanged.
-3. The `[texture-mesh]` log line prints the orientation and which file axis faces the front.
+3. A `[mesh]` log line prints the orientation and which file axis faces the front
+   (`mesh_front_axis`).
 
-Tests (`trellis-test-mesh-io`): every one of the 24 orientations maps a marked cube's face
-to the expected grid side, and `P` then `Pᵀ` returns the input bit for bit. `trellis-test-multiview`:
-the argument rules (bad axis, bad yaw, yaw without a mesh is refused).
+Tests (`trellis-test-mesh-io`): for every up axis (auto and the six signed axes) and turn, on
+an OBJ and an STL marker mesh: the map is a proper rotation, the up axis lands on glTF +y, the
+reported front on glTF +z, turn 90 is counter-clockwise from above, and load → normalise →
+restore → undo gives the default orientation's output bit for bit (the undo is the identity
+exactly for the default). `trellis-test-multiview`: the argument rules (bad axis, bad turn,
+`--mesh-up` / `--mesh-yaw` without a mesh, refine accepts them).
 
 ## Studio
 
@@ -85,8 +107,9 @@ Before generating, the viewer shows the mesh untextured:
   The preview applies the same rotation through `<model-viewer>`'s `orientation` attribute
   (no re-conversion), and resets the camera to the front.
 - **Front marker:** a `<model-viewer>` hotspot at the front of the bounding box with the
-  photo's thumbnail and the label "photo side". The caption reads "The photo is painted on
-  the side facing you."
+  photo's thumbnail and the label "photo side". The caption reads "Turn the mesh so the side
+  in the photo faces you." (Phase 1: the model matches the photo to this front, and to the
+  shape; a wrong turn loses the photo's details.)
 - The values go to the server as `mesh_up` and `mesh_yaw` (Auto sends nothing).
 - When the result arrives, the viewer shows the painted GLB in the file's orientation; the
   orientation controls are hidden until the user goes back to editing (any input change).

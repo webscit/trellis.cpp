@@ -309,7 +309,11 @@ trellis-cli --texture-mesh part.stl --view photo.png:0 -o painted.glb --res 512 
 
 - `--res 512` uses the 512 texture flow, anything else the 1024 one (as upstream). Dense
   meshes give many texture tokens at 1024; the run stops past `--max-tokens` and suggests 512.
-- STL files are z-up by default (`--mesh-up auto|y|z`); OBJ and glTF are y-up.
+- STL files are z-up by default; OBJ and glTF are y-up. `--mesh-up auto|x|-x|y|-y|z|-z` names
+  the file axis that points up, and `--mesh-yaw 0|90|180|270` then turns the mesh about it
+  (counter-clockwise seen from above). One image is matched to the side facing the front
+  (a z-up STL's −y side at turn 0; the log names it), so turn the mesh until the photo's side
+  faces there. The output keeps the file's orientation either way.
 - The output keeps the input's position and size. `--3mf` writes the input triangles (no
   watertight rebuild) at the file's size (STL/OBJ units read as millimetres, glTF as metres)
   unless `--print-size` is given.
@@ -336,7 +340,8 @@ POST /generate      multipart/form-data with an "image" file part; optional text
                     "elevations", "blend_temp", "front_axis", "yaw_offset".
 POST /refine        a "mesh" part (GLB, OBJ or STL) + one or more "image" parts and the
                     same fields, plus "refine_coords" (auto|encoder|voxel),
-                    "restore_transform" (on|off) and "mesh_up" (auto|y|z).
+                    "restore_transform" (on|off), "mesh_up" (auto|x|-x|y|-y|z|-z) and
+                    "mesh_yaw" (0|90|180|270).
 POST /texture       the /refine form, but paints the mesh and keeps its triangles
                     (texture-only mode); geometry-changing fields answer 400.
 POST /jobs          asynchronous form of the three above: same fields ("task"=refine or

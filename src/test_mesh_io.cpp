@@ -8,6 +8,7 @@
 // malformed inputs that must fail with an error rather than crash.
 #include "mesh_io.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -203,6 +204,110 @@ int main(int argc, char** argv) {
     { Mesh m; std::string err; CHECK(!load_mesh("/nonexistent/x.glb", m, err), "missing file accepted"); }
     { Mesh m; m.verts = { 1, 1, 1, 1, 1, 1, 1, 1, 1 }; m.faces = { 0, 1, 2 }; MeshNorm nm;
       CHECK(!normalize_mesh_trellis(m, nm), "degenerate mesh normalised"); }
+
+    // Orientation (--mesh-up / --mesh-yaw, docs/spec/34-studio-texture-mode.md). A marker mesh:
+    // vertex 0 at an offset origin, then one vertex 1 unit along each signed file axis
+    // (+x, -x, +y, -y, +z, -z), with uneven extents so the bounding box is not symmetric.
+    {
+        const float O[3] = { 3.0f, -2.0f, 7.5f };
+        const float ext[3] = { 1.0f, 1.25f, 1.5f };
+        std::string obj, stl = "solid m\n";
+        float P[7][3];
+        for (int a = 0; a < 3; ++a) P[0][a] = O[a];
+        for (int k = 0; k < 6; ++k) {
+            for (int a = 0; a < 3; ++a) P[1 + k][a] = O[a];
+            P[1 + k][k / 2] += (k % 2 ? -1.0f : 1.0f) * ext[k / 2];
+        }
+        for (const auto& p : P) { char l[96]; snprintf(l, sizeof l, "v %g %g %g\n", p[0], p[1], p[2]); obj += l; }
+        const int T[4][3] = { { 0, 1, 3 }, { 0, 3, 2 }, { 0, 5, 4 }, { 0, 6, 1 } };   // 0-based
+        for (const auto& t : T) {
+            char l[64]; snprintf(l, sizeof l, "f %d %d %d\n", t[0] + 1, t[1] + 1, t[2] + 1); obj += l;
+            stl += "facet normal 0 0 0\nouter loop\n";
+            for (int k = 0; k < 3; ++k) {
+                char v[96]; snprintf(v, sizeof v, "vertex %g %g %g\n", P[t[k]][0], P[t[k]][1], P[t[k]][2]); stl += v;
+            }
+            stl += "endloop\nendfacet\n";
+        }
+        stl += "endsolid m\n";
+        const char* names[] = { "+x", "-x", "+y", "-y", "+z", "-z" };
+        // The glTF direction of a vertex relative to the origin vertex, as a signed axis name.
+        auto dir_of = [&](const Mesh& m, int v) -> std::string {
+            for (int a = 0; a < 3; ++a) {
+                const float d = m.verts[3 * v + a] - m.verts[a];
+                if (std::fabs(d) > 0.5f) return std::string(d > 0 ? "+" : "-") + "xyz"[a];
+            }
+            return "?";
+        };
+        // Index of the marker vertex at a signed file axis name, found by position.
+        auto vert_at = [&](const Mesh& m, const std::string& axis) -> int {
+            const int k = (int)(std::find(names, names + 6, axis) - names);
+            for (int v = 0; v < m.V(); ++v) {
+                bool eq = true;
+                for (int a = 0; a < 3; ++a) eq = eq && m.verts[3 * v + a] == P[1 + k][a];
+                if (eq) return v;
+            }
+            return -1;
+        };
+        const std::string up_names[] = { "auto", "+x", "-x", "+y", "-y", "+z", "-z" };
+        for (const auto& file : { tmpfile("orient.obj", obj), tmpfile("orient.stl", stl) }) {
+            const bool is_stl = file.size() > 4 && file.substr(file.size() - 4) == ".stl";
+            Mesh raw; std::string err;
+            // the raw file positions: load with the identity map (y up, no turn) unless STL ...
+            CHECK(load_mesh(file, raw, err, MeshOrient{ MeshUp::Y, 0 }), "orient raw: %s", err.c_str());
+            // ... the default output (grid axes after restore), which every orientation must reproduce
+            Mesh def; MeshNorm dn;
+            CHECK(load_mesh(file, def, err) && normalize_mesh_trellis(def, dn), "orient default: %s", err.c_str());
+            restore_mesh_transform(def.verts, dn);
+            for (const std::string& un : up_names) {
+                MeshUp up; CHECK(parse_mesh_up(un, up), "parse %s", un.c_str());
+                const std::string up_axis = un == "auto" ? (is_stl ? "+z" : "+y") : un;
+                for (int yaw : { 0, 90, 180, 270 }) {
+                    const MeshOrient o{ up, yaw };
+                    const AxisMap L = mesh_load_map(file, o);
+                    int det = 0;   // of the signed permutation: sign of the permutation times the signs
+                    {
+                        const int* a = L.axis;
+                        const int par = (a[0] == 0 ? (a[1] == 1 ? 1 : -1) : a[0] == 1 ? (a[1] == 0 ? -1 : 1) : (a[1] == 0 ? 1 : -1));
+                        det = par * L.sign[0] * L.sign[1] * L.sign[2];
+                    }
+                    CHECK(det == 1, "%s up %s yaw %d: not a proper rotation", file.c_str(), un.c_str(), yaw);
+                    Mesh m;
+                    CHECK(load_mesh(file, m, err, o), "%s up %s yaw %d: %s", file.c_str(), un.c_str(), yaw, err.c_str());
+                    if (m.V() != raw.V()) continue;
+                    // the up axis points up, the reported front axis faces glTF +z
+                    CHECK(dir_of(m, vert_at(raw, up_axis)) == "+y", "%s up %s yaw %d: up goes to %s", file.c_str(),
+                          un.c_str(), yaw, dir_of(m, vert_at(raw, up_axis)).c_str());
+                    const std::string front = mesh_front_axis(file, o);
+                    CHECK(dir_of(m, vert_at(raw, front)) == "+z", "%s up %s yaw %d: front %s goes to %s",
+                          file.c_str(), un.c_str(), yaw, front.c_str(), dir_of(m, vert_at(raw, front)).c_str());
+                    // the turn is counter-clockwise seen from above: what faced +x at yaw 0 faces -z at 90
+                    if (yaw == 90) {
+                        Mesh m0; load_mesh(file, m0, err, MeshOrient{ up, 0 });
+                        int vx = -1;
+                        for (int v = 1; v < m0.V(); ++v) if (dir_of(m0, v) == "+x") vx = v;
+                        CHECK(vx >= 0 && dir_of(m, vx) == "-z", "%s up %s: yaw 90 is not counter-clockwise", file.c_str(), un.c_str());
+                    }
+                    // normalise, restore, undo: bit-identical to the default orientation's output
+                    MeshNorm nm;
+                    CHECK(normalize_mesh_trellis(m, nm), "normalize");
+                    restore_mesh_transform(m.verts, nm);
+                    const AxisMap undo = mesh_orient_undo_grid(file, o);
+                    undo.apply(m.verts);
+                    CHECK(m.verts == def.verts, "%s up %s yaw %d: output differs from the default orientation",
+                          file.c_str(), un.c_str(), yaw);
+                    const bool native = yaw == 0 && (un == "auto" || un == (is_stl ? "+z" : "+y"));
+                    CHECK(undo.identity() == native, "%s up %s yaw %d: undo identity %d", file.c_str(), un.c_str(),
+                          yaw, (int)undo.identity());
+                }
+            }
+            CHECK(mesh_front_axis(file, MeshOrient{}) == (is_stl ? "-y" : "+z"), "%s: default front %s", file.c_str(),
+                  mesh_front_axis(file, MeshOrient{}).c_str());
+            Mesh bad;
+            CHECK(!load_mesh(file, bad, err, MeshOrient{ MeshUp::Auto, 45 }), "yaw 45 accepted");
+        }
+        MeshUp up;
+        CHECK(!parse_mesh_up("w", up) && !parse_mesh_up("", up) && !parse_mesh_up("--z", up), "bad mesh_up accepted");
+    }
 
     printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL OK", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

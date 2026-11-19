@@ -213,7 +213,96 @@ bool load_stl(const std::string& path, Mesh& out, std::string& err) {
 
 bool is_stl_path(const std::string& path) { return lower_ext(path) == "stl"; }
 
-bool load_mesh(const std::string& path, Mesh& out, std::string& err, MeshUp up) {
+bool parse_mesh_up(const std::string& s, MeshUp& out) {
+    if      (s == "auto")               out = MeshUp::Auto;
+    else if (s == "x"  || s == "+x")    out = MeshUp::X;
+    else if (s == "-x")                 out = MeshUp::NX;
+    else if (s == "y"  || s == "+y")    out = MeshUp::Y;
+    else if (s == "-y")                 out = MeshUp::NY;
+    else if (s == "z"  || s == "+z")    out = MeshUp::Z;
+    else if (s == "-z")                 out = MeshUp::NZ;
+    else return false;
+    return true;
+}
+
+bool AxisMap::identity() const {
+    for (int i = 0; i < 3; ++i) if (axis[i] != i || sign[i] != 1) return false;
+    return true;
+}
+
+AxisMap AxisMap::inverse() const {
+    AxisMap r;
+    for (int i = 0; i < 3; ++i) { r.axis[axis[i]] = i; r.sign[axis[i]] = sign[i]; }
+    return r;
+}
+
+AxisMap AxisMap::after(const AxisMap& first) const {
+    AxisMap r;
+    for (int i = 0; i < 3; ++i) { r.axis[i] = first.axis[axis[i]]; r.sign[i] = sign[i] * first.sign[axis[i]]; }
+    return r;
+}
+
+void AxisMap::apply(float* v, size_t count, size_t stride) const {
+    for (size_t k = 0; k < count; ++k, v += stride) {
+        const float in[3] = {v[0], v[1], v[2]};
+        for (int i = 0; i < 3; ++i) v[i] = sign[i] < 0 ? -in[axis[i]] : in[axis[i]];
+    }
+}
+
+namespace {
+
+AxisMap make_map(int a0, int s0, int a1, int s1, int a2, int s2) {
+    AxisMap m;
+    m.axis[0] = a0; m.sign[0] = s0; m.axis[1] = a1; m.sign[1] = s1; m.axis[2] = a2; m.sign[2] = s2;
+    return m;
+}
+
+// File -> glTF: the rotation that takes the file axis `up` to +y (Auto resolved by the caller).
+AxisMap up_map(MeshUp up) {
+    switch (up) {
+        case MeshUp::Z:  return make_map(0, 1, 2, 1, 1, -1);   // (x, y, z) -> (x, z, -y)
+        case MeshUp::NZ: return make_map(0, 1, 2, -1, 1, 1);   // (x, y, z) -> (x, -z, y)
+        case MeshUp::NY: return make_map(0, 1, 1, -1, 2, -1);  // (x, y, z) -> (x, -y, -z)
+        case MeshUp::X:  return make_map(1, -1, 0, 1, 2, 1);   // (x, y, z) -> (-y, x, z)
+        case MeshUp::NX: return make_map(1, 1, 0, -1, 2, 1);   // (x, y, z) -> (y, -x, z)
+        default:         return AxisMap{};                     // y up already
+    }
+}
+
+// glTF: a turn of `yaw` degrees about +y, counter-clockwise seen from above (right-handed).
+AxisMap yaw_map(int yaw) {
+    switch (((yaw % 360) + 360) % 360) {
+        case 90:  return make_map(2, 1, 1, 1, 0, -1);    // (x, y, z) -> (z, y, -x)
+        case 180: return make_map(0, -1, 1, 1, 2, -1);   // (x, y, z) -> (-x, y, -z)
+        case 270: return make_map(2, -1, 1, 1, 0, 1);    // (x, y, z) -> (-z, y, x)
+        default:  return AxisMap{};
+    }
+}
+
+MeshUp resolve_up(const std::string& path, MeshUp up) {
+    return up != MeshUp::Auto ? up : is_stl_path(path) ? MeshUp::Z : MeshUp::Y;
+}
+
+}  // namespace
+
+AxisMap mesh_load_map(const std::string& path, MeshOrient o) {
+    return yaw_map(o.yaw).after(up_map(resolve_up(path, o.up)));
+}
+
+AxisMap mesh_orient_undo_grid(const std::string& path, MeshOrient o) {
+    const AxisMap to_grid = make_map(0, 1, 2, -1, 1, 1);   // glTF (x, y, z) -> grid (x, -z, y)
+    const AxisMap native = up_map(resolve_up(path, MeshUp::Auto));
+    // grid -> glTF -> (undo the load) file -> the file's own convention -> grid
+    return to_grid.after(native.after(mesh_load_map(path, o).inverse().after(to_grid.inverse())));
+}
+
+std::string mesh_front_axis(const std::string& path, MeshOrient o) {
+    // The file direction the load sends to glTF +z: out.z = sign[2] * in[axis[2]].
+    const AxisMap m = mesh_load_map(path, o);
+    return std::string(m.sign[2] < 0 ? "-" : "+") + "xyz"[m.axis[2]];
+}
+
+bool load_mesh(const std::string& path, Mesh& out, std::string& err, MeshOrient orient) {
     char magic[4] = {0, 0, 0, 0};
     {
         FILE* f = std::fopen(path.c_str(), "rb");
@@ -234,14 +323,9 @@ bool load_mesh(const std::string& path, Mesh& out, std::string& err, MeshUp up) 
         return false;
     }
     if (!ok) return false;
-    if (up == MeshUp::Z || (up == MeshUp::Auto && ext == "stl")) {
-        // z-up file -> glTF y-up: (x, y, z) -> (x, z, -y). A proper rotation: winding unchanged.
-        for (size_t i = 0; i + 2 < out.verts.size(); i += 3) {
-            const float y = out.verts[i + 1], z = out.verts[i + 2];
-            out.verts[i + 1] = z;
-            out.verts[i + 2] = -y;
-        }
-    }
+    if (orient.yaw % 90 != 0) { err = "the mesh turn must be 0, 90, 180 or 270 degrees"; return false; }
+    // File -> glTF y-up, then the turn: a proper rotation, so the winding is unchanged.
+    mesh_load_map(path, orient).apply(out.verts);
     return true;
 }
 

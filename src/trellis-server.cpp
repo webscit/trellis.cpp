@@ -43,7 +43,8 @@
 //                    the mesh and keeps its triangles (docs/spec/33-texture-only.md). "3mf"=on
 //                    writes those triangles (no watertight rebuild) at the file's size unless
 //                    "print_size"; "watertight", "faces", "print_base", "normal_map" -> 400.
-//                    "mesh_up" (auto|y|z) for /refine and /texture.
+//                    "mesh_up" (auto|x|-x|y|-y|z|-z) and "mesh_yaw" (0|90|180|270) for /refine
+//                    and /texture.
 //   POST /jobs        asynchronous form of the three above (same fields; "task"=refine|texture
 //                    selects /refine or /texture) -> 202 {"id","status","position"}. Use it for long runs: the
 //                    synchronous endpoints hold one request open for the whole run, which a
@@ -61,6 +62,7 @@
 // directory is resolved once; each request runs the full pipeline via trellis_run()
 // (per-stage load/free, like trellis-cli) on a single worker thread, in arrival order.
 // Keeping the process resident avoids re-initializing the GPU backend on every request.
+#include "mesh_io.h"
 #include "trellis_args.h"
 #include "trellis_run.h"
 #include "httplib.h"
@@ -407,10 +409,14 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
         if (mesh_bytes.size() < 4) { bad_request(res, "mesh part is empty"); return nullptr; }
         if (req.has_file("mesh_up")) {
             const std::string& v = req.get_file_value("mesh_up").content;
-            if      (v == "auto") p.mesh_up = -1;
-            else if (v == "y")    p.mesh_up = 0;
-            else if (v == "z")    p.mesh_up = 1;
-            else { bad_request(res, "mesh_up must be auto, y or z"); return nullptr; }
+            trellis::MeshUp up;
+            if (!trellis::parse_mesh_up(v, up)) { bad_request(res, "mesh_up must be auto, x, -x, y, -y, z or -z"); return nullptr; }
+            p.mesh_up = v;
+        }
+        if (req.has_file("mesh_yaw") &&
+            !trellis::parse_mesh_yaw(req.get_file_value("mesh_yaw").content, p.mesh_yaw)) {
+            bad_request(res, "mesh_yaw must be 0, 90, 180 or 270");
+            return nullptr;
         }
     }
     if (texture) {

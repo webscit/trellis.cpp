@@ -166,8 +166,10 @@ struct TrellisParams {
 
     // ---- mesh refinement (--refine-mesh, docs/spec/31-mesh-refine.md) ----
     std::string refine_mesh;         // --refine-mesh in.glb|in.obj|in.stl
-    int         mesh_up        = -1; // --mesh-up auto|y|z: the input mesh's up axis (-1 auto: z for
-                                     //   .stl, y otherwise; 0 y; 1 z), docs/spec/33-texture-only.md
+    std::string mesh_up        = "auto"; // --mesh-up auto|x|-x|y|-y|z|-z: the file axis that points up
+                                     //   (auto: z for .stl, y otherwise), docs/spec/33, 34
+    int         mesh_yaw       = 0;  // --mesh-yaw 0|90|180|270: then a turn about the up axis
+                                     //   (counter-clockwise seen from above), docs/spec/34
     int         refine_coords  = -1; // --refine-coords auto|encoder|voxel (-1 auto, 0 voxel, 1 encoder)
     bool        refine_restore = true;  // --refine-restore-transform on|off
 
@@ -239,7 +241,11 @@ bool check_print_compat(const TrellisParams& p, std::string& error);
 // --texture-mesh: rejects the options that would change or rebuild the geometry, and drops the
 // watertight rebuild that --3mf implies (the input triangles are written as they are). No-op
 // without --texture-mesh. Shared by the CLI and trellis-server.
+// Also refuses --mesh-up / --mesh-yaw without a mesh.
 bool apply_texture_mesh_rules(TrellisParams& p, std::string& error);
+
+// --mesh-yaw / server field "mesh_yaw": "0", "90", "180" or "270".
+bool parse_mesh_yaw(const std::string& s, int& out);
 
 // ---- UV atlas size (--atlas / server field "atlas") ----
 // Side length in px of the square textures baked onto the mesh (base color + metallic/

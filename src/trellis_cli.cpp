@@ -367,12 +367,17 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     bool refine_encoder = false;
     trellis::Mesh texmesh_in;          // the input mesh, normalised (grid frame): the bake target
     float texmesh_size = 0;            // its longest side in millimetres (for the 3MF)
+    trellis::AxisMap orient_undo;      // undoes --mesh-up / --mesh-yaw's turn on output (grid axes)
     if (refine || texmesh) {
         std::string err;
         const std::string& path = texmesh ? cfg.texture_mesh : cfg.refine_mesh;
-        const trellis::MeshUp up = cfg.mesh_up == 0 ? trellis::MeshUp::Y
-                                 : cfg.mesh_up == 1 ? trellis::MeshUp::Z : trellis::MeshUp::Auto;
-        if (!trellis::load_mesh(path, refine_in, err, up)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
+        trellis::MeshOrient orient;
+        trellis::parse_mesh_up(cfg.mesh_up, orient.up);   // validated by the argument parsers
+        orient.yaw = cfg.mesh_yaw;
+        if (!trellis::load_mesh(path, refine_in, err, orient)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
+        orient_undo = trellis::mesh_orient_undo_grid(path, orient);
+        printf("[mesh] %s: up %s, turn %d deg; the file's %s side faces the front\n", path.c_str(),
+               cfg.mesh_up.c_str(), cfg.mesh_yaw, trellis::mesh_front_axis(path, orient).c_str());
         if (!trellis::normalize_mesh_trellis(refine_in, refine_norm)) {
             fprintf(stderr, "[trellis] %s: degenerate mesh (empty or zero extent): %s\n",
                     texmesh ? "--texture-mesh" : "--refine-mesh", path.c_str());
@@ -1558,7 +1563,11 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox, nsp);
         if (bm.ok()) {
             if (pix) pixal3d_to_trellis_frame(bm.verts);
-            if ((refine && cfg.refine_restore) || texmesh) trellis::restore_mesh_transform(bm.verts, refine_norm);
+            if ((refine && cfg.refine_restore) || texmesh) {
+                trellis::restore_mesh_transform(bm.verts, refine_norm);
+                orient_undo.apply(bm.verts);
+                if (!bm.tangents.empty()) orient_undo.apply(bm.tangents.data(), bm.tangents.size() / 4, 4);
+            }
             trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
                                         bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
                                         /*double_sided=*/rm.F() == 0, run_seed,
@@ -1645,7 +1654,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         } else printf("  watertight: solid remesh produced nothing; writing the raw mesh\n");
     }
     if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply
-    if ((refine && cfg.refine_restore) || texmesh) trellis::restore_mesh_transform(mesh.verts, refine_norm);
+    if ((refine && cfg.refine_restore) || texmesh) {
+        trellis::restore_mesh_transform(mesh.verts, refine_norm);
+        orient_undo.apply(mesh.verts);
+    }
     if (!textured) {
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),
                            colors.empty() ? nullptr : colors.data(), run_seed,
