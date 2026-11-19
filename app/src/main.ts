@@ -6,7 +6,7 @@ import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphe
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
 import { MESH_EXT, orientGlb, readMesh, type MeshFile } from "./meshpreview";
-import { MESH_UPS, frontAxis, nativeUp, previewMap, quaternion, type MeshUp, type MeshYaw } from "./orient";
+import { MESH_UPS, applyMap, frontAxis, nativeUp, previewMap, quaternion, type MeshUp, type MeshYaw } from "./orient";
 import { AUTO_AZ, DEFAULT_PARAMS, MAX_VIEWS, type ExtraView, type GenParams, type GenRecord, type PrintInterior, type PrintReport } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -86,7 +86,8 @@ let meshYaw: MeshYaw = 0;
 let previewing = false;
 let previewSeq = 0; // a newer preview (or leaving it) makes an older load's result stale
 let markerUrl: string | null = null;
-let resultCaption = ""; // the caption of the result in the viewer, restored after a preview
+let resultCaption = "";
+let runningMode: Mode = "image"; // the mode of the job in progress (for its stage text) // the caption of the result in the viewer, restored after a preview
 
 // ---- controls -> params ----
 function readParams(): GenParams {
@@ -104,6 +105,11 @@ function readParams(): GenParams {
     printWall: readNumber("ctl-print-wall", DEFAULT_PARAMS.printWall!, 0, 20),
     printInterior: ($("ctl-print-interior") as HTMLSelectElement).value as PrintInterior,
     printColors: parseInt(($("ctl-print-colors") as HTMLSelectElement).value, 10) || 0,
+    printColorRes: parseFloat(($("ctl-print-color-res") as HTMLSelectElement).value) || 0,
+    printSizeFromFile: ($("ctl-print-size-file") as HTMLInputElement).checked,
+    mode,
+    meshUp: mode === "mesh" ? meshUp : undefined,
+    meshYaw: mode === "mesh" ? meshYaw : undefined,
     blendTemp: readBlendTemp(),
     frontAxis: ($("ctl-front") as HTMLSelectElement).value as GenParams["frontAxis"],
     autoYaw: ($("ctl-yaw") as HTMLSelectElement).value === "auto",
@@ -139,6 +145,8 @@ function applyParams(p: GenParams): void {
   ($("ctl-print-wall") as HTMLInputElement).value = String(p.printWall ?? DEFAULT_PARAMS.printWall);
   ($("ctl-print-interior") as HTMLSelectElement).value = p.printInterior ?? (p.printSeal === 0 ? "hollow" : DEFAULT_PARAMS.printInterior!);
   ($("ctl-print-colors") as HTMLSelectElement).value = String(p.printColors ?? DEFAULT_PARAMS.printColors);
+  ($("ctl-print-color-res") as HTMLSelectElement).value = String(p.printColorRes ?? DEFAULT_PARAMS.printColorRes);
+  ($("ctl-print-size-file") as HTMLInputElement).checked = p.printSizeFromFile ?? true;
   syncPrintOptions();
   // records saved before multi-view existed have neither field
   ($("ctl-blend") as HTMLInputElement).value = String(p.blendTemp ?? DEFAULT_PARAMS.blendTemp);
@@ -151,12 +159,23 @@ function applyParams(p: GenParams): void {
 }
 
 // ---- toasts ----
-function toast(msg: string, kind: "" | "ok" | "err" = ""): void {
+function toast(msg: string, kind: "" | "ok" | "err" = "", action?: { label: string; run: () => void }): void {
   const el = document.createElement("div");
   el.className = "toast" + (kind ? " " + kind : "");
   el.textContent = msg;
+  if (action) {
+    const b = document.createElement("button");
+    b.className = "toast-action";
+    b.type = "button";
+    b.textContent = action.label;
+    b.addEventListener("click", () => {
+      el.remove();
+      action.run();
+    });
+    el.append(b);
+  }
   $("toasts").appendChild(el);
-  setTimeout(() => el.remove(), kind === "err" ? 8000 : 4000);
+  setTimeout(() => el.remove(), action ? 20000 : kind === "err" ? 8000 : 4000);
 }
 
 // ---- input image ----
@@ -426,7 +445,12 @@ window.addEventListener("paste", async (e: ClipboardEvent) => {
 
 /** The panel for `m`, without touching the viewer. */
 function applyModeUi(m: Mode): void {
-  mode = m;
+  if (m !== mode) {
+    saveModeSettings();
+    mode = m;
+    restoreModeSettings(m);
+  }
+  syncPrintOptions();
   try { localStorage.setItem("studio-mode", m); } catch { /* ignore */ }
   for (const b of modeBtns) b.setAttribute("aria-selected", String(b.dataset.mode === m));
   meshZone.classList.toggle("hidden", m !== "mesh");
@@ -453,32 +477,31 @@ async function setMesh(file: File): Promise<void> {
   inputMesh = { ...m, blob: file, name: file.name };
   meshUp = "auto";
   meshYaw = 0;
-  renderMeshInfo(null);
+  renderMeshInfo();
   if (mode !== "mesh") applyModeUi("mesh");
   await showMeshPreview();
 }
 
 function clearMesh(): void {
   inputMesh = null;
-  renderMeshInfo(null);
+  renderMeshInfo();
   leavePreview(true);
   updateGenerateEnabled();
 }
 
 /** The mesh line: name, triangles, and the size as turned (width × depth × height). */
-function renderMeshInfo(dims: { x: number; y: number; z: number } | null): void {
+function renderMeshInfo(): void {
   meshHint.classList.toggle("hidden", !!inputMesh);
   meshInfo.classList.toggle("hidden", !inputMesh);
+  syncPrintOptions(); // "from file" shows the mesh's size
   if (!inputMesh) return;
   $("mesh-name").textContent = inputMesh.name;
-  const mm = (v: number) => {
-    const m = v * 1000;
-    return m < 0.05 ? "0" : m.toFixed(m < 10 ? 1 : 0);
-  };
+  const mm = (m: number) => (m < 0.05 ? "0" : m.toFixed(m < 10 ? 1 : 0));
+  const d = applyMap(previewMap(inputMesh.kind, meshUp, meshYaw), inputMesh.size).map(Math.abs);
   // the size kept on one line (non-breaking spaces)
-  $("mesh-stats").textContent = `${inputMesh.triangles.toLocaleString()} triangles` +
-    (dims ? ` · ${[mm(dims.x), mm(dims.z), mm(dims.y)].join(" × ")} mm` : "");
-  $("mesh-stats").title = dims ? "width × depth × height, as turned (STL / OBJ units read as millimetres)" : "";
+  $("mesh-stats").textContent = `${inputMesh.triangles.toLocaleString()} triangles · ` +
+    `${[mm(d[0]), mm(d[2]), mm(d[1])].join(" × ")} mm`;
+  $("mesh-stats").title = "width × depth × height, as turned (STL / OBJ units read as millimetres, GLB as metres)";
 }
 
 /** The pin on the preview's front face: the photo's thumbnail, labelled. */
@@ -520,7 +543,7 @@ async function showMeshPreview(): Promise<void> {
   }
   if (seq !== previewSeq) return;
   viewer.resetView();
-  renderMeshInfo(viewer.dimensions());
+  renderMeshInfo();
   viewer.setFrontMarker(frontMarker());
   viewerCaption.textContent = `${inputMesh.name} · its ${frontAxis(kind, meshUp, meshYaw)} side faces you`;
 }
@@ -606,8 +629,8 @@ function fmtElapsed(ms: number): string {
 }
 
 function updateGenerateEnabled(): void {
-  // "Paint a mesh" sends its request from phase 3 of spec 34 on.
-  generateBtn.disabled = !(serverOnline && inputImage && !generating && mode === "image");
+  generateBtn.disabled = !(serverOnline && inputImage && !generating && (mode === "image" || inputMesh));
+  generateBtn.title = mode === "mesh" && !inputMesh ? "Drop the mesh to paint first" : "";
 }
 
 function describeJob(s: JobStatus | null): string {
@@ -630,6 +653,7 @@ async function runJob(
   work: (signal: AbortSignal, hooks: GenerateHooks) => Promise<GenerateResult>,
 ): Promise<void> {
   generating = true;
+  runningMode = rec.params.mode ?? "image";
   browsedAway = false;
   updateGenerateEnabled();
   progress.classList.remove("hidden");
@@ -663,13 +687,47 @@ async function runJob(
       toast(running
         ? "Cancelled — the server finishes the run already in progress, but its result is discarded."
         : "Generation cancelled");
-    } else toast((e as Error).message || "generation failed", "err");
+    } else {
+      const msg = (e as Error).message || "generation failed";
+      // A mesh too dense for the 1024 texture flow: offer the 512 one.
+      if (rec.params.mode === "mesh" && /--res 512/.test(msg)) {
+        const m = /(\d+) texture tokens .*--max-tokens (\d+)/.exec(msg);
+        const n = (s: string) => Number(s).toLocaleString();
+        toast("This mesh is too detailed to paint at 1024" +
+          (m ? `: it needs ${n(m[1])} texture tokens, over this server's limit of ${n(m[2])}.` : "."), "err", {
+          label: "Retry at 512",
+          run: () => retryAt512(rec),
+        });
+      } else toast(msg, "err");
+    }
   } finally {
     generating = false;
     if (elapsedTimer) window.clearInterval(elapsedTimer);
     progress.classList.add("hidden");
     updateGenerateEnabled();
   }
+}
+
+/** Paint the same mesh, photo and settings again with the 512 texture flow. */
+function retryAt512(failed: GenRecord): void {
+  if (generating) return toast("Wait for the current run to finish first.", "err");
+  if (!failed.mesh || !failed.meshName) return;
+  if (mode === "mesh") {
+    ($("ctl-res") as HTMLSelectElement).value = "512";
+    saveModeSettings();
+  }
+  const rec: GenRecord = {
+    ...failed,
+    id: newId(),
+    ts: Date.now(),
+    params: { ...failed.params, resolution: 512 },
+    glb: null,
+    thumb: null,
+    pending: undefined,
+    jobId: undefined,
+  };
+  const mesh = { blob: failed.mesh, name: failed.meshName };
+  void runJob(rec, (signal, hooks) => generate(rec.input, rec.params, rec.views ?? [], signal, hooks, mesh));
 }
 
 /** Store a finished generation; show it unless the user is browsing another item. */
@@ -691,7 +749,8 @@ async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob, report?:
     try {
       const bytes = new Uint8Array(await glb.arrayBuffer());
       const mv = nViews ? `_mv${nViews + 1}` : "";
-      const fname = `${stem}_${rec.params.resolution}${mv}_seed${rec.params.seed}_${rec.id}.glb`;
+      const painted = rec.params.mode === "mesh" ? "_painted" : "";
+      const fname = `${stem}${painted}_${rec.params.resolution}${mv}_seed${rec.params.seed}_${rec.id}.glb`;
       savedPath = await saveToOutputDir(fname, bytes);
       if (model3mf)
         await saveToOutputDir(fname.replace(/\.glb$/, ".3mf"), new Uint8Array(await model3mf.arrayBuffer()));
@@ -716,16 +775,17 @@ async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob, report?:
     await refreshGallery();
     return;
   }
-  toast(savedPath ? `Saved to ${savedPath}` : "Generation complete", "ok");
+  toast(savedPath ? `Saved to ${savedPath}` : rec.params.mode === "mesh" ? "Mesh painted" : "Generation complete", "ok");
   leavePreview(false);
   currentGlb = glb;
   current3mf = model3mf ?? null;
-  showPrintReport(rec.report);
-  currentName = stem;
+  showPrintReport(rec.report, rec.params.mode === "mesh");
+  currentName = stem + (rec.params.mode === "mesh" ? "_painted" : "");
   activeId = rec.id;
   setViewerTools(true);
-  setResultCaption(
-    `${rec.params.resolution}${viewsLabel(nViews)} · seed ${rec.params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`);
+  const size = glb.size < 1e6 ? `${Math.max(1, Math.round(glb.size / 1e3))} KB` : `${(glb.size / 1e6).toFixed(1)} MB`;
+  setResultCaption((rec.params.mode === "mesh" ? `${rec.name} · painted at ` : "") +
+    `${rec.params.resolution}${viewsLabel(nViews)} · seed ${rec.params.seed} · ${size}`);
   await refreshGallery();
 
   // 3) Best-effort 3D preview + gallery thumbnail — never blocks the save above.
@@ -744,19 +804,24 @@ async function finishRecord(rec: GenRecord, glb: Blob, model3mf?: Blob, report?:
 
 async function doGenerate(): Promise<void> {
   if (!inputImage || generating) return;
+  const paint = mode === "mesh";
+  if (paint && !inputMesh) return;
   const params = readParams();
   const views = extraViews.map((v) => ({ ...v }));
   const rec: GenRecord = {
     id: newId(),
     ts: Date.now(),
-    name: inputName,
+    name: paint ? inputMesh!.name : inputName,
     params,
     input: inputImage,
     views: views.length ? views : undefined,
+    mesh: paint ? inputMesh!.blob : undefined,
+    meshName: paint ? inputMesh!.name : undefined,
     glb: null,
     thumb: null,
   };
-  await runJob(rec, (signal, hooks) => generate(rec.input, params, views, signal, hooks));
+  const mesh = rec.mesh ? { blob: rec.mesh, name: rec.meshName! } : undefined;
+  await runJob(rec, (signal, hooks) => generate(rec.input, params, views, signal, hooks, mesh));
 }
 
 /** Pick up jobs that were still running on the server when the page was closed. */
@@ -787,22 +852,116 @@ resetViewBtn.addEventListener("click", () => viewer.resetView());
 
 // ---- 3D print: options follow the toggle; the report follows the model in the viewer ----
 const printOpts = $("print-opts");
-function syncPrintOptions(): void {
-  printOpts.classList.toggle("hidden", ($("ctl-print") as HTMLSelectElement).value !== "on");
+const sizeInput = $<HTMLInputElement>("ctl-print-size");
+const sizeFromFile = $<HTMLInputElement>("ctl-print-size-file");
+
+/** The mesh's longest side in mm (what the 3MF gets "from file"), or null without a mesh. */
+function meshLongestMm(): number | null {
+  return inputMesh ? Math.max(...inputMesh.size) : null;
 }
-$("ctl-print").addEventListener("change", syncPrintOptions);
+
+/**
+ * The print and resolution controls for the mode: "Paint a mesh" writes a 3MF of the mesh as
+ * it is (no flat base, wall or interior: nothing is rebuilt), at the file's size by default,
+ * and paints at 512 or 1024 only.
+ */
+function syncPrintOptions(): void {
+  const mesh = mode === "mesh";
+  printOpts.classList.toggle("hidden", ($("ctl-print") as HTMLSelectElement).value !== "on");
+  $("ctl-print-label").textContent = mesh ? "3MF" : "3D print";
+  $("ctl-print-on").textContent = mesh ? "3MF of this mesh" : "watertight solid";
+  $("ctl-print-wrap").title = mesh
+    ? "Also write a 3MF of your mesh's own triangles, painted. Nothing is rebuilt: what you dropped is what prints."
+    : "Rebuild the mesh as one closed, manifold solid a slicer accepts. Slower.";
+  for (const id of ["print-base-wrap", "print-wall-wrap", "print-interior-wrap", "ctl-tex-wrap"])
+    $(id).classList.toggle("hidden", mesh);
+  $("print-size-file-wrap").classList.toggle("hidden", !mesh);
+  const fromFile = mesh && sizeFromFile.checked;
+  if (fromFile) {
+    if (!sizeInput.disabled) sizeInput.dataset.manual = sizeInput.value;
+    sizeInput.disabled = true;
+    const mm = meshLongestMm();
+    sizeInput.value = mm ? mm.toFixed(mm < 100 ? 1 : 0) : "";
+    sizeInput.placeholder = "the mesh's size";
+  } else if (sizeInput.disabled) {
+    sizeInput.disabled = false;
+    sizeInput.value = sizeInput.dataset.manual || String(DEFAULT_PARAMS.printSize);
+  }
+  const colors = parseInt(($("ctl-print-colors") as HTMLSelectElement).value, 10) || 0;
+  $("print-color-res-wrap").classList.toggle("hidden", colors === 0);
+  const res = $<HTMLSelectElement>("ctl-res");
+  ($("res-1536") as HTMLOptionElement).hidden = mesh;
+  if (mesh && res.value === "1536") res.value = "1024";
+  $("res-512").textContent = mesh ? "512 · fast (default)" : "512 · light";
+  $("res-1024").textContent = mesh ? "1024 · detailed, slower" : "1024 · cascade";
+}
+
+// Each mode keeps its own resolution and print settings (a per-viewer convenience).
+interface ModeSettings {
+  res: string;
+  print: string;
+  size: string;
+  sizeFromFile: boolean;
+  colors: string;
+  colorRes: string;
+}
+const MODE_DEFAULTS: Record<Mode, ModeSettings> = {
+  image: { res: "1024", print: "off", size: "100", sizeFromFile: true, colors: "0", colorRes: "1" },
+  mesh: { res: "512", print: "off", size: "100", sizeFromFile: true, colors: "0", colorRes: "1" },
+};
+let modeSettings: Partial<Record<Mode, ModeSettings>> = {};
+try {
+  modeSettings = JSON.parse(localStorage.getItem("studio-mode-settings") || "{}") || {};
+} catch { /* storage unavailable or corrupt: defaults */ }
+
+function saveModeSettings(): void {
+  modeSettings[mode] = {
+    res: ($("ctl-res") as HTMLSelectElement).value,
+    print: ($("ctl-print") as HTMLSelectElement).value,
+    size: sizeInput.disabled ? sizeInput.dataset.manual || String(DEFAULT_PARAMS.printSize) : sizeInput.value,
+    sizeFromFile: sizeFromFile.checked,
+    colors: ($("ctl-print-colors") as HTMLSelectElement).value,
+    colorRes: ($("ctl-print-color-res") as HTMLSelectElement).value,
+  };
+  try { localStorage.setItem("studio-mode-settings", JSON.stringify(modeSettings)); } catch { /* ignore */ }
+}
+
+function restoreModeSettings(m: Mode): void {
+  const s = { ...MODE_DEFAULTS[m], ...modeSettings[m] };
+  ($("ctl-res") as HTMLSelectElement).value = s.res;
+  ($("ctl-print") as HTMLSelectElement).value = s.print;
+  sizeInput.disabled = false;
+  sizeInput.value = s.size;
+  sizeFromFile.checked = s.sizeFromFile;
+  ($("ctl-print-colors") as HTMLSelectElement).value = s.colors;
+  ($("ctl-print-color-res") as HTMLSelectElement).value = s.colorRes;
+}
+
+for (const id of ["ctl-res", "ctl-print", "ctl-print-size", "ctl-print-size-file", "ctl-print-colors", "ctl-print-color-res"])
+  $(id).addEventListener("change", () => {
+    syncPrintOptions();
+    saveModeSettings();
+  });
 syncPrintOptions();
 
 const reportEl = $<HTMLDetailsElement>("print-report");
 /** The server words its advice as CLI flags; say it with this app's control names. */
-function studioWording(warning: string): string {
+function studioWording(warning: string, mesh: boolean): string {
+  if (mesh)
+    // A painted mesh is printed as it is: the advice is about the mesh itself.
+    return warning
+      .replace(/^not watertight/, "your mesh is not watertight")
+      .replace("raise --print-wall or --print-size",
+               'thicken them in your CAD tool, or set a larger "Print size"')
+      .replace(/use --print-base( auto)?( for a wider base)?$/,
+               "the mesh prints as it is: turn it in your slicer or add a base in your CAD tool");
   return warning
     .replace("raise --print-wall or --print-size", 'raise "Minimum wall" or "Print size"')
     .replace("use --print-base auto for a wider base", 'set "Flat base" to auto for a wider base')
     .replace("use --print-base auto", 'set "Flat base" to auto')
     .replace("use --print-base", 'choose a "Flat base"');
 }
-function showPrintReport(report: PrintReport | null | undefined): void {
+function showPrintReport(report: PrintReport | null | undefined, mesh = false): void {
   reportEl.classList.toggle("hidden", !report);
   if (!report) return;
   const badge = $("print-report-badge");
@@ -858,7 +1017,7 @@ function showPrintReport(report: PrintReport | null | undefined): void {
   const list = $("print-report-warnings");
   list.replaceChildren(...report.warnings.map((text) => {
     const li = document.createElement("li");
-    li.textContent = studioWording(text);
+    li.textContent = studioWording(text, mesh);
     return li;
   }));
   reportEl.open = !report.ok; // warnings open by themselves; a clean report stays one line
@@ -924,7 +1083,9 @@ document.addEventListener("click", (e) => {
 exportBtn.addEventListener("click", async () => {
   if (!currentGlb) return;
   if (exportFormat === "3mf" && !current3mf) {
-    toast('This model has no 3MF. Set "3D print" to "watertight solid" and generate again.', "err");
+    toast(mode === "mesh"
+      ? 'This model has no 3MF. Set "3MF" to "3MF of this mesh" and paint again.'
+      : 'This model has no 3MF. Set "3D print" to "watertight solid" and generate again.', "err");
     return;
   }
   const blob = exportFormat === "3mf" ? current3mf! : currentGlb;
@@ -953,10 +1114,22 @@ async function loadRecord(id: string): Promise<void> {
     toast((e as Error).message, "err");
     return;
   }
-  // Gallery records are image generations until spec 34 phase 3 stores painted meshes.
-  applyModeUi("image");
+  const recMode = rec.params.mode ?? "image";
+  applyModeUi(recMode);
+  if (recMode === "mesh" && rec.mesh && rec.meshName) {
+    // The painted mesh's own file and orientation, ready to paint again.
+    try {
+      const m = await readMesh(await rec.mesh.arrayBuffer(), rec.meshName);
+      inputMesh = { ...m, blob: rec.mesh, name: rec.meshName };
+      meshUp = rec.params.meshUp ?? "auto";
+      meshYaw = rec.params.meshYaw ?? 0;
+    } catch {
+      inputMesh = null;
+    }
+    renderMeshInfo();
+  }
   inputImage = rec.input;
-  inputName = rec.name;
+  inputName = recMode === "mesh" ? "photo.png" : rec.name;
   inputPreview.src = URL.createObjectURL(rec.input);
   inputPreview.classList.remove("hidden");
   dropHint.classList.add("hidden");
@@ -965,11 +1138,11 @@ async function loadRecord(id: string): Promise<void> {
   renderViews();
   currentGlb = rec.glb;
   current3mf = rec.model3mf ?? null;
-  showPrintReport(rec.report);
-  currentName = rec.name.replace(/\.[^.]+$/, "") || "model";
+  showPrintReport(rec.report, recMode === "mesh");
+  currentName = (rec.name.replace(/\.[^.]+$/, "") || "model") + (recMode === "mesh" ? "_painted" : "");
   activeId = rec.id;
   setViewerTools(true);
-  setResultCaption(`${rec.name} · ${rec.params.resolution}${viewsLabel(rec.views?.length ?? 0)} · seed ${rec.params.seed}`);
+  setResultCaption(`${rec.name} · ${recMode === "mesh" ? "painted at " : ""}${rec.params.resolution}${viewsLabel(rec.views?.length ?? 0)} · seed ${rec.params.seed}`);
   updateGenerateEnabled();
   await refreshGallery();
 }
@@ -999,7 +1172,7 @@ async function refreshGallery(): Promise<void> {
     meta.className = "gmeta";
     meta.textContent = r.pending
       ? "generating…"
-      : `${r.params.resolution}${r.views?.length ? ` · ${r.views.length + 1}v` : ""}`;
+      : `${r.params.mode === "mesh" ? "mesh · " : ""}${r.params.resolution}${r.views?.length ? ` · ${r.views.length + 1}v` : ""}`;
     item.appendChild(meta);
 
     const delBtn = document.createElement("button");
@@ -1066,14 +1239,19 @@ async function pollHealth(): Promise<void> {
 // ---- server log -> progress (Tauri only) ----
 listen<string>("server-log", (line) => {
   const t = String(line).trim();
-  if (generating && t) progressStage.textContent = t;
+  if (!generating || !t) return;
+  // Painting a mesh: its encode stage is said in words; the rest as the server logs it.
+  if (runningMode === "mesh" && /^\[(mesh|texture-mesh)\]|^\[3\/6\]|shape SLAT encode/.test(t))
+    progressStage.textContent = "Reading your mesh…";
+  else progressStage.textContent = t;
 });
 
 // ---- boot ----
 async function boot(): Promise<void> {
   setViewerTools(false);
+  restoreModeSettings(mode);
   applyModeUi(mode);
-  renderMeshInfo(null);
+  renderMeshInfo();
   await refreshGallery();
   await pollHealth();
   window.setInterval(pollHealth, 4000);

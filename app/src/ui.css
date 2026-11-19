@@ -171,6 +171,10 @@ body {
 }
 .ctl select:focus, .ctl input:focus { outline: none; border-color: var(--accent); }
 .ctl select option { background: var(--panel-2); color: var(--text); }
+.ctl input:disabled { color: var(--muted); cursor: not-allowed; }
+.ctl-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ctl-check { display: inline-flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; }
+.ctl .ctl-check input { margin: 0; padding: 0; }
 
 .primary {
   background: var(--accent); color: #fff; border: none; border-radius: 8px;
@@ -336,4 +340,9 @@ body {
   box-shadow: 0 6px 20px rgba(0,0,0,0.4);
 }
 .toast.err { border-left-color: var(--err); }
+.toast-action {
+  display: block; margin-top: 8px; background: var(--accent); color: #fff; border: none;
+  border-radius: 6px; padding: 5px 10px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.toast-action:hover { background: var(--accent-2); }
 .toast.ok { border-left-color: var(--ok); }

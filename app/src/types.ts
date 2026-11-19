@@ -1,4 +1,8 @@
 // Shared types for Trellis Studio.
+import type { MeshUp, MeshYaw } from "./orient";
+
+/** "image": image -> 3D; "mesh": paint a given mesh (docs/spec/34-studio-texture-mode.md). */
+export type GenMode = "image" | "mesh";
 
 export type Resolution = 512 | 1024 | 1536;
 export type BgRemoval = "auto" | "birefnet" | "threshold";
@@ -41,6 +45,17 @@ export interface GenParams {
   printInterior?: PrintInterior;
   /** Filament colours in the 3MF (server field print_colors): 0 = textured 3MF, else 2..32. */
   printColors?: number;
+  /** Colour detail (server field print_color_res, mm): large triangles painted in parts down to
+   *  this size; 0 = one colour per triangle. Default 1. */
+  printColorRes?: number;
+  /** Absent or "image": image -> 3D. "mesh": paint `GenRecord.mesh` (server task=texture);
+   *  `watertight` then means "write a 3MF of the mesh as it is". */
+  mode?: GenMode;
+  /** Paint a mesh: the file axis that points up, and the quarter turn (server mesh_up / mesh_yaw). */
+  meshUp?: MeshUp;
+  meshYaw?: MeshYaw;
+  /** Paint a mesh: the 3MF at the file's own size (no print_size sent). Default true. */
+  printSizeFromFile?: boolean;
   /** Older records: 0 = keep hollow, anything else = the then default. */
   printSeal?: number;
   /** Multi-view blend sharpness (server field blend_temp; only sent with extra views). */
@@ -70,6 +85,8 @@ export const DEFAULT_PARAMS: GenParams = {
   printWall: 0.8,
   printInterior: "auto",
   printColors: 0,
+  printColorRes: 1,
+  printSizeFromFile: true,
   blendTemp: 2,
   frontAxis: "-y",
 };
@@ -113,6 +130,9 @@ export interface GenRecord {
   params: GenParams;
   input: Blob; // source image (the front view)
   views?: ExtraView[]; // extra views (multi-view); absent on single-image records
+  /** Paint a mesh: the mesh file as dropped, and its name (`name` is the mesh's name too). */
+  mesh?: Blob;
+  meshName?: string;
   glb: Blob | null; // resulting model/gltf-binary; null while pending
   /** The same model as a 3MF (made when "3D print" is on); absent otherwise. */
   model3mf?: Blob | null;

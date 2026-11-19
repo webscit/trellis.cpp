@@ -47,6 +47,8 @@ test("STL binary / ASCII and OBJ give the same box, z-up STL turned to y-up, in 
   for (const [name, data] of cases) {
     const m = await readMesh(data, name);
     assert.equal(m.triangles, 12, name);
+    // size in mm, glTF axes of the file's own convention (an STL's 30 mm height is y)
+    assert.deepEqual(m.size.map((v) => +v.toFixed(3)), m.kind === "stl" ? [40, 30, 20] : [40, 20, 30], name);
     const { json, pos } = inspect(m.preview);
     const acc = json.accessors[0];
     if (m.kind === "stl") {
@@ -66,6 +68,7 @@ test("GLB: read as is, triangle count from the accessors, orientation as a root 
   const m = await readMesh(glb, "x.glb");
   assert.equal(m.kind, "glb");
   assert.equal(m.triangles, 12);
+  assert.deepEqual(m.size.map((v) => +v.toFixed(3)), [40, 20, 30]);
   assert.equal(m.preview, glb);
   const turned = orientGlb(glb, [0, 0.7071, 0, 0.7071]);
   const { json, pos: p2 } = inspect(turned);

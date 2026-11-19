@@ -107,16 +107,6 @@ export class Viewer {
     this.el.jumpCameraToGoal();
   }
 
-  /** The loaded model's bounding box size in metres (glTF axes: x wide, y up, z towards the front). */
-  dimensions(): { x: number; y: number; z: number } | null {
-    try {
-      const d = this.el.getDimensions();
-      return d && isFinite(d.x) ? { x: d.x, y: d.y, z: d.z } : null;
-    } catch {
-      return null;
-    }
-  }
-
   /**
    * Pin `marker` to the middle of the model's front face (+z, where the default camera
    * looks from), or remove it with null.

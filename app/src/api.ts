@@ -2,12 +2,14 @@
 //   GET  /health   -> "ok"
 //   POST /jobs      same form as /generate -> 202 {"id"}; GET /jobs/{id} -> status;
 //                   GET /jobs/{id}/result -> GLB; DELETE /jobs/{id} cancels / frees.
+//   POST /jobs task=texture + a "mesh" part: paint that mesh (docs/spec/34-studio-texture-mode.md).
 //   POST /generate  multipart: image file + seed/resolution/bg_removal/uv/texture fields;
 //                   multi-view: one "image" part per view (front first) + "azimuths" and
 //                   "elevations" (comma lists, one entry per image) + blend_temp/front_axis
 //                   -> model/gltf-binary, or JSON {"error": "..."} on failure.
 
 import { apiBase, loadConfig } from "./config";
+import { orientFields } from "./orient";
 import { AUTO_AZ, DEFAULT_PARAMS, type ExtraView, type GenParams, type PrintReport } from "./types";
 
 async function base(): Promise<string> {
@@ -115,9 +117,22 @@ export async function toPng(image: Blob): Promise<Blob> {
   }
 }
 
+/** The mesh to paint ("Paint a mesh"): the file as dropped, sent under its own name. */
+export interface MeshInput {
+  blob: Blob;
+  name: string;
+}
+
 /** trellis-server maps bg_removal: "auto" keeps the server default (no field). */
-function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
+function toForm(image: Blob, p: GenParams, views: ExtraView[], mesh?: MeshInput): FormData {
   const fd = new FormData();
+  if (mesh) {
+    // POST /jobs task=texture (docs/spec/34-studio-texture-mode.md): the mesh keeps its
+    // triangles; the server sniffs the format and needs the extension only for its log.
+    fd.append("task", "texture");
+    fd.append("mesh", mesh.blob, mesh.name);
+    for (const [k, v] of Object.entries(orientFields(p.meshUp ?? "auto", p.meshYaw ?? 0))) fd.append(k, v);
+  }
   fd.append("image", image, "input.png");
   if (views.length) {
     views.forEach((v, i) => fd.append("image", v.image, `view${i + 1}.png`));
@@ -135,6 +150,22 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
   fd.append("resolution", String(p.resolution));
   if (p.bgRemoval !== "auto") fd.append("bg_removal", p.bgRemoval);
   fd.append("uv", p.uv);
+  const colors = p.printColors ?? DEFAULT_PARAMS.printColors!;
+  const colorFields = () => {
+    if (colors <= 0) return;
+    fd.append("print_colors", String(colors));
+    fd.append("print_color_res", String(p.printColorRes ?? DEFAULT_PARAMS.printColorRes));
+  };
+  if (mesh) {
+    // "3MF of this mesh": the input triangles as they are, no watertight rebuild (the server
+    // refuses watertight / print_base here); its size is the file's unless one is given.
+    if (p.watertight) {
+      fd.append("3mf", "on");
+      if (p.printSizeFromFile === false) fd.append("print_size", String(p.printSize ?? DEFAULT_PARAMS.printSize));
+      colorFields();
+    }
+    return fd;
+  }
   if (!p.texture) fd.append("texture", "off");
   if (p.watertight) {
     fd.append("watertight", "on");
@@ -143,8 +174,7 @@ function toForm(image: Blob, p: GenParams, views: ExtraView[]): FormData {
     fd.append("print_base", p.printBase ?? DEFAULT_PARAMS.printBase!);
     fd.append("print_wall", String(p.printWall ?? DEFAULT_PARAMS.printWall));
     fd.append("print_interior", p.printInterior ?? DEFAULT_PARAMS.printInterior!);
-    const colors = p.printColors ?? DEFAULT_PARAMS.printColors!;
-    if (colors > 0) fd.append("print_colors", String(colors));
+    colorFields();
   }
   return fd;
 }
@@ -210,12 +240,20 @@ export async function generate(
   views: ExtraView[] = [],
   signal?: AbortSignal,
   hooks: GenerateHooks = {},
+  mesh?: MeshInput,
 ): Promise<GenerateResult> {
   const pngs = await Promise.all([image, ...views.map((v) => v.image)].map(prepareImage));
-  const form = () => toForm(pngs[0], params, views.map((v, i) => ({ ...v, image: pngs[i + 1] })));
+  const form = () => toForm(pngs[0], params, views.map((v, i) => ({ ...v, image: pngs[i + 1] })), mesh);
   const url = await base();
 
   const sub = await fetch(`${url}/jobs`, { method: "POST", body: form(), signal });
+  if (mesh && (sub.status === 404 || sub.status === 405 || sub.status === 400)) {
+    // A server from before texture-only mode answers task=texture with 400 or has no /jobs.
+    const msg = await errorOf(sub, "");
+    if (sub.status !== 400 || /task must be/.test(msg))
+      throw new Error("This trellis-server can't paint meshes yet — update trellis.cpp.");
+    throw new Error(msg || `painting failed (HTTP ${sub.status})`);
+  }
   if (sub.status === 404 || sub.status === 405) {
     // Server predates the job API: one synchronous request.
     const res = await fetch(`${url}/generate`, { method: "POST", body: form(), signal });

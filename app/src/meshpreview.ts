@@ -13,6 +13,20 @@ export interface MeshFile {
   triangles: number;
   /** A GLB of the file in its own convention (STL z-up turned to glTF y-up), in metres. */
   preview: ArrayBuffer;
+  /** Bounding box size in mm, glTF axes of the file's own convention (x wide, y up, z depth).
+   *  STL / OBJ units are read as millimetres, glTF as metres; a GLB's node transforms are
+   *  ignored (exact for TRELLIS output). */
+  size: [number, number, number];
+}
+
+function extent(pos: Float32Array): [number, number, number] {
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < pos.length; i += 3)
+    for (let a = 0; a < 3; a++) {
+      lo[a] = Math.min(lo[a], pos[i + a]);
+      hi[a] = Math.max(hi[a], pos[i + a]);
+    }
+  return [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
 }
 
 export const MESH_EXT = /\.(stl|obj|glb)$/i;
@@ -28,7 +42,7 @@ export async function readMesh(data: ArrayBuffer, name: string): Promise<MeshFil
   const isGlb = bytes.length >= 12 && String.fromCharCode(...bytes.subarray(0, 4)) === "glTF";
   const kind: MeshKind | null = isGlb ? "glb" : meshKind(name);
   if (!kind) throw new Error(`"${name}" isn't a mesh — use an STL, OBJ or GLB file.`);
-  if (kind === "glb") return { kind, triangles: glbTriangles(data, name), preview: data };
+  if (kind === "glb") return { kind, ...glbInfo(data, name), preview: data };
   const { pos, idx } = kind === "stl" ? parseStl(data, name) : parseObj(data, name);
   const tris = idx ? idx.length / 3 : pos.length / 9;
   if (!tris) throw new Error(`"${name}" has no triangles.`);
@@ -39,7 +53,8 @@ export async function readMesh(data: ArrayBuffer, name: string): Promise<MeshFil
     const v = applyMap(m, [pos[i], pos[i + 1], pos[i + 2]]);
     pos[i] = v[0] / 1000; pos[i + 1] = v[1] / 1000; pos[i + 2] = v[2] / 1000;
   }
-  return { kind, triangles: tris, preview: writeGlb(pos, idx) };
+  const size = extent(pos).map((v) => v * 1000) as [number, number, number];
+  return { kind, triangles: tris, preview: writeGlb(pos, idx), size };
 }
 
 function bad(name: string, what: string): Error {
@@ -107,7 +122,7 @@ interface GltfJson {
   scenes?: { nodes?: number[] }[];
   nodes?: Record<string, unknown>[];
   meshes?: { primitives: { mode?: number; indices?: number; attributes: Record<string, number> }[] }[];
-  accessors?: { count: number }[];
+  accessors?: { count: number; min?: number[]; max?: number[] }[];
   [k: string]: unknown;
 }
 
@@ -134,17 +149,26 @@ function splitGlb(data: ArrayBuffer, name: string): { json: GltfJson; bin: Uint8
   return { json, bin };
 }
 
-function glbTriangles(data: ArrayBuffer, name: string): number {
+/** Triangles, and the size in mm from the POSITION accessors' min / max (required by glTF). */
+function glbInfo(data: ArrayBuffer, name: string): { triangles: number; size: [number, number, number] } {
   const { json } = splitGlb(data, name);
   let n = 0;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const mesh of json.meshes ?? [])
     for (const p of mesh.primitives ?? []) {
       if ((p.mode ?? 4) !== 4) continue;
       const acc = json.accessors?.[p.indices ?? p.attributes?.POSITION ?? -1];
       if (acc) n += Math.floor(acc.count / 3);
+      const pa = json.accessors?.[p.attributes?.POSITION ?? -1];
+      if (pa?.min && pa?.max)
+        for (let a = 0; a < 3; a++) {
+          lo[a] = Math.min(lo[a], pa.min[a]);
+          hi[a] = Math.max(hi[a], pa.max[a]);
+        }
     }
   if (!n) throw bad(name, "no triangles");
-  return n;
+  const size = [0, 1, 2].map((a) => (hi[a] > lo[a] ? (hi[a] - lo[a]) * 1000 : 0)) as [number, number, number];
+  return { triangles: n, size };
 }
 
 const pad4 = (n: number) => (n + 3) & ~3;

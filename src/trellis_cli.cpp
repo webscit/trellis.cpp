@@ -374,24 +374,20 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::MeshOrient orient;
         trellis::parse_mesh_up(cfg.mesh_up, orient.up);   // validated by the argument parsers
         orient.yaw = cfg.mesh_yaw;
-        if (!trellis::load_mesh(path, refine_in, err, orient)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
+        // Thrown, not returned: trellis-server passes the text on to the client.
+        if (!trellis::load_mesh(path, refine_in, err, orient)) throw std::runtime_error(err);
         orient_undo = trellis::mesh_orient_undo_grid(path, orient);
         printf("[mesh] %s: up %s, turn %d deg; the file's %s side faces the front\n", path.c_str(),
                cfg.mesh_up.c_str(), cfg.mesh_yaw, trellis::mesh_front_axis(path, orient).c_str());
-        if (!trellis::normalize_mesh_trellis(refine_in, refine_norm)) {
-            fprintf(stderr, "[trellis] %s: degenerate mesh (empty or zero extent): %s\n",
-                    texmesh ? "--texture-mesh" : "--refine-mesh", path.c_str());
-            return 1;
-        }
+        if (!trellis::normalize_mesh_trellis(refine_in, refine_norm))
+            throw std::runtime_error("the mesh is empty or flat (zero extent): " + path);
         FILE* ef = fopen((M + "/shape_enc.gguf").c_str(), "rb");
         const bool have_enc = ef != nullptr;
         if (ef) fclose(ef);
         if (texmesh) {
-            if (!have_enc) {
-                fprintf(stderr, "[trellis] --texture-mesh needs %s/shape_enc.gguf (convert it with"
-                                " tools/convert.py shape_enc)\n", M.c_str());
-                return 1;
-            }
+            if (!have_enc)
+                throw std::runtime_error("painting a mesh needs " + M + "/shape_enc.gguf (convert it with"
+                                         " tools/convert.py shape_enc)");
             // STL / OBJ carry no unit: read as millimetres. glTF is in metres.
             const std::string ext = path.size() >= 4 ? path.substr(path.size() - 4) : path;
             const bool gltf = ext == ".glb" || ext == "gltf" || ext == ".GLB" || ext == "GLTF";
@@ -728,11 +724,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // Upstream has no token cap here. Past the cascade's cap the texture flow's attention
         // may not fit, and the run is long anyway: stop with the remedy instead.
         const int ntok = (int)texmesh_lat.coords.size();
-        if (ntok > cfg.max_tokens) {
-            fprintf(stderr, "[trellis] --texture-mesh: %d texture tokens at res %d exceeds --max-tokens %d;"
-                            " use --res 512\n", ntok, refine_R, cfg.max_tokens);
-            return 1;
-        }
+        if (ntok > cfg.max_tokens)
+            throw std::runtime_error("this mesh gives " + std::to_string(ntok) + " texture tokens at res " +
+                                     std::to_string(refine_R) + ", more than --max-tokens " +
+                                     std::to_string(cfg.max_tokens) + "; use --res 512");
         if (ntok > 16384 && refine_R > 512)
             printf("      [warn] %d texture tokens: the texture flow will be slow; --res 512 has ~4x fewer\n", ntok);
         if (pose_on) {

@@ -1,8 +1,8 @@
 # 34 — Studio: paint a mesh
 
-Status: phases 1–2 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below; the Studio
-mode switch, mesh slot and turned preview). Phases 3–4 open: until phase 3 the "Paint mesh"
-button stays disabled.
+Status: phases 1–3 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below; the Studio
+mode switch, mesh slot and turned preview; the paint request, records, print options, 512
+default and "Retry at 512"). Phase 4 (user docs) open.
 
 Brings texture-only mode (spec 33, `POST /jobs` with `task=texture`) to Trellis Studio. The
 user drops an STL / OBJ / GLB and a photo, turns the mesh until the photo's side faces the
@@ -176,8 +176,22 @@ generation. `waitForJob` is unchanged (result, 3MF, report).
    up −Z shows it upside down; the marker sits on the front face; an OBJ dropped on the
    gallery switches modes; a junk STL keeps the previous mesh with an error.
 3. **Requests, records, print options (D, both modes' colour detail), resolution and the
-   retry.** End to end against `trellis-server`: the torus-on-block STL at 512 with 4 colours
-   gives a GLB in the file's orientation, a 3MF at the file's size, and a report.
+   retry** (done). The server now passes texture-mode failures on: an unreadable or flat mesh,
+   a missing `shape_enc.gguf` and the token limit are thrown with their message rather than
+   returned as an exit code (which the server reports as "3D reconstruction failed"); Studio
+   recognises the token limit by its `use --res 512` and offers the retry, which repaints the
+   failed record at 512 whatever is on screen by then. `MeshFile.size` (mm, from the parsed
+   file or a GLB's POSITION min / max) gives the mesh line and "from file" without the viewer.
+   Each mode keeps its own resolution and print settings in `localStorage`.
+   End to end in headless Chromium against a `trellis-server` started with `--max-tokens 6000`:
+   the wedge turned 180° with "3MF of this mesh" and 4 colours, first at 1024, is refused
+   ("it needs 12,024 texture tokens, over this server's limit of 6,000") with **Retry at
+   512**, which paints it: the server logs `turn 180 deg`, a 3MF at the file's 40 mm, 4
+   filaments with 1 mm split painting, and the report says "Ready to print"; the gallery item
+   (`mesh · 512`) reopens in "Paint a mesh" with the wedge and its 180° turn. The torus-on-block
+   STL and a photo dropped together on the photo zone fill both slots; with "from file"
+   unticked at 80 mm the 3MF is 80 mm and the report says "your mesh is not watertight" and
+   flags its two shells. Image mode keeps 1024 and its own print settings throughout.
 4. **Docs:** `docs/getting-started.md` gets a "Paint a mesh" section; the README's Studio
    lines and `app/README.md` mention it.
 
