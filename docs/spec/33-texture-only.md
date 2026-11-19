@@ -1,6 +1,7 @@
 # 33 — Texture-only mode (`--texture-mesh`)
 
-Status: phases 1–2 done (STL input, decoder tree); phases 3–5 to do.
+Status: phases 1–3 done (STL input, decoder tree, `--texture-mesh` / `POST /texture` with the
+bake onto the input and a 3MF of the input triangles). Open: phase 5's finer print colours.
 
 Paints an existing mesh from one or more images, **without changing its geometry**. This is
 upstream TRELLIS.2's `Trellis2TexturingPipeline` (`trellis2/pipelines/trellis2_texturing.py`),
@@ -101,22 +102,46 @@ The texture flow's concat input is the normalised shape latent (`slat_norm` in
    [gpu]` checks the invariant and the rejection, then runs `tex_decode` on the tree and checks
    for one finite row per fine voxel. Phase 3 feeds `tex_decode` the flow's texture latent and
    pairs its rows with `DecodeTree::coords` for the `VoxelPbr`.
-3. **CLI / server.** `--texture-mesh PATH` (exclusive with `--refine-mesh`), `POST /texture`.
-   Needs `shape_enc.gguf` (no voxel fallback: the flow needs a real shape latent). Reuses the
-   refine branch's view handling (yaw offset, auto azimuth, multi-view tex blend,
-   `--mv-visibility`). Keeps the input mesh. Rejects `--faces`, `--remesh`, `--retopo`,
-   `--watertight`; ignores `--tex-res` with a notice. Warns when the token count is high and
-   suggests `--res 512` (no silent drop).
-4. **Bake onto the input mesh.** `uv_bake(input verts/faces, VoxelPbr{coords, feats, R})`, no
-   BVH snap (the surface is the true one). If xatlas is too slow on million-face inputs, fall
-   back to `uv_chart_project`. Check: every output vertex maps to an input vertex within ~1e-5
-   of the extent.
-5. **Printing.** `--3mf` in this mode writes the input triangles as they are (no watertight
-   rebuild), audit + report only, keeps the file's mm scale. `--print-colors` is one colour per
-   triangle today, which is coarse on CAD triangles: first subdivide large flat triangles by
-   edge length (exact geometrically); later, Orca `paint_color` split states.
+3. **CLI / server** (done). `--texture-mesh PATH`, `POST /texture`, `"task"=texture` on
+   `/jobs`, `mesh_up` field. In `trellis_run` it is a third branch next to refine:
+   - [3/6] voxelise with duals, `shape_encode`, `decode_tree_from_fine`; the pose check runs on
+     the mesh's voxels.
+   - [4/7] no shape flow: `slat_norm = (raw − SHAPE_MEAN) / SHAPE_STD` on the latent coords.
+   - [5/7] no shape decode: `mesh` is the input, `so.coords` / `so.subs` come from the tree, so
+     the texture stage runs unchanged (`tex_flow_512` + cond 512 at R = 512, else
+     `tex_flow_1024` + cond 1024; never the mixed-resolution path).
+   - Needs `shape_enc.gguf` (no voxel fallback). Past `--max-tokens` the run stops and suggests
+     `--res 512`; above 16,384 tokens at 1024 it warns.
+   - `apply_texture_mesh_rules` (CLI and server) refuses `--refine-mesh`, `--model pixal3d`,
+     `--no-texture`, `--retopo`, explicit `--watertight`, `--print-base`, `--faces` /
+     `--decim`, `--normal-map`, `--dump-post`, and drops the watertight rebuild that `--3mf`
+     implies. `--tex-res` is ignored with a notice.
+4. **Bake onto the input mesh** (done). The [7/7] weld / hole fill / remesh / decimation are
+   skipped; the input triangles are unwrapped (`--xatlas`, the default, or `--box-uv`) and baked
+   from `VoxelPbr{tree coords, PBR, R}` with no BVH snap. The output is restored to the input's
+   position and size.
+5. **Printing** (partly done). `--3mf` writes the input triangles as they are, at the file's
+   size unless `--print-size` (STL / OBJ units read as millimetres, glTF as metres).
+   **Open:** `--print-colors` is one colour per triangle, which is coarse on CAD triangles:
+   subdivide large flat triangles by edge length first (exact geometrically), or use Orca
+   `paint_color` split states. No printability report is emitted in this mode yet.
 
 ## Validation
+
+Measured (NVIDIA Thor, Vulkan):
+
+| input | res | tokens | fine voxels | wall | geometry check |
+|---|---|---|---|---|---|
+| generated torus-on-block STL, 6,156 facets | 512 | 3,208 | 866,560 | 46 s | same 6,156 triangles, vertices within 4e-8 of the extent |
+| same | 1024 | 13,472 | 3,476,292 | 319 s (texture flow 258 s) | 3MF: the 6,156 input triangles, 60 × 40 × 56 mm z-up, 4 filament colours |
+| goblin GLB generated at 512 (seed 42), repainted from `goblin.png` (seed 7) | 512 | 3,402 | 2,148,266 | 62 s | same 141,168 triangles, vertices within 4.5e-8 |
+
+The repainted goblin matches the generated one in a four-view render: helmet, armour, belt,
+buckle, loincloth and skin land in the same places, a little more saturated. The torus,
+painted from the goblin image, takes coherent armour / skin patches and stands upright (z-up
+handled). `POST /texture` with the STL returns the GLB; `watertight=on`, `faces` and a missing
+mesh answer 400. The renderer-based colour-error comparison with `--refine-mesh` (item 2 below)
+is not done yet.
 
 1. Coordinate-set identity (phase 2), CPU and Vulkan.
 2. Strip the texture from a generated GLB, retexture it from its source image, and score it with

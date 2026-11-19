@@ -169,6 +169,11 @@ struct TrellisParams {
     int         refine_coords  = -1; // --refine-coords auto|encoder|voxel (-1 auto, 0 voxel, 1 encoder)
     bool        refine_restore = true;  // --refine-restore-transform on|off
 
+    // ---- texture-only mode (--texture-mesh, docs/spec/33-texture-only.md) ----
+    std::string texture_mesh;        // --texture-mesh in.stl|in.obj|in.glb: paint this mesh, keep its geometry
+    bool watertight_explicit = false;   // --watertight given (as opposed to implied by --3mf)
+    bool print_size_set      = false;   // --print-size given (texture-only keeps the file's size otherwise)
+
     bool help = false;          // --help requested
 
     // 512 -> light single-res path; 1024/1536 -> cascade with that HR target.
@@ -228,6 +233,11 @@ bool check_faces_compat(const TrellisParams& p, std::string& error);
 bool parse_print_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error);
 // Watertight output needs the QEM path (or --decim 0): cluster decimation tears the surface.
 bool check_print_compat(const TrellisParams& p, std::string& error);
+
+// --texture-mesh: rejects the options that would change or rebuild the geometry, and drops the
+// watertight rebuild that --3mf implies (the input triangles are written as they are). No-op
+// without --texture-mesh. Shared by the CLI and trellis-server.
+bool apply_texture_mesh_rules(TrellisParams& p, std::string& error);
 
 // ---- UV atlas size (--atlas / server field "atlas") ----
 // Side length in px of the square textures baked onto the mesh (base color + metallic/

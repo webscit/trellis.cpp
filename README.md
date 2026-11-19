@@ -277,7 +277,7 @@ only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `pri
 
 ### Mesh refinement
 
-`--refine-mesh in.glb|in.obj` re-generates an existing mesh from one or more views. The mesh's
+`--refine-mesh in.glb|in.obj|in.stl` re-generates an existing mesh from one or more views. The mesh's
 voxels fix the shape SLAT's coordinates; the shape and texture are re-sampled, blended over the
 views. The sparse-structure and LR stages are skipped.
 
@@ -294,6 +294,30 @@ python tools/convert.py shape_enc` from `ckpts/shape_enc_next_dc_f16c32_fp16.*` 
 `--refine-restore-transform off`). See
 [`docs/spec/31-mesh-refine.md`](docs/spec/31-mesh-refine.md).
 
+### Texture-only mode
+
+`--texture-mesh in.stl|in.obj|in.glb` paints an existing mesh from one or more views and
+**keeps its triangles**: no shape is generated, nothing is remeshed or decimated. This is
+upstream's `Trellis2TexturingPipeline`. The mesh goes through the shape VAE encoder
+(`shape_enc.gguf`, see above), the texture flow runs on that latent, and the PBR volume is
+baked onto the input triangles.
+
+```bash
+trellis-cli --texture-mesh part.stl --view photo.png:0 -o painted.glb --res 512 \
+            --3mf painted.3mf --print-colors 4
+```
+
+- `--res 512` uses the 512 texture flow, anything else the 1024 one (as upstream). Dense
+  meshes give many texture tokens at 1024; the run stops past `--max-tokens` and suggests 512.
+- STL files are z-up by default (`--mesh-up auto|y|z`); OBJ and glTF are y-up.
+- The output keeps the input's position and size. `--3mf` writes the input triangles (no
+  watertight rebuild) at the file's size (STL/OBJ units read as millimetres, glTF as metres)
+  unless `--print-size` is given.
+- `--watertight`, `--faces`, `--decim`, `--print-base`, `--normal-map`, `--retopo` and
+  `--refine-mesh` are refused.
+
+See [`docs/spec/33-texture-only.md`](docs/spec/33-texture-only.md).
+
 ### trellis-server
 
 `trellis-server` keeps the process resident (no Vulkan re-init per request) and exposes:
@@ -307,11 +331,13 @@ POST /generate      multipart/form-data with an "image" file part; optional text
                     Multi-view: repeat the "image" part and add "azimuths" (one per
                     image, comma-separated; degrees or names) and optionally
                     "elevations", "blend_temp", "front_axis", "yaw_offset".
-POST /refine        a "mesh" part (GLB or OBJ) + one or more "image" parts and the
-                    same fields, plus "refine_coords" (auto|encoder|voxel) and
-                    "restore_transform" (on|off).
-POST /jobs          asynchronous form of the two above: same fields ("task"=refine for
-                    /refine) -> 202 {"id","status","position"}; errors in the fields
+POST /refine        a "mesh" part (GLB, OBJ or STL) + one or more "image" parts and the
+                    same fields, plus "refine_coords" (auto|encoder|voxel),
+                    "restore_transform" (on|off) and "mesh_up" (auto|y|z).
+POST /texture       the /refine form, but paints the mesh and keeps its triangles
+                    (texture-only mode); geometry-changing fields answer 400.
+POST /jobs          asynchronous form of the three above: same fields ("task"=refine or
+                    texture) -> 202 {"id","status","position"}; errors in the fields
                     still answer 400 at once.
 GET  /jobs/{id}     -> {"status": queued|running|done|error, "position", "elapsed", "error"}
 GET  /jobs/{id}/result   -> model/gltf-binary (409 while queued or running)
@@ -328,6 +354,8 @@ curl -F image=@front.png -F image=@back.png -F azimuths=0,180 -F resolution=512 
      http://127.0.0.1:8080/generate -o out.glb
 curl -F mesh=@rough.glb -F image=@front.png -F image=@back.png -F azimuths=0,180 \
      http://127.0.0.1:8080/refine -o refined.glb
+curl -F mesh=@part.stl -F image=@photo.png -F resolution=512 \
+     http://127.0.0.1:8080/texture -o painted.glb
 
 id=$(curl -s -F image=@front.png -F resolution=1024 http://127.0.0.1:8080/jobs | jq -r .id)
 curl -s http://127.0.0.1:8080/jobs/$id                       # poll until "done"

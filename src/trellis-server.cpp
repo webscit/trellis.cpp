@@ -32,14 +32,19 @@
 //                    auto), "mv_ss" (blend|union|fill), "mv_visibility"
 //                    and "check_views" (on|off). One image and
 //                    no angle fields is exactly the single-image request.
-//   POST /refine      multipart/form-data with a "mesh" file part (GLB or OBJ, detected by
+//   POST /refine      multipart/form-data with a "mesh" file part (GLB, OBJ or STL, detected by
 //                    magic) and one or more "image" parts plus every /generate field
 //                    (angles, blend, seed, resolution, texture, faces, atlas, ...), and
 //                    "refine_coords" (auto|encoder|voxel) and "restore_transform" (on|off).
 //                    Re-generates the mesh from the view(s) on the mesh's own voxels
 //                    (docs/spec/31-mesh-refine.md). model=pixal3d -> 400.
-//   POST /jobs        asynchronous form of the two above (same fields; "task"=refine selects
-//                    /refine) -> 202 {"id","status","position"}. Use it for long runs: the
+//   POST /texture     the /refine form ("mesh" + "image" parts, the same view fields), but paints
+//                    the mesh and keeps its triangles (docs/spec/33-texture-only.md). "3mf"=on
+//                    writes those triangles (no watertight rebuild) at the file's size unless
+//                    "print_size"; "watertight", "faces", "print_base", "normal_map" -> 400.
+//                    "mesh_up" (auto|y|z) for /refine and /texture.
+//   POST /jobs        asynchronous form of the three above (same fields; "task"=refine|texture
+//                    selects /refine or /texture) -> 202 {"id","status","position"}. Use it for long runs: the
 //                    synchronous endpoints hold one request open for the whole run, which a
 //                    browser or proxy may time out (Firefox gives up after 300 s).
 //   GET  /jobs/{id}         -> {"status": queued|running|done|error, "position", "elapsed",
@@ -63,6 +68,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -169,7 +175,7 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     if (req.has_file("watertight")) {
         const std::string& w = req.get_file_value("watertight").content;
         if      (w == "off" || w == "0" || w == "false") p.watertight = false;
-        else if (w == "on"  || w == "1" || w == "true")  p.watertight = true;
+        else if (w == "on"  || w == "1" || w == "true")  { p.watertight = true; p.watertight_explicit = true; }
         else { bad_request(res, "watertight must be on or off"); return false; }
     }
     for (const auto& field : {std::pair<const char*, const char*>{"print_size", "print-size"},
@@ -328,6 +334,7 @@ struct Job {
     enum class State { Queued, Running, Done, Error, Cancelled };
     std::string id;
     bool refine = false;
+    bool texture = false;            // /texture: paint the uploaded mesh (refine is false)
     bool sync = false;               // /generate, /refine: the handler waits and then drops it
     trellis::TrellisParams p;
     std::string stem;
@@ -357,9 +364,10 @@ const char* state_name(Job::State s) {
 // Validates a /generate, /refine or /jobs request into a Job. Returns nullptr with a 400 (or
 // 500) already set on `res`.
 std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& res,
-                              const trellis::TrellisParams& base, bool refine) {
-    if (refine && !req.has_file("mesh")) {
-        json_error(res, 400, "missing 'mesh' file part (GLB or OBJ)");
+                              const trellis::TrellisParams& base, bool refine, bool texture = false) {
+    const bool with_mesh = refine || texture;
+    if (with_mesh && !req.has_file("mesh")) {
+        json_error(res, 400, "missing 'mesh' file part (GLB, OBJ or STL)");
         return nullptr;
     }
     if (!req.has_file("image")) {
@@ -370,6 +378,7 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
 
     auto job = std::make_shared<Job>();
     job->refine = refine;
+    job->texture = texture;
     job->n_images = images.size();
     // Per-request params start from the launch defaults, then apply overrides.
     trellis::TrellisParams& p = job->p;
@@ -383,7 +392,7 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
             bad_request(res, "at most " + std::to_string(trellis::kMaxViews) + " images are supported");
             return nullptr;
         }
-        if ((images.size() > 1 || refine) && p.family == trellis::ModelFamily::Pixal3D) {
+        if ((images.size() > 1 || with_mesh) && p.family == trellis::ModelFamily::Pixal3D) {
             bad_request(res, "--model pixal3d does not support multi-view conditioning (--view) or --refine-mesh yet;"
                              " use --model trellis, or pass a single image.");
             return nullptr;
@@ -391,9 +400,23 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
     }
 
     std::string mesh_bytes;
-    if (refine) {
+    if (with_mesh) {
         mesh_bytes = req.get_file_value("mesh").content;
         if (mesh_bytes.size() < 4) { bad_request(res, "mesh part is empty"); return nullptr; }
+        if (req.has_file("mesh_up")) {
+            const std::string& v = req.get_file_value("mesh_up").content;
+            if      (v == "auto") p.mesh_up = -1;
+            else if (v == "y")    p.mesh_up = 0;
+            else if (v == "z")    p.mesh_up = 1;
+            else { bad_request(res, "mesh_up must be auto, y or z"); return nullptr; }
+        }
+    }
+    if (texture) {
+        p.texture_mesh = "pending";   // the staged path is set below
+        std::string error;
+        if (!trellis::apply_texture_mesh_rules(p, error)) { bad_request(res, error); return nullptr; }
+    }
+    if (refine) {
         if (req.has_file("refine_coords")) {
             const std::string& v = req.get_file_value("refine_coords").content;
             if      (v == "auto")    p.refine_coords = -1;
@@ -435,10 +458,16 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
     p.output = stem + ".glb";
     if (!p.out_3mf.empty()) p.out_3mf = stem + ".3mf";
     if (p.watertight) p.print_report = stem + ".print.json";
-    if (refine) {
-        // Detected by magic: binary glTF, else treated as OBJ text (load_mesh re-checks).
-        p.refine_mesh = stem + (mesh_bytes.compare(0, 4, "glTF") == 0 ? "_mesh.glb" : "_mesh.obj");
-        job->staged.push_back(p.refine_mesh);
+    if (with_mesh) {
+        // Detected by content: binary glTF; binary STL (84 + 50 * facet count bytes) or ASCII STL
+        // ("solid"); else OBJ text. load_mesh re-checks.
+        uint32_t nf = 0;
+        if (mesh_bytes.size() >= 84) std::memcpy(&nf, mesh_bytes.data() + 80, 4);
+        const bool stl = (mesh_bytes.size() >= 84 && mesh_bytes.size() == 84 + 50ull * nf) ||
+                         mesh_bytes.compare(0, 5, "solid") == 0;
+        const std::string path = stem + (mesh_bytes.compare(0, 4, "glTF") == 0 ? "_mesh.glb" : stl ? "_mesh.stl" : "_mesh.obj");
+        (texture ? p.texture_mesh : p.refine_mesh) = path;
+        job->staged.push_back(path);
         job->bytes.push_back(std::move(mesh_bytes));
     }
     return job;
@@ -455,7 +484,7 @@ void execute(Job& job) {
         }
     }
     fprintf(stderr, "[trellis-server] %s %s: %zu image(s), %zu-byte first image, seed %u, res %s, bg %s, uv %s, faces %d, atlas %s, webp %s, texture %s\n",
-            job.refine ? "refine" : "generate", job.id.c_str(), job.n_images, job.bytes[0].size(), p.seed,
+            job.texture ? "texture" : job.refine ? "refine" : "generate", job.id.c_str(), job.n_images, job.bytes[0].size(), p.seed,
             p.cascade ? std::to_string(p.hr_res).c_str() : "512",
             p.birefnet < 0 ? "auto" : (p.birefnet ? "birefnet" : "threshold"), p.xatlas ? "xatlas" : "box",
             trellis::qem_face_target(p), p.tex > 0 ? std::to_string(p.tex).c_str() : "auto",
@@ -657,8 +686,8 @@ int main(int argc, char** argv) {
     // /generate and /refine: synchronous -- queue the job and hold the connection until it is
     // done. Kept for curl and older clients; a long run can outlast a browser's or proxy's
     // response timeout, which is what /jobs avoids.
-    auto run_sync = [&](const httplib::Request& req, httplib::Response& res, bool refine) {
-        auto job = make_job(req, res, base, refine);
+    auto run_sync = [&](const httplib::Request& req, httplib::Response& res, bool refine, bool texture = false) {
+        auto job = make_job(req, res, base, refine, texture);
         if (!job) return;
         job->sync = true;
         queue.submit(job);
@@ -669,19 +698,21 @@ int main(int argc, char** argv) {
     };
     svr.Post("/generate", [&](const httplib::Request& req, httplib::Response& res) { run_sync(req, res, false); });
     svr.Post("/refine",   [&](const httplib::Request& req, httplib::Response& res) { run_sync(req, res, true); });
+    svr.Post("/texture",  [&](const httplib::Request& req, httplib::Response& res) { run_sync(req, res, false, true); });
 
     // Asynchronous jobs: POST /jobs takes the /generate form (plus "task"=refine with a "mesh"
     // part for /refine) and answers 202 {"id",...} at once; GET /jobs/{id} reports
     // queued (with position) / running / done / error; GET /jobs/{id}/result returns the GLB;
     // DELETE /jobs/{id} cancels a queued job or frees a finished one.
     svr.Post("/jobs", [&](const httplib::Request& req, httplib::Response& res) {
-        bool refine = false;
+        bool refine = false, texture = false;
         if (req.has_file("task")) {
             const std::string& t = req.get_file_value("task").content;
             if      (t == "refine")   refine = true;
-            else if (t != "generate") { json_error(res, 400, "task must be generate or refine"); return; }
+            else if (t == "texture")  texture = true;
+            else if (t != "generate") { json_error(res, 400, "task must be generate, refine or texture"); return; }
         }
-        auto job = make_job(req, res, base, refine);
+        auto job = make_job(req, res, base, refine, texture);
         if (!job) return;
         queue.submit(job);
         res.status = 202;

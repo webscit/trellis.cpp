@@ -75,6 +75,7 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
     if (name == "print-size") {
         if (!number || n <= 0) { error = "print-size must be a positive number of millimetres"; return false; }
         p.print_size = n;
+        p.print_size_set = true;
     } else if (name == "print-base") {
         if (!number || n < 0 || n > 0.5f) { error = "print-base must be a fraction from 0 to 0.5, or auto"; return false; }
         p.print_base = n;
@@ -96,6 +97,23 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
         if (!number || n < 0) { error = "print-wall must be a nonnegative number of millimetres"; return false; }
         p.print_wall = n;
     }
+    return true;
+}
+
+bool apply_texture_mesh_rules(TrellisParams& p, std::string& error) {
+    if (p.texture_mesh.empty()) return true;
+    const char* bad = nullptr;
+    if (!p.refine_mesh.empty())              bad = "--refine-mesh (pick one: --refine-mesh re-generates the shape, --texture-mesh keeps it)";
+    else if (p.family == ModelFamily::Pixal3D) bad = "--model pixal3d";
+    else if (!p.texture)                     bad = "--no-texture";
+    else if (p.retopo)                       bad = "--retopo";
+    else if (p.watertight_explicit)          bad = "--watertight (the input triangles are kept as they are)";
+    else if (p.print_base != 0.0f)           bad = "--print-base (it would cut the input geometry)";
+    else if (p.faces > 0 || p.decim >= 0)    bad = "--faces / --decim (the input triangles are kept as they are)";
+    else if (p.normal_map)                   bad = "--normal-map (there is no dense shell to bake it from)";
+    else if (!p.dump_post.empty())           bad = "--dump-post";
+    if (bad) { error = std::string("--texture-mesh cannot be combined with ") + bad; return false; }
+    p.watertight = false;   // implied by --3mf only: the 3MF gets the input triangles
     return true;
 }
 
@@ -200,7 +218,8 @@ bool resolve_views(const TrellisParams& p, std::vector<ViewSpec>& out, std::stri
     if (!p.image.empty()) v.push_back(ViewSpec{ p.image, 0.0f, 0.0f });
     for (const ViewSpec& s : p.views) v.push_back(s);
     if (v.empty()) {
-        error = p.refine_mesh.empty() ? "no input image (give <image.png>, --image or --view)"
+        error = !p.texture_mesh.empty() ? "--texture-mesh needs at least one view image (--image or --view)"
+              : p.refine_mesh.empty() ? "no input image (give <image.png>, --image or --view)"
                                       : "--refine-mesh needs at least one view image (--image or --view)";
         return false;
     }
@@ -286,6 +305,10 @@ void print_usage(const char* argv0, bool server) {
         "      --refine-restore-transform on|off\n"
         "                          map the refined mesh back to the input's position and scale\n"
         "                          (default on)\n"
+        "      --texture-mesh PATH paint an existing mesh (.stl/.obj/.glb/.gltf) from the view(s),\n"
+        "                          keeping its triangles (needs shape_enc.gguf). --res 512 uses the\n"
+        "                          512 texture flow, otherwise 1024. --3mf writes the input triangles\n"
+        "                          (no watertight rebuild) at the file's size unless --print-size\n"
         "      --mesh-up A         up axis of the input mesh: auto (default: z for .stl, y for\n"
         "                          .glb/.gltf/.obj) | y | z\n"
         "      --copyright TEXT    glTF asset.copyright metadata\n"
@@ -459,6 +482,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   std::string error;
                                                   if (!parse_mv_stages(v, p.mv_stages, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; } }
         else if (a == "--refine-mesh")          { const char* v = need(a.c_str()); if (!v) return false; p.refine_mesh = v; }
+        else if (a == "--texture-mesh")         { const char* v = need(a.c_str()); if (!v) return false; p.texture_mesh = v; }
         else if (a == "--mesh-up")              { const char* v = need(a.c_str()); if (!v) return false;
                                                   if      (std::strcmp(v, "auto") == 0) p.mesh_up = -1;
                                                   else if (std::strcmp(v, "y") == 0)    p.mesh_up = 0;
@@ -524,7 +548,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   if      (std::strcmp(v,"on")==0  || std::strcmp(v,"1")==0 || std::strcmp(v,"true")==0)  p.normal_map = 1;
                                                   else if (std::strcmp(v,"off")==0 || std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0) p.normal_map = 0;
                                                   else { fprintf(stderr, "[trellis] --normal-map must be on or off\n"); return false; } }
-        else if (a == "--watertight")           { p.watertight = true; }
+        else if (a == "--watertight")           { p.watertight = true; p.watertight_explicit = true; }
         else if (a == "--3mf")                  { const char* v = need(a.c_str()); if (!v) return false; p.out_3mf = v; p.watertight = true; }
         else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-interior" ||
                  a == "--print-colors" || a == "--print-speck" || a == "--print-color-lift") {
@@ -572,7 +596,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
     }
     {
         std::string error;
-        if (!check_faces_compat(p, error) || !check_print_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
+        if (!check_faces_compat(p, error) || !check_print_compat(p, error) || !apply_texture_mesh_rules(p, error)) {
+            fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
     }
     if (p.print_colors > 0 && p.out_3mf.empty())
         fprintf(stderr, "[trellis] warning: --print-colors only changes the 3MF; add --3mf PATH\n");

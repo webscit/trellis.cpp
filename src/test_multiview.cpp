@@ -296,6 +296,25 @@ static void test_cli() {
     CHECK(parse({ "a.png", "--model", "pixal3d", "--view", "b.png:180" }, p) && !resolve_views(p, vs, err),
           "pixal3d multi-view rejected");
     CHECK(parse({ "a.png", "--model", "pixal3d" }, p) && resolve_views(p, vs, err), "pixal3d single ok");
+
+    // --texture-mesh (docs/spec/33-texture-only.md): --3mf no longer implies the watertight
+    // rebuild, and every option that would change the geometry is refused.
+    CHECK(parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--3mf", "o.3mf", "--mesh-up", "z" }, p) &&
+          p.texture_mesh == "m.stl" && !p.watertight && !p.out_3mf.empty() && p.mesh_up == 1 && !p.print_size_set,
+          "texture-mesh + 3mf: no watertight rebuild");
+    CHECK(parse({ "a.png", "o.glb", "--texture-mesh", "m.stl", "--print-size", "80" }, p) &&
+          p.print_size_set && p.print_size == 80.0f, "texture-mesh print-size");
+    for (const vector<string>& extra : vector<vector<string>>{
+             { "--watertight" }, { "--faces", "5000" }, { "--decim", "0" }, { "--print-base", "0.1" },
+             { "--print-base", "auto" }, { "--no-texture" }, { "--normal-map", "on" }, { "--dump-post", "x.post" },
+             { "--refine-mesh", "r.glb" }, { "--model", "pixal3d" } }) {
+        vector<string> a = { "a.png", "o.glb", "--texture-mesh", "m.stl" };
+        a.insert(a.end(), extra.begin(), extra.end());
+        CHECK(!parse(a, p), "texture-mesh with %s accepted", extra[0].c_str());
+    }
+    CHECK(parse({ "-o", "x.glb", "--texture-mesh", "m.stl" }, p) && !resolve_views(p, vs, err) &&
+          err.find("--texture-mesh") != string::npos, "texture-mesh without a view: %s", err.c_str());
+    CHECK(!parse({ "a.png", "--mesh-up", "x" }, p), "mesh-up x rejected");
     unsigned st = 0;
     CHECK(parse_mv_stages("all", st, err) && st == 7u, "all");
     CHECK(parse_mv_stages("none", st, err) && st == 0u, "none");
