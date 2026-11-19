@@ -1580,6 +1580,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 printf("  watertight: GLB     %s\n",
                        trellis::audit_summary(trellis::audit_mesh(wv.data(), (int64_t)wv.size()/3, wf.data(), (int64_t)wf.size()/3)).c_str());
             }
+            if (texmesh && !cfg.out_3mf.empty()) {
+                // Nothing was rebuilt, so the report audits the input's own triangles (welded
+                // over the UV seams) at the 3MF's size: a mesh that is not watertight is said so.
+                std::vector<float> wv = bm.verts; std::vector<int32_t> wf = bm.faces;
+                trellis::weld_exact(wv, wf);
+                solid_report = trellis::print_report(wv.data(), (int64_t)wv.size()/3, wf.data(), (int64_t)wf.size()/3,
+                                                     print_size, print_up_axis, cfg.print_wall);
+                report_pending = true;
+            }
             if (!cfg.out_3mf.empty()) {
                 const std::vector<float>& pv = bm.verts;   // already z-up (TRELLIS frame)
                 const trellis::PrintTexture ptex{bm.uv.data(), bm.base.data(), bm.T};
@@ -1590,10 +1599,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                     co.count = cfg.print_colors;
                     co.speck_mm2 = cfg.print_speck;
                     co.lift = cfg.print_color_lift;
+                    co.cell_mm = cfg.print_color_res;
                     pcol = trellis::quantize_print_colors(pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
                                                           (int64_t)bm.faces.size()/3, ptex, print_size, co);
-                    printf("  colours: %d filaments, %d patches (specks under %.1f mm2 merged, lift %.2f) in %.1fs\n",
-                           (int)pcol.palette.size(), pcol.patches, cfg.print_speck, cfg.print_color_lift, now() - tc0);
+                    size_t split = 0;
+                    for (const auto& code : pcol.face_code) split += code.size() > 3;   // more than one leaf
+                    printf("  colours: %d filaments, %d patches (specks under %.1f mm2 merged, lift %.2f), %zu triangles"
+                           " painted in parts (cells %.2g mm) in %.1fs\n",
+                           (int)pcol.palette.size(), pcol.patches, cfg.print_speck, cfg.print_color_lift, split,
+                           cfg.print_color_res, now() - tc0);
                     if (report_pending) trellis::set_report_colors(solid_report, pcol);
                 }
                 if (trellis::write_3mf(cfg.out_3mf.c_str(), pv.data(), (int64_t)pv.size()/3, bm.faces.data(),

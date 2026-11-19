@@ -20,7 +20,8 @@
 //                      (mm), "print_interior" (auto|solid|hollow), and "3mf" (on|off; on also builds a textured 3MF, served by
 //                      GET /jobs/{id}/3mf -- /jobs only). "print_colors" (0 or 2..32) makes that
 //                      3MF carry N filament colours instead of the texture (needs 3mf=on); "print_speck" (mm2)
-//                      and "print_color_lift" tune it.
+//                      and "print_color_lift" tune it; "print_color_res" (mm, 0 = whole
+//                      triangles) paints large triangles in parts.
 //                      Returns model/gltf-binary.
 //
 //                    Multi-view (docs/spec/30-multiview.md): send several "image" parts
@@ -181,7 +182,8 @@ bool apply_common_fields(const httplib::Request& req, trellis::TrellisParams& p,
     for (const auto& field : {std::pair<const char*, const char*>{"print_size", "print-size"},
                               {"print_base", "print-base"}, {"print_wall", "print-wall"},
                               {"print_interior", "print-interior"}, {"print_colors", "print-colors"},
-                              {"print_speck", "print-speck"}, {"print_color_lift", "print-color-lift"}}) {
+                              {"print_speck", "print-speck"}, {"print_color_lift", "print-color-lift"},
+                              {"print_color_res", "print-color-res"}}) {
         if (!req.has_file(field.first)) continue;
         std::string error;
         if (!trellis::parse_print_arg(field.second, req.get_file_value(field.first).content.c_str(), p, error)) {
@@ -457,7 +459,7 @@ std::shared_ptr<Job> make_job(const httplib::Request& req, httplib::Response& re
     }
     p.output = stem + ".glb";
     if (!p.out_3mf.empty()) p.out_3mf = stem + ".3mf";
-    if (p.watertight) p.print_report = stem + ".print.json";
+    if (p.watertight || (texture && !p.out_3mf.empty())) p.print_report = stem + ".print.json";
     if (with_mesh) {
         // Detected by content: binary glTF; binary STL (84 + 50 * facet count bytes) or ASCII STL
         // ("solid"); else OBJ text. load_mesh re-checks.

@@ -315,6 +315,10 @@ static void test_cli() {
     CHECK(parse({ "-o", "x.glb", "--texture-mesh", "m.stl" }, p) && !resolve_views(p, vs, err) &&
           err.find("--texture-mesh") != string::npos, "texture-mesh without a view: %s", err.c_str());
     CHECK(!parse({ "a.png", "--mesh-up", "x" }, p), "mesh-up x rejected");
+    CHECK(parse({ "a.png", "o.glb" }, p) && p.print_color_res == 1.0f, "print-color-res default");
+    CHECK(parse({ "a.png", "o.glb", "--print-color-res", "0" }, p) && p.print_color_res == 0.0f, "print-color-res 0");
+    CHECK(parse({ "a.png", "o.glb", "--print-color-res", "0.4" }, p) && p.print_color_res == 0.4f, "print-color-res 0.4");
+    CHECK(!parse({ "a.png", "--print-color-res", "-1" }, p), "print-color-res -1 rejected");
     unsigned st = 0;
     CHECK(parse_mv_stages("all", st, err) && st == 7u, "all");
     CHECK(parse_mv_stages("none", st, err) && st == 0u, "none");

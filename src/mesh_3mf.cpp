@@ -202,10 +202,16 @@ bool write_3mf(const char* path, const float* verts, int64_t V, const int32_t* f
         const int32_t* t = &tris[3 * (size_t)f];
         if (t[0] == t[1] || t[1] == t[2] || t[0] == t[2]) continue;
         if (colored) {
+            // A split code can be thousands of digits: appended, not formatted into `line`.
             const int s = colors->face_slot[f];
+            const std::string& code = colors->face_code.empty() ? paint[s] : colors->face_code[f];
             std::snprintf(line, sizeof line,
-                          "     <triangle v1=\"%d\" v2=\"%d\" v3=\"%d\" pid=\"1\" p1=\"%d\" paint_color=\"%s\"/>\n",
-                          t[0], t[1], t[2], s, paint[s].c_str());
+                          "     <triangle v1=\"%d\" v2=\"%d\" v3=\"%d\" pid=\"1\" p1=\"%d\" paint_color=\"",
+                          t[0], t[1], t[2], s);
+            model += line;
+            model += code;
+            model += "\"/>\n";
+            continue;
         } else if (textured)
             std::snprintf(line, sizeof line,
                           "     <triangle v1=\"%d\" v2=\"%d\" v3=\"%d\" pid=\"2\" p1=\"%d\" p2=\"%d\" p3=\"%d\"/>\n",

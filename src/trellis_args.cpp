@@ -90,6 +90,9 @@ bool parse_print_arg(const std::string& name, const char* value, TrellisParams& 
     } else if (name == "print-speck") {
         if (!number || n < 0) { error = "print-speck must be a nonnegative area in mm2"; return false; }
         p.print_speck = n;
+    } else if (name == "print-color-res") {
+        if (!number || n < 0 || n > 1000) { error = "print-color-res must be from 0 to 1000 mm"; return false; }
+        p.print_color_res = n;
     } else if (name == "print-color-lift") {
         if (!number || n < 0 || n > 2) { error = "print-color-lift must be from 0 to 2"; return false; }
         p.print_color_lift = n;
@@ -403,6 +406,9 @@ void print_usage(const char* argv0, bool server) {
         "                          with them (default 0 = textured 3MF)\n"
         "      --print-speck MM2   with --print-colors: merge colour patches smaller than this\n"
         "                          into a neighbour (default 4; 0 = keep every speck)\n"
+        "      --print-color-res MM  with --print-colors: paint triangles with edges longer than MM\n"
+        "                          in parts (Orca split painting; the triangles stay as they are),\n"
+        "                          down to MM (default 1; 0 = one colour per triangle)\n"
         "      --print-color-lift F  with --print-colors: lift baked-in shadows before choosing\n"
         "                          the palette (default 0.3; 0 = the texture's own tones)\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
@@ -551,7 +557,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--watertight")           { p.watertight = true; p.watertight_explicit = true; }
         else if (a == "--3mf")                  { const char* v = need(a.c_str()); if (!v) return false; p.out_3mf = v; p.watertight = true; }
         else if (a == "--print-size" || a == "--print-base" || a == "--print-wall" || a == "--print-interior" ||
-                 a == "--print-colors" || a == "--print-speck" || a == "--print-color-lift") {
+                 a == "--print-colors" || a == "--print-speck" || a == "--print-color-lift" || a == "--print-color-res") {
             const char* v = need(a.c_str()); if (!v) return false;
             std::string error;
             if (!parse_print_arg(a.substr(2), v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }

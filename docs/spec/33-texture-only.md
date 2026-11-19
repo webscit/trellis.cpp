@@ -1,7 +1,8 @@
 # 33 — Texture-only mode (`--texture-mesh`)
 
-Status: phases 1–3 done (STL input, decoder tree, `--texture-mesh` / `POST /texture` with the
-bake onto the input and a 3MF of the input triangles). Open: phase 5's finer print colours.
+Status: phases 1–5 done (STL input, decoder tree, `--texture-mesh` / `POST /texture`, the bake
+onto the input, a 3MF of the input triangles with split painting and a printability report).
+Split painting is confirmed in Snapmaker Orca 2.4.1.
 
 Paints an existing mesh from one or more images, **without changing its geometry**. This is
 upstream TRELLIS.2's `Trellis2TexturingPipeline` (`trellis2/pipelines/trellis2_texturing.py`),
@@ -120,11 +121,61 @@ The texture flow's concat input is the normalised shape latent (`slat_norm` in
    skipped; the input triangles are unwrapped (`--xatlas`, the default, or `--box-uv`) and baked
    from `VoxelPbr{tree coords, PBR, R}` with no BVH snap. The output is restored to the input's
    position and size.
-5. **Printing** (partly done). `--3mf` writes the input triangles as they are, at the file's
-   size unless `--print-size` (STL / OBJ units read as millimetres, glTF as metres).
-   **Open:** `--print-colors` is one colour per triangle, which is coarse on CAD triangles:
-   subdivide large flat triangles by edge length first (exact geometrically), or use Orca
-   `paint_color` split states. No printability report is emitted in this mode yet.
+5. **Printing** (done). `--3mf` writes the input triangles as they are, at the file's size
+   unless `--print-size` (STL / OBJ units read as millimetres, glTF as metres), and the
+   printability report audits those triangles (welded over the UV seams). `--print-colors`
+   paints large triangles in parts with Orca split states; see below.
+
+## Split painting (`--print-color-res`, all modes)
+
+One colour per triangle is coarse on a CAD part, whose faces are a few large triangles. Orca
+stores a painted triangle as a split tree (`libslic3r/TriangleSelector.cpp`, `serialize` /
+`deserialize`; the string form in `Model.cpp`, `get_triangle_as_string` /
+`set_triangle_from_string`), so a triangle can carry several colours while the mesh stays as
+it is. Read from OrcaSlicer's sources:
+
+- Per node a nibble: bits 0–1 the number of split sides, bits 2–3 the leaf state or the
+  special side. A leaf state of 3 and above is `0b11` there, then a nibble of (state − 3), or
+  `0xF` and a nibble of (state − 18) from 18 on. A split node is followed by its children in
+  the order 3, 2, 1, 0.
+- A three-side split of (v0, v1, v2) with midpoints m01, m12, m20 has children
+  0 = (v0, m01, m20), 1 = (m01, v1, m12), 2 = (m12, v2, m20), 3 = (m01, m12, m20)
+  (`perform_split`, special side 0).
+- The 3MF string: each hex digit is 4 bits, 2^j first, and the string is read from its end.
+  The leaf-only codes this gives are the ones Snapmaker Orca 2.4.1 writes (`4`, `8`, `0C`,
+  `2C`, `2FC`).
+
+`quantize_print_colors` with `ColorOptions::cell_mm > 0`:
+
+1. Per triangle, a depth d (≤ `kPaintMaxDepth` = 8) so that its longest edge / 2^d ≤ cell (at
+   the 3MF's size). Leaves are capped at 8M; past that the cell grows.
+2. A temporary leaf mesh: uniform three-side splits in Orca's child order, midpoints shared
+   per vertex pair (UVs interpolated; a UV seam's two sides keep bit-identical positions).
+3. The unchanged quantiser (palette, speck merge) runs on the leaves. Two faces of different
+   depth meet in T-junctions, where the leaves share no vertices: each leaf side on an
+   original side is recorded with its interval along it, and overlapping intervals give the
+   speck merge the missing borders (without them, the dense goblin at 100 mm kept 6,584
+   patches instead of 226).
+4. Each triangle's leaves fold into a split tree, equal-coloured subtrees collapsing to a leaf
+   (`paint_tree_code`), so a uniform triangle keeps its one-leaf code. `face_slot` is the
+   majority slot (for the 3MF's `basematerials`).
+
+`write_3mf` writes the code as is (they can be thousands of digits).
+
+Tests (`trellis-test-mesh-print`): every slot's one-leaf tree equals `paint_color_code`;
+random trees of depth 1–4 with 2–32 colours round-trip through a decoder written from Orca's
+reader; a red disc on a blue 100 mm square of two triangles decodes, with Orca's child
+geometry, to the right colour on every leaf more than 0.02 from the rim (131,072 leaves) and
+the disc's share within 1e-4 of its area; a 0.3 mm² sliver at a T-junction merges (the test
+fails without the interval borders). Measured:
+
+| input | triangles painted in parts | leaves | patches (whole triangles) | 3MF size |
+|---|---|---|---|---|
+| torus-on-block STL at 60 mm | 1,175 of 6,156 | 19,923 | 47 (49) | +7% |
+| generated goblin at 100 mm | 8,350 of 141,168 | 181,809 | 226 (231) | — |
+
+On the STL the block's faces, two triangles each, go from one flat colour to the texture's
+detail. Confirmed in Snapmaker Orca 2.4.1: the split colours load and show on the block.
 
 ## Validation
 

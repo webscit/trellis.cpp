@@ -1,6 +1,7 @@
 // Filament colours for multi-material printers: the base-colour texture reduced to a small
-// palette, one colour per triangle, with specks merged away. See mesh_print.h and
-// docs/spec/32-print-ready.md §2.7.
+// palette, one colour per triangle (or per sub-triangle of a large one, written as Orca split
+// states), with specks merged away. See mesh_print.h, docs/spec/32-print-ready.md §2.7 and
+// docs/spec/33-texture-only.md.
 #include "mesh_print.h"
 
 #include <algorithm>
@@ -101,8 +102,210 @@ std::string paint_color_code(int slot) {
     return buffer + code;
 }
 
+namespace {
+
+// Orca's TriangleSelector bitstream (libslic3r/TriangleSelector.cpp, serialize): per node a
+// nibble of 2 bits "split sides" then 2 bits (leaf: state; split: special side); a leaf state
+// of 3 and above is 0b11 there plus a nibble of (state - 3), or 0b1111 and a nibble of
+// (state - 18) from 18 on; a three-side split is followed by its children 3, 2, 1, 0. The 3MF
+// string packs the bits in nibbles (bit j of a nibble = 2^j) written last nibble first.
+void push_bits(std::vector<bool>& bits, int value, int n) {
+    for (int j = 0; j < n; ++j) bits.push_back((value >> j) & 1);
+}
+void push_leaf(std::vector<bool>& bits, int state) {
+    push_bits(bits, 0, 2);
+    if (state < 3) { push_bits(bits, state, 2); return; }
+    push_bits(bits, 3, 2);
+    if (state <= 17) push_bits(bits, state - 3, 4);
+    else { push_bits(bits, 15, 4); push_bits(bits, state - 18, 4); }
+}
+void push_tree(std::vector<bool>& bits, const uint8_t* slots, int64_t n) {
+    bool uniform = true;
+    for (int64_t i = 1; i < n && uniform; ++i) uniform = slots[i] == slots[0];
+    if (uniform) { push_leaf(bits, slots[0] + 1); return; }
+    push_bits(bits, 3, 2);   // three split sides
+    push_bits(bits, 0, 2);   // special side (ignored for three)
+    const int64_t q = n / 4;
+    for (int child = 3; child >= 0; --child) push_tree(bits, slots + child * q, q);
+}
+std::string bits_to_code(const std::vector<bool>& bits) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string code;
+    for (size_t i = 0; i < bits.size(); i += 4) {
+        int v = 0;
+        for (int j = 0; j < 4 && i + j < bits.size(); ++j) v |= (int)bits[i + j] << j;
+        code.push_back(kHex[v]);
+    }
+    std::reverse(code.begin(), code.end());
+    return code;
+}
+
+struct FacePair { int32_t f, g; float length; };   // faces sharing a border of `length` mm
+PrintColors quantize_faces(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                           const PrintTexture& texture, float size_mm, const ColorOptions& options,
+                           const std::vector<FacePair>* extra_pairs = nullptr);
+
+}  // namespace
+
+std::string paint_tree_code(const uint8_t* leaf_slots, int depth) {
+    std::vector<bool> bits;
+    push_tree(bits, leaf_slots, (int64_t)1 << (2 * depth));
+    return bits_to_code(bits);
+}
+
 PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* faces, int64_t F,
                                   const PrintTexture& texture, float size_mm, const ColorOptions& options) {
+    if (options.cell_mm <= 0 || V <= 0 || F <= 0 || !texture.ok())
+        return quantize_faces(verts, V, faces, F, texture, size_mm, options);
+    // Millimetres per mesh unit, exactly as write_3mf scales.
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (int64_t v = 0; v < V; ++v)
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = std::min(lo[k], verts[3 * v + k]);
+            hi[k] = std::max(hi[k], verts[3 * v + k]);
+        }
+    const float extent = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+    const double mm = size_mm > 0 && extent > 0 ? size_mm / extent : 1.0;
+    std::vector<double> edge(F);
+    for (int64_t f = 0; f < F; ++f) {
+        double m = 0;
+        for (int k = 0; k < 3; ++k) {
+            const float* p = verts + 3 * faces[3 * f + k], *q = verts + 3 * faces[3 * f + (k + 1) % 3];
+            m = std::max(m, std::sqrt((double)(p[0] - q[0]) * (p[0] - q[0]) + (double)(p[1] - q[1]) * (p[1] - q[1]) +
+                                      (double)(p[2] - q[2]) * (p[2] - q[2])) * mm);
+        }
+        edge[f] = m;
+    }
+    // Depth per face: halve the edges until they are at most the cell. A leaf budget keeps the
+    // temporary mesh bounded; past it the cell grows until the leaves fit.
+    constexpr int64_t kMaxLeaves = 8'000'000;
+    std::vector<uint8_t> depth(F, 0);
+    double cell = options.cell_mm;
+    for (;;) {
+        int64_t leaves = 0;
+        for (int64_t f = 0; f < F; ++f) {
+            int d = 0;
+            while (d < kPaintMaxDepth && edge[f] / (double)(1 << d) > cell) ++d;
+            depth[f] = (uint8_t)d;
+            leaves += (int64_t)1 << (2 * d);
+        }
+        if (leaves <= std::max<int64_t>(kMaxLeaves, F)) break;
+        cell *= 1.25;
+    }
+    if (std::all_of(depth.begin(), depth.end(), [](uint8_t d) { return d == 0; }))
+        return quantize_faces(verts, V, faces, F, texture, size_mm, options);
+
+    // The leaf mesh: midpoints shared per (vertex, vertex) pair, so a UV seam keeps its two
+    // sides' UVs while their positions stay bit-identical (adjacency welds them).
+    std::vector<float> lv(verts, verts + 3 * V), luv(texture.uv, texture.uv + 2 * V);
+    std::vector<int32_t> lf;
+    std::unordered_map<uint64_t, int32_t> mids;
+    auto mid = [&](int32_t a, int32_t b) {
+        const uint64_t key = (uint64_t)(uint32_t)std::min(a, b) << 32 | (uint32_t)std::max(a, b);
+        auto it = mids.find(key);
+        if (it != mids.end()) return it->second;
+        const int32_t id = (int32_t)(lv.size() / 3);
+        for (int k = 0; k < 3; ++k) lv.push_back(0.5f * (lv[3 * (size_t)a + k] + lv[3 * (size_t)b + k]));
+        for (int k = 0; k < 2; ++k) luv.push_back(0.5f * (luv[2 * (size_t)a + k] + luv[2 * (size_t)b + k]));
+        mids.emplace(key, id);
+        return id;
+    };
+    // Where two faces of different depth meet, their leaves do not share vertices (a
+    // T-junction), so the speck merge would not see that border. Each leaf side lying on an
+    // original side is recorded with its interval along that side; overlapping intervals of
+    // faces with different depths become extra adjacency pairs.
+    std::vector<float> wpos(verts, verts + 3 * V);
+    std::vector<int32_t> wid(faces, faces + 3 * F);
+    weld_exact(wpos, wid);   // welded vertex ids of the original corners
+    struct Side { int k; double t0, t1; };   // original side k of the face (-1: interior), interval
+    struct OnSide { uint64_t key; double lo, hi; int32_t leaf; int32_t face; };
+    std::vector<OnSide> on_side;
+    int64_t cur_face = 0;
+    std::function<void(int32_t, int32_t, int32_t, Side, Side, Side, int)> emit =
+        [&](int32_t a, int32_t b, int32_t c, Side sab, Side sbc, Side sca, int d) {
+            if (d == 0) {
+                const int32_t leaf = (int32_t)(lf.size() / 3);
+                lf.push_back(a); lf.push_back(b); lf.push_back(c);
+                for (const Side& sd : {sab, sbc, sca}) {
+                    if (sd.k < 0) continue;
+                    const int32_t p = wid[3 * cur_face + sd.k], q = wid[3 * cur_face + (sd.k + 1) % 3];
+                    if (p == q) continue;
+                    // the interval along p -> q, re-expressed along min -> max of the welded ids
+                    double lo = std::min(sd.t0, sd.t1), hi = std::max(sd.t0, sd.t1);
+                    if (p > q) { const double l2 = 1 - hi; hi = 1 - lo; lo = l2; }
+                    on_side.push_back({(uint64_t)(uint32_t)std::min(p, q) << 32 | (uint32_t)std::max(p, q), lo, hi, leaf,
+                                       (int32_t)cur_face});
+                }
+                return;
+            }
+            const int32_t ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+            auto half = [](const Side& sd, bool second) {
+                if (sd.k < 0) return sd;
+                const double m = 0.5 * (sd.t0 + sd.t1);
+                return second ? Side{sd.k, m, sd.t1} : Side{sd.k, sd.t0, m};
+            };
+            const Side in{-1, 0, 0};
+            emit(a, ab, ca, half(sab, false), in, half(sca, true), d - 1);
+            emit(ab, b, bc, half(sab, true), half(sbc, false), in, d - 1);
+            emit(bc, c, ca, half(sbc, true), half(sca, false), in, d - 1);
+            emit(ab, bc, ca, in, in, in, d - 1);
+        };
+    std::vector<int64_t> first(F + 1, 0);
+    for (int64_t f = 0; f < F; ++f) {
+        first[f] = (int64_t)lf.size() / 3;
+        cur_face = f;
+        emit(faces[3 * f], faces[3 * f + 1], faces[3 * f + 2], Side{0, 0, 1}, Side{1, 0, 1}, Side{2, 0, 1}, depth[f]);
+    }
+    first[F] = (int64_t)lf.size() / 3;
+    mids.clear();
+    std::vector<FacePair> tj;
+    std::sort(on_side.begin(), on_side.end(), [](const OnSide& x, const OnSide& y) {
+        return x.key != y.key ? x.key < y.key : x.lo < y.lo;
+    });
+    for (size_t i = 0; i < on_side.size();) {
+        size_t j = i;
+        while (j < on_side.size() && on_side[j].key == on_side[i].key) ++j;
+        const int32_t p = (int32_t)(on_side[i].key >> 32), q = (int32_t)(on_side[i].key & 0xffffffffu);
+        const float* P = &wpos[3 * (size_t)p], *Q = &wpos[3 * (size_t)q];
+        const double len = std::sqrt((double)(P[0] - Q[0]) * (P[0] - Q[0]) + (double)(P[1] - Q[1]) * (P[1] - Q[1]) +
+                                     (double)(P[2] - Q[2]) * (P[2] - Q[2])) * mm;
+        for (size_t x = i; x < j; ++x)
+            for (size_t y = x + 1; y < j && on_side[y].lo < on_side[x].hi; ++y) {
+                const OnSide& u = on_side[x], &w = on_side[y];
+                // same face, or two faces of the same depth: they share vertices already
+                if (u.face == w.face || depth[u.face] == depth[w.face]) continue;
+                const double overlap = std::min(u.hi, w.hi) - std::max(u.lo, w.lo);
+                if (overlap > 1e-12) tj.push_back({u.leaf, w.leaf, (float)(overlap * len)});
+            }
+        i = j;
+    }
+    on_side.clear(); on_side.shrink_to_fit();
+    const PrintTexture ltex{luv.data(), texture.rgba, texture.size};
+    PrintColors leaf = quantize_faces(lv.data(), (int64_t)lv.size() / 3, lf.data(), (int64_t)lf.size() / 3, ltex,
+                                      size_mm, options, &tj);
+    if (!leaf.ok()) return leaf;
+    PrintColors out;
+    out.palette = std::move(leaf.palette);
+    out.share = std::move(leaf.share);
+    out.patches = leaf.patches;
+    out.face_slot.resize(F);
+    out.face_code.resize(F);
+    for (int64_t f = 0; f < F; ++f) {
+        const uint8_t* s = leaf.face_slot.data() + first[f];
+        const int64_t n = first[f + 1] - first[f];
+        int count[kMaxPrintColors] = {0};
+        for (int64_t i = 0; i < n; ++i) ++count[s[i]];
+        out.face_slot[f] = (uint8_t)(std::max_element(count, count + kMaxPrintColors) - count);
+        out.face_code[f] = paint_tree_code(s, depth[f]);
+    }
+    return out;
+}
+
+namespace {
+
+PrintColors quantize_faces(const float* verts, int64_t V, const int32_t* faces, int64_t F,
+                           const PrintTexture& texture, float size_mm, const ColorOptions& options,
+                           const std::vector<FacePair>* extra_pairs) {
     PrintColors out;
     const int K = std::min(options.count, kMaxPrintColors);
     if (K < 2 || V <= 0 || F <= 0 || !texture.ok()) return out;
@@ -231,7 +434,7 @@ PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* 
     std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) {
         return x.a != y.a ? x.a < y.a : x.b != y.b ? x.b < y.b : x.face < y.face;
     });
-    struct Pair { int32_t f, g; float length; };
+    using Pair = FacePair;
     std::vector<Pair> pairs;   // faces sharing an edge (every pair on a non-manifold edge)
     for (size_t i = 0; i < edges.size();) {
         size_t j = i;
@@ -244,6 +447,7 @@ PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* 
         i = j;
     }
     edges.clear(); edges.shrink_to_fit();
+    if (extra_pairs) pairs.insert(pairs.end(), extra_pairs->begin(), extra_pairs->end());
 
     // Speck merge: a same-colour patch under speck_mm2 takes the colour it shares the longest
     // border with. Smallest first; a patch that moves freezes its neighbours for the round, so
@@ -336,6 +540,8 @@ PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* 
     out.patches = ncomp;
     return out;
 }
+
+}  // namespace
 
 void set_report_colors(PrintReport& report, const PrintColors& colors) {
     report.palette = colors.palette;

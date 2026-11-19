@@ -268,7 +268,7 @@ trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base
 | `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and joints between thick parts (a wrist, an ankle) narrower than twice it are thickened; the rest is not touched |
 | `--print-report PATH` | write the printability report (size, walls, base and stability, overhangs, warnings) as JSON; it is always logged |
 | `--print-interior M` | `auto` (default): cap the tears in the generated surface and keep wide openings (cups, vases) open; `solid`: fill those too; `hollow`: cap nothing |
-| `--print-colors N` | for multi-material printers: the 3MF carries N filament colours (2..32), one per triangle, instead of the texture. It is written in the paint format of the Orca family and opens painted in Snapmaker Orca, with those colours as the filament list (other slicers of the family share the format; not checked). `--print-speck MM2` (default 4) merges smaller colour patches; `--print-color-lift F` (default 0.3) lifts baked-in shadows first |
+| `--print-colors N` | for multi-material printers: the 3MF carries N filament colours (2..32) instead of the texture. It is written in the paint format of the Orca family and opens painted in Snapmaker Orca, with those colours as the filament list (other slicers of the family share the format; not checked). `--print-speck MM2` (default 4) merges smaller colour patches; `--print-color-lift F` (default 0.3) lifts baked-in shadows first. `--print-color-res MM` (default 1) paints a triangle with an edge longer than MM in parts, down to MM (Orca's split painting: the triangles themselves are unchanged); 0 gives one colour per triangle |
 
 `trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
 only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
@@ -313,6 +313,9 @@ trellis-cli --texture-mesh part.stl --view photo.png:0 -o painted.glb --res 512 
 - The output keeps the input's position and size. `--3mf` writes the input triangles (no
   watertight rebuild) at the file's size (STL/OBJ units read as millimetres, glTF as metres)
   unless `--print-size` is given.
+- `--print-colors N` paints the large flat triangles of a CAD part in parts (Orca split
+  painting, `--print-color-res`), so a two-triangle face still carries the texture's detail.
+  The printability report audits the input's own triangles.
 - `--watertight`, `--faces`, `--decim`, `--print-base`, `--normal-map`, `--retopo` and
   `--refine-mesh` are refused.
 

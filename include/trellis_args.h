@@ -111,6 +111,8 @@ struct TrellisParams {
                                 //   triangle, instead of the texture (0 = off)
     float print_speck = 4.0f;   // --print-speck MM2: colour patches smaller than this merge
     float print_color_lift = 0.3f;  // --print-color-lift F: shadow lift before the palette (0 = off)
+    float print_color_res = 1.0f;   // --print-color-res MM: triangles with longer edges are painted in
+                                    //   parts (Orca split states) down to this edge; 0 = whole triangles
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast
