@@ -364,7 +364,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     bool refine_encoder = false;
     if (refine) {
         std::string err;
-        if (!trellis::load_mesh(cfg.refine_mesh, refine_in, err)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
+        const trellis::MeshUp up = cfg.mesh_up == 0 ? trellis::MeshUp::Y
+                                 : cfg.mesh_up == 1 ? trellis::MeshUp::Z : trellis::MeshUp::Auto;
+        if (!trellis::load_mesh(cfg.refine_mesh, refine_in, err, up)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
         if (!trellis::normalize_mesh_trellis(refine_in, refine_norm)) {
             fprintf(stderr, "[trellis] --refine-mesh: degenerate mesh (empty or zero extent): %s\n", cfg.refine_mesh.c_str());
             return 1;

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 
 using namespace trellis;
@@ -107,6 +108,78 @@ int main(int argc, char** argv) {
         CHECK(ok && m.V() == 3 && m.F() == 1, "gltf: %s", err.c_str());
         if (ok && m.V() == 3) CHECK(m.verts[0] == 10.0f && m.verts[3] == 11.0f, "gltf node translation not applied");
     }
+    // STL: a unit cube as a triangle soup (12 facets, 36 corners), binary and ASCII.
+    {
+        static const float P[8][3] = { {0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1} };
+        static const int T[12][3] = { {0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                                      {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7} };
+        // Binary, with a header that starts with "solid" (many exporters do this).
+        std::string bin(80, ' ');
+        bin.replace(0, 11, "solid cube ");
+        const uint32_t n = 13;   // 12 facets + one degenerate (a repeated corner) that must be dropped
+        bin.append((const char*)&n, 4);
+        auto facet = [&](const float* a, const float* b, const float* c) {
+            const float zero[3] = { 0, 0, 0 };
+            bin.append((const char*)zero, 12);
+            bin.append((const char*)a, 12); bin.append((const char*)b, 12); bin.append((const char*)c, 12);
+            bin.append(2, '\0');
+        };
+        for (const auto& t : T) facet(P[t[0]], P[t[1]], P[t[2]]);
+        facet(P[0], P[0], P[1]);
+        // ASCII, same cube; -0 must weld with +0.
+        std::string asc = "solid cube\n";
+        for (const auto& t : T) {
+            asc += "  facet normal 0 0 0\n    outer loop\n";
+            for (int k = 0; k < 3; ++k) {
+                char line[96];
+                const float* p = P[t[k]];
+                snprintf(line, sizeof line, "      vertex %s %g %g\n", p[0] == 0 && t[k] == 3 ? "-0" : (p[0] ? "1" : "0"), p[1], p[2]);
+                asc += line;
+            }
+            asc += "    endloop\n  endfacet\n";
+        }
+        asc += "endsolid cube\n";
+        for (const auto& c : { std::make_pair("cube_bin.stl", bin), std::make_pair("cube_ascii.stl", asc) }) {
+            const std::string p = tmpfile(c.first, c.second);
+            Mesh m; std::string err;
+            const bool ok = load_mesh(p, m, err, MeshUp::Y);
+            CHECK(ok && m.V() == 8 && m.F() == 12, "%s: %s V=%d F=%d (want 8/12)", c.first, err.c_str(), m.V(), m.F());
+            // Closed after welding: every undirected edge is used by exactly two faces.
+            std::map<std::pair<int,int>, int> edges;
+            for (int f = 0; f < m.F(); ++f)
+                for (int k = 0; k < 3; ++k) {
+                    int a = m.faces[f * 3 + k], b = m.faces[f * 3 + (k + 1) % 3];
+                    if (a > b) std::swap(a, b);
+                    ++edges[{ a, b }];
+                }
+            bool closed = !edges.empty();
+            for (const auto& e : edges) closed = closed && e.second == 2;
+            CHECK(closed, "%s: welded cube is not closed", c.first);
+            // Up axis: Auto on an .stl is z-up, rotated to glTF y-up as (x, y, z) -> (x, z, -y).
+            Mesh z; std::string zerr;
+            CHECK(load_mesh(p, z, zerr) && z.V() == m.V(), "%s auto: %s", c.first, zerr.c_str());
+            bool rot = z.V() == m.V();
+            for (int i = 0; rot && i < m.V(); ++i)
+                rot = z.verts[i * 3] == m.verts[i * 3] && z.verts[i * 3 + 1] == m.verts[i * 3 + 2] &&
+                      z.verts[i * 3 + 2] == -m.verts[i * 3 + 1];
+            CHECK(rot, "%s: auto up axis is not the z-up rotation", c.first);
+            // ... which TRELLIS normalisation then maps back: the grid frame is z-up.
+            if (rot) {
+                MeshNorm nm; Mesh g = z;
+                CHECK(normalize_mesh_trellis(g, nm), "normalize stl");
+                bool same = true;
+                for (int i = 0; i < g.V(); ++i)
+                    for (int a = 0; a < 3; ++a)
+                        same = same && std::fabs(g.verts[i * 3 + a] - (m.verts[i * 3 + a] - 0.5f) * nm.scale) < 1e-6f;
+                CHECK(same, "%s: z-up file does not land unrotated in the grid frame", c.first);
+            }
+        }
+        // A binary file whose size disagrees with its facet count, not starting with "solid".
+        std::string trunc(84, '\0');
+        trunc[80] = 5;
+        { Mesh m; std::string err;
+          CHECK(!load_mesh(tmpfile("trunc.stl", trunc), m, err), "truncated binary STL accepted"); }
+    }
     // Malformed inputs: an error, never a crash.
     const std::pair<const char*, const char*> bad[] = {
         { "empty.obj", "" },
@@ -117,6 +190,8 @@ int main(int argc, char** argv) {
         { "junk.glb", "glTFjunkjunkjunkjunk" },
         { "bad.gltf", "{\"asset\":{\"version\":\"2.0\"},\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":7}}]}]}" },
         { "x.stl", "solid x\n" },
+        { "short.stl", "solid x\n facet normal 0 0 1\n outer loop\n vertex 0 0 0\n vertex 1 0 0\n endloop\n endfacet\n" },
+        { "nan.stl", "solid x\n facet normal 0 0 1\n outer loop\n vertex 0 0 0\n vertex nan 0 0\n vertex 0 1 0\n endloop\n endfacet\n" },
     };
     for (const auto& b : bad) {
         const std::string p = tmpfile(b.first, b.second);

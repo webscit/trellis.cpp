@@ -12,6 +12,12 @@
 //       Chamfer distance to the (normalised) input, in voxels of `grid`.
 //   trellis-test-shape-enc coords <shape_enc.gguf> <shape_dec.gguf> <mesh> <grid> [gpu]
 //       Token-set IoU of the encoder and voxel coordinate sources of --refine-mesh at `grid`.
+//   trellis-test-shape-enc texsubs <shape_enc.gguf> <tex_dec.gguf> <mesh> <grid> [gpu]
+//       Texture-only mode (docs/spec/33-texture-only.md): voxelize -> encode -> the decoder
+//       tree from the fine voxels (decode_tree_from_fine). The tree must reproduce the dual
+//       grid's voxel set exactly; then tex_decode runs on it (random latent) and must return one
+//       finite PBR row per fine voxel. Also checks that a tree for a different voxel set is
+//       rejected.
 #include "dual_grid.h"
 #include "mesh_io.h"
 #include "mesh_voxelize.h"
@@ -137,8 +143,61 @@ static int coords_iou(const char* enc_path, const char* dec_path, const char* me
     return iou >= 0.9 ? 0 : 1;
 }
 
+static int texsubs(const char* enc_path, const char* tex_path, const char* mesh, int grid, int gpu) {
+    Mesh m; std::string err; MeshNorm nm;
+    if (!load_mesh(mesh, m, err) || !normalize_mesh_trellis(m, nm)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    const DualGrid dg = mesh_to_flexible_dual_grid(m.verts.data(), m.V(), m.faces.data(), m.F(), grid, false);
+    printf("%s: V=%d F=%d -> %zu voxels @%d (%.1fs)\n", mesh, m.V(), m.F(), dg.coords.size(), grid, secs());
+    ShapeLatent lat;
+    { Model em = Model::load(enc_path, gpu); lat = shape_encode(em, dg); em.free(); }
+    printf("encoded: %zu latent voxels @%d (%.1fs)\n", lat.coords.size(), lat.grid, secs());
+    int fails = 0;
+    DecodeTree tree;
+    try { tree = decode_tree_from_fine(dg.coords, lat.coords); }
+    catch (const std::exception& e) { fprintf(stderr, "FAIL tree: %s\n", e.what()); return 1; }
+    size_t grown = lat.coords.size();
+    for (size_t k = 0; k < tree.subs.size(); ++k) {
+        size_t on = 0;
+        for (uint8_t b : tree.subs[k]) on += b;
+        printf("  stage %zu: %zu parents -> %zu children\n", k, grown, on);
+        grown = on;
+    }
+    auto a = dg.coords, b = tree.coords;
+    std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+    const bool same = a == b;
+    printf("tree voxel set vs dual grid: %zu vs %zu, %s\n", b.size(), a.size(), same ? "IDENTICAL" : "** DIFFERENT");
+    fails += !same;
+    // A tree for another voxel set must be refused: drop the latent's last cell.
+    {
+        auto wrong = lat.coords; wrong.pop_back();
+        bool threw = false;
+        try { decode_tree_from_fine(dg.coords, wrong); } catch (const std::exception&) { threw = true; }
+        printf("mismatched latent rejected: %s\n", threw ? "yes" : "** no");
+        fails += !threw;
+    }
+    // tex_decode on the tree: one finite 6-channel row per fine voxel.
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> z((size_t)32 * lat.coords.size());
+    for (float& v : z) v = nd(rng);
+    std::vector<float> pbr;
+    { Model tm = Model::load(tex_path, gpu); pbr = tex_decode(tm, z, lat.coords, tree.subs); tm.free(); }
+    size_t bad = 0;
+    for (float v : pbr) bad += !std::isfinite(v);
+    const bool rows = pbr.size() == (size_t)6 * tree.coords.size();
+    printf("tex_decode: %zu rows (want %zu), %zu non-finite (%.1fs) %s\n", pbr.size() / 6, tree.coords.size(), bad, secs(),
+           rows && bad == 0 ? "OK" : "**");
+    fails += !(rows && bad == 0);
+    printf("%s\n", fails ? "FAILED" : "ALL OK");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc > 5 && std::string(argv[1]) == "texsubs")
+        return texsubs(argv[2], argv[3], argv[4], atoi(argv[5]), argc > 6 ? atoi(argv[6]) : 0);
     if (argc > 5 && std::string(argv[1]) == "coords")
         return coords_iou(argv[2], argv[3], argv[4], atoi(argv[5]), argc > 6 ? atoi(argv[6]) : 0);
     if (argc > 4 && std::string(argv[1]) == "dump") return dump(argv[2], atoi(argv[3]), argv[4]);
@@ -148,7 +207,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s <shape_enc.gguf> <ref_dir> [gpu]\n"
                         "       %s dump <mesh> <grid> <out.bin>\n"
                         "       %s roundtrip <shape_enc.gguf> <shape_dec.gguf> <mesh> <grid> [gpu]\n"
-                        "       %s coords <shape_enc.gguf> <shape_dec.gguf> <mesh> <grid> [gpu]\n", argv[0], argv[0], argv[0], argv[0]);
+                        "       %s coords <shape_enc.gguf> <shape_dec.gguf> <mesh> <grid> [gpu]\n"
+                        "       %s texsubs <shape_enc.gguf> <tex_dec.gguf> <mesh> <grid> [gpu]\n", argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
     const std::string ref = argv[2];

@@ -163,7 +163,9 @@ struct TrellisParams {
     unsigned    mv_stages  = 7;      // --mv-stages ss,shape,tex (bit0 ss, bit1 shape, bit2 tex)
 
     // ---- mesh refinement (--refine-mesh, docs/spec/31-mesh-refine.md) ----
-    std::string refine_mesh;         // --refine-mesh in.glb|in.obj
+    std::string refine_mesh;         // --refine-mesh in.glb|in.obj|in.stl
+    int         mesh_up        = -1; // --mesh-up auto|y|z: the input mesh's up axis (-1 auto: z for
+                                     //   .stl, y otherwise; 0 y; 1 z), docs/spec/33-texture-only.md
     int         refine_coords  = -1; // --refine-coords auto|encoder|voxel (-1 auto, 0 voxel, 1 encoder)
     bool        refine_restore = true;  // --refine-restore-transform on|off
 

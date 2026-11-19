@@ -1,16 +1,26 @@
-// Mesh input for --refine-mesh: GLB / glTF (cgltf) and OBJ loading, and the TRELLIS.2
-// normalisation into the latent grid's frame (docs/spec/31-mesh-refine.md).
+// Mesh input for --refine-mesh / --texture-mesh: GLB / glTF (cgltf), OBJ and STL loading, and
+// the TRELLIS.2 normalisation into the latent grid's frame (docs/spec/31-mesh-refine.md,
+// docs/spec/33-texture-only.md).
 #pragma once
 #include <string>
 #include "dual_grid.h"   // trellis::Mesh
 
 namespace trellis {
 
+// Up axis of the file. The loader returns glTF y-up vertices: a z-up file is rotated by
+// (x, y, z) -> (x, z, -y). Auto means z for STL (CAD / slicer convention), y for the others.
+enum class MeshUp { Auto, Y, Z };
+
+// True when `path` would be read as STL (by extension).
+bool is_stl_path(const std::string& path);
+
 // Loads every triangle primitive of every node (world transforms applied) of a .glb / .gltf,
-// or the v/f records of an .obj (fan-triangulated polygons, negative indices), merged into one
-// mesh. The format is detected by the "glTF" magic, else by extension. Returns false with
-// `err` on any failure; never throws on malformed input.
-bool load_mesh(const std::string& path, Mesh& out, std::string& err);
+// the v/f records of an .obj (fan-triangulated polygons, negative indices), or the facets of
+// a binary / ASCII .stl, merged into one mesh. The format is detected by the "glTF" magic,
+// else by extension. STL facets are welded on exact position (STL stores each triangle
+// separately) and faces left with a repeated vertex are dropped. Returns false with `err` on
+// any failure; never throws on malformed input.
+bool load_mesh(const std::string& path, Mesh& out, std::string& err, MeshUp up = MeshUp::Auto);
 
 // The transform normalize_mesh_trellis applied: v_norm = R * (v - center) * scale, where R maps
 // glTF (x, y, z) to the latent grid's (x, -z, y).

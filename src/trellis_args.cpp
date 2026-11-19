@@ -278,7 +278,7 @@ void print_usage(const char* argv0, bool server) {
         "                          see (unseen regions keep the direction-only blend)\n"
         "      --mv-stages LIST    stages that blend views: ss,shape,tex | all | none (default all;\n"
         "                          the others use the first view only)\n"
-        "      --refine-mesh PATH  re-generate an existing mesh (.glb/.gltf/.obj) from the view(s):\n"
+        "      --refine-mesh PATH  re-generate an existing mesh (.glb/.gltf/.obj/.stl) from the view(s):\n"
         "                          its voxels fix the shape SLAT coordinates; the sparse-structure\n"
         "                          and LR stages are skipped\n"
         "      --refine-coords M   auto (default) | encoder | voxel: where the refine coordinates\n"
@@ -286,6 +286,8 @@ void print_usage(const char* argv0, bool server) {
         "      --refine-restore-transform on|off\n"
         "                          map the refined mesh back to the input's position and scale\n"
         "                          (default on)\n"
+        "      --mesh-up A         up axis of the input mesh: auto (default: z for .stl, y for\n"
+        "                          .glb/.gltf/.obj) | y | z\n"
         "      --copyright TEXT    glTF asset.copyright metadata\n"
         "  -m, --models DIR        GGUF model directory\n"
         "      --model FAMILY      trellis (default) | pixal3d — which flow weights the model\n"
@@ -457,6 +459,11 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   std::string error;
                                                   if (!parse_mv_stages(v, p.mv_stages, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; } }
         else if (a == "--refine-mesh")          { const char* v = need(a.c_str()); if (!v) return false; p.refine_mesh = v; }
+        else if (a == "--mesh-up")              { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if      (std::strcmp(v, "auto") == 0) p.mesh_up = -1;
+                                                  else if (std::strcmp(v, "y") == 0)    p.mesh_up = 0;
+                                                  else if (std::strcmp(v, "z") == 0)    p.mesh_up = 1;
+                                                  else { fprintf(stderr, "[trellis] --mesh-up must be auto, y or z\n"); return false; } }
         else if (a == "--refine-coords")        { const char* v = need(a.c_str()); if (!v) return false;
                                                   if      (std::strcmp(v, "auto") == 0)    p.refine_coords = -1;
                                                   else if (std::strcmp(v, "voxel") == 0)   p.refine_coords = 0;
