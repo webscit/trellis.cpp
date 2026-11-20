@@ -12,7 +12,7 @@ don't need this directory unless you're developing the app.
 
 ```
 src/            web UI (Vite + TypeScript, framework-free)
-  api.ts        POST /generate, GET /health against trellis-server
+  api.ts        POST /jobs (image→3D, and task=texture for "Paint a mesh"), GET /health
   viewer.ts     <model-viewer> wrapper (vendored in public/vendor)
   store.ts      IndexedDB gallery (input + GLB + thumbnail blobs)
   config.ts     resolves server host/port/models (Tauri command or localStorage)
@@ -35,7 +35,8 @@ web UI also runs in a plain browser against a manually-started server.
 
 ## Develop
 
-`npm test` runs the unit tests with Node's built-in runner (Node 22.6+ strips the types).
+`npm test` runs the unit tests with Node's built-in runner, which strips the types itself
+from Node 22.18 / 23.6 on.
 
 ```bash
 npm install

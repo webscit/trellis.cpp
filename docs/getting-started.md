@@ -78,6 +78,52 @@ Examples:
 5. Every result is saved to a local **gallery** (IndexedDB) — click a thumbnail to
    reload it, even after restarting the app.
 
+## Paint a mesh
+
+**Paint a mesh** (the second tab above the drop zone) colours a model you already have, for
+example a CAD part, from a photo of the real object. The mesh keeps its triangles, its size
+and its orientation: nothing is regenerated, so the result fits whatever it was designed for.
+
+1. **One-time setup.** Reading a mesh needs one more model file, `shape_enc.gguf`, that the
+   installer doesn't download. Convert it from Microsoft's checkpoint (about 700 MB) with
+   the converter in this repository, writing it into your models folder:
+
+   ```bash
+   git clone https://github.com/pwilkin/trellis.cpp && cd trellis.cpp
+   python3 -m venv .venv && .venv/bin/pip install numpy gguf huggingface_hub
+   .venv/bin/hf download microsoft/TRELLIS.2-4B ckpts/shape_enc_next_dc_f16c32_fp16.safetensors \
+       ckpts/shape_enc_next_dc_f16c32_fp16.json --local-dir trellis2
+   TRELLIS_MODELS=trellis2 TRELLIS_GGUF_OUT=~/.local/share/trellis-studio/models \
+       .venv/bin/python tools/convert.py shape_enc
+   ```
+
+   On Windows, use `.venv\Scripts\` and set `TRELLIS_GGUF_OUT` to
+   `%LOCALAPPDATA%\trellis-studio\models`. The server looks for the file on each job, so
+   there is nothing to restart.
+2. **Drop a mesh** (STL, OBJ or GLB) on the mesh slot, or anywhere on the window: Studio
+   switches to *Paint a mesh* by itself. Then add a photo of the object as usual. STL and
+   OBJ files are read in millimetres, GLB in metres.
+3. **Turn the mesh so the side in the photo faces you.** The preview shows the mesh in grey
+   with a marker on the side the photo will paint. **Up** picks the file's axis that points
+   up (*auto* is z for STL, y for OBJ and GLB); **⟲ 90° / ⟳ 90°** turn it about that axis.
+   The photo is matched by shape as well as by side, but a front that doesn't match the
+   photo can lose the photo's details. The painted model keeps the file's own orientation
+   whatever you pick here.
+4. **Resolution** is *512 · fast* by default; *1024 · detailed* gives sharper colours but
+   is slower. Meshes with many small triangles (or a large CAD part) can be too much for 1024:
+   Studio then says so and offers **Retry at 512**.
+5. **3MF** set to *3MF of this mesh* also writes a 3MF of the painted mesh. Its size comes
+   from the file (untick **from file** to scale it), and **3MF colours** works as in image
+   mode: the texture, or 4 to 32 filament colours. With filament colours, **Colour detail**
+   (0.5 mm, 1 mm, 2 mm or *whole triangles*) paints the large flat triangles of a CAD part in
+   smaller pieces, so a face made of two triangles still gets the photo's detail. The print
+   report under the preview checks the mesh as it is: Studio doesn't add a base or thicken
+   walls, so fix those in your CAD tool.
+6. **Paint mesh**. The result is named `<your mesh>_painted` and goes to the gallery with a
+   *mesh* badge; clicking it brings back the mesh and its orientation, ready to paint again.
+
+Each tab keeps its own resolution and print settings.
+
 ## No app? Use it in a browser
 
 The UI is a plain web bundle, so you can skip the desktop app entirely:
@@ -143,3 +189,8 @@ plus its full stdout/stderr — attach the newest file to a bug report.
   open **Settings** and point it at your models directory.
 - **ROCm server won't start** — install the gfx-matched TheRock ROCm runtime, or
   switch to Vulkan (`--backend vulkan`).
+- **"painting a mesh needs …/shape_enc.gguf"** — do the one-time setup in
+  [Paint a mesh](#paint-a-mesh); the path in the message is the models folder the
+  server uses.
+- **"This trellis-server can't paint meshes yet"** — the server predates *Paint a mesh*;
+  re-run the installer to update it.

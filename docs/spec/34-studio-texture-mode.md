@@ -1,8 +1,8 @@
 # 34 — Studio: paint a mesh
 
-Status: phases 1–3 done (`--mesh-up` signed axes, `--mesh-yaw`, measured below; the Studio
-mode switch, mesh slot and turned preview; the paint request, records, print options, 512
-default and "Retry at 512"). Phase 4 (user docs) open.
+Status: done (`--mesh-up` signed axes, `--mesh-yaw`, measured below; the Studio mode switch,
+mesh slot and turned preview; the paint request, records, print options, 512 default and
+"Retry at 512"; the user docs).
 
 Brings texture-only mode (spec 33, `POST /jobs` with `task=texture`) to Trellis Studio. The
 user drops an STL / OBJ / GLB and a photo, turns the mesh until the photo's side faces the
@@ -192,8 +192,9 @@ generation. `waitForJob` is unchanged (result, 3MF, report).
    STL and a photo dropped together on the photo zone fill both slots; with "from file"
    unticked at 80 mm the 3MF is 80 mm and the report says "your mesh is not watertight" and
    flags its two shells. Image mode keeps 1024 and its own print settings throughout.
-4. **Docs:** `docs/getting-started.md` gets a "Paint a mesh" section; the README's Studio
-   lines and `app/README.md` mention it.
+4. **Docs** (done): `docs/getting-started.md` has a "Paint a mesh" section, with the one-time
+   `shape_enc.gguf` conversion (the installer's published set doesn't include it) and two
+   troubleshooting entries; the README's Studio section and `app/README.md` mention it.
 
 ## Open questions
 

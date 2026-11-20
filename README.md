@@ -24,7 +24,8 @@ Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on th
 
 New here? **Trellis Studio** is a one-command install that auto-detects your GPU
 runtime (CUDA / ROCm / Vulkan), downloads the server + weights, and gives you a
-drag-an-image → 3D desktop app with an interactive preview and a saved gallery.
+drag-an-image → 3D desktop app with an interactive preview and a saved gallery. It can also
+paint an STL, OBJ or GLB you already have from a photo.
 
 ```bash
 # Linux (x86-64)
@@ -95,6 +96,13 @@ click → rotate the result.
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
    the app.
+
+**Paint a mesh** (the second tab) colours a mesh you already have from a photo and keeps its
+triangles ([texture-only mode](#texture-only-mode)): drop an STL, OBJ or GLB, turn it so the
+photo's side faces you, and paint it at 512 (default) or 1024, optionally with a 3MF of the
+mesh at its own size and filament colours. It needs `shape_enc.gguf`, which the installer
+doesn't download; see [Paint a mesh](docs/getting-started.md#paint-a-mesh) for the one-time
+conversion.
 
 The **Settings** panel (gear icon) points the app at a different models directory,
 GPU index, or port; the models directory, backend, and server binary come from the
