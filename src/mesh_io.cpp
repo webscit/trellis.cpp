@@ -1,4 +1,5 @@
 #include "mesh_io.h"
+#include "mesh_print.h"   // weld_exact
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <vector>
 
@@ -136,9 +138,171 @@ bool load_obj(const std::string& path, Mesh& out, std::string& err) {
     return true;
 }
 
+
+// Binary STL: 80-byte header, uint32 facet count, then 50 bytes per facet (normal, 3 vertices,
+// uint16 attribute). Detected by the exact size, because many binary files begin with "solid".
+// ASCII STL: "solid ... facet normal ... outer loop / vertex x y z ... endloop endfacet ...".
+bool load_stl(const std::string& path, Mesh& out, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open " + path; return false; }
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<float> verts;
+    std::vector<int32_t> faces;
+    bool binary = false;
+    uint32_t n = 0;
+    if (data.size() >= 84) {
+        std::memcpy(&n, data.data() + 80, 4);
+        binary = data.size() == 84 + 50ull * n;
+    }
+    if (binary) {
+        if ((uint64_t)n * 3 > (uint64_t)INT32_MAX) { err = "mesh too large: " + path; return false; }
+        verts.resize((size_t)n * 9);
+        faces.resize((size_t)n * 3);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(verts.data() + (size_t)i * 9, data.data() + 84 + 50ull * i + 12, 36);
+            for (int k = 0; k < 3; ++k) faces[(size_t)i * 3 + k] = (int32_t)(i * 3 + k);
+        }
+    } else {
+        size_t p = 0;
+        while (p < data.size() && std::isspace((unsigned char)data[p])) ++p;
+        if (data.compare(p, 5, "solid") != 0) {
+            err = "not an STL file (neither binary of the right size nor ASCII): " + path; return false;
+        }
+        std::istringstream is(data);
+        std::string tok;
+        std::vector<float> loop;
+        while (is >> tok) {
+            if (tok == "vertex") {
+                float x, y, z;
+                if (!(is >> x >> y >> z)) { err = "bad vertex in " + path; return false; }
+                loop.push_back(x); loop.push_back(y); loop.push_back(z);
+            } else if (tok == "endloop" || tok == "endfacet") {
+                const int nv = (int)loop.size() / 3;
+                if (tok == "endloop" && nv < 3) { err = "facet with fewer than 3 vertices in " + path; return false; }
+                if (nv >= 3) {
+                    const int32_t base = (int32_t)(verts.size() / 3);
+                    verts.insert(verts.end(), loop.begin(), loop.end());
+                    for (int k = 2; k < nv; ++k) {   // fan, for the rare polygon facet
+                        faces.push_back(base); faces.push_back(base + k - 1); faces.push_back(base + k);
+                    }
+                    if (verts.size() / 3 > (size_t)INT32_MAX) { err = "mesh too large: " + path; return false; }
+                }
+                loop.clear();
+            }
+        }
+    }
+    for (float v : verts)
+        if (!std::isfinite(v)) { err = "non-finite vertex in " + path; return false; }
+    if (faces.empty()) { err = "no facets in " + path; return false; }
+    out.verts = std::move(verts);
+    out.faces = std::move(faces);
+    weld_exact(out.verts, out.faces);   // mesh_print.h: bit-identical positions, -0 == +0
+    std::vector<int32_t> kept;
+    kept.reserve(out.faces.size());
+    for (size_t t = 0; t + 2 < out.faces.size(); t += 3) {
+        const int32_t a = out.faces[t], b = out.faces[t + 1], c = out.faces[t + 2];
+        if (a == b || b == c || a == c) continue;   // a facet with a repeated corner
+        kept.push_back(a); kept.push_back(b); kept.push_back(c);
+    }
+    out.faces.swap(kept);
+    if (out.faces.empty()) { err = "every facet of " + path + " is degenerate"; return false; }
+    return true;
+}
+
 }  // namespace
 
-bool load_mesh(const std::string& path, Mesh& out, std::string& err) {
+bool is_stl_path(const std::string& path) { return lower_ext(path) == "stl"; }
+
+bool parse_mesh_up(const std::string& s, MeshUp& out) {
+    if      (s == "auto")               out = MeshUp::Auto;
+    else if (s == "x"  || s == "+x")    out = MeshUp::X;
+    else if (s == "-x")                 out = MeshUp::NX;
+    else if (s == "y"  || s == "+y")    out = MeshUp::Y;
+    else if (s == "-y")                 out = MeshUp::NY;
+    else if (s == "z"  || s == "+z")    out = MeshUp::Z;
+    else if (s == "-z")                 out = MeshUp::NZ;
+    else return false;
+    return true;
+}
+
+bool AxisMap::identity() const {
+    for (int i = 0; i < 3; ++i) if (axis[i] != i || sign[i] != 1) return false;
+    return true;
+}
+
+AxisMap AxisMap::inverse() const {
+    AxisMap r;
+    for (int i = 0; i < 3; ++i) { r.axis[axis[i]] = i; r.sign[axis[i]] = sign[i]; }
+    return r;
+}
+
+AxisMap AxisMap::after(const AxisMap& first) const {
+    AxisMap r;
+    for (int i = 0; i < 3; ++i) { r.axis[i] = first.axis[axis[i]]; r.sign[i] = sign[i] * first.sign[axis[i]]; }
+    return r;
+}
+
+void AxisMap::apply(float* v, size_t count, size_t stride) const {
+    for (size_t k = 0; k < count; ++k, v += stride) {
+        const float in[3] = {v[0], v[1], v[2]};
+        for (int i = 0; i < 3; ++i) v[i] = sign[i] < 0 ? -in[axis[i]] : in[axis[i]];
+    }
+}
+
+namespace {
+
+AxisMap make_map(int a0, int s0, int a1, int s1, int a2, int s2) {
+    AxisMap m;
+    m.axis[0] = a0; m.sign[0] = s0; m.axis[1] = a1; m.sign[1] = s1; m.axis[2] = a2; m.sign[2] = s2;
+    return m;
+}
+
+// File -> glTF: the rotation that takes the file axis `up` to +y (Auto resolved by the caller).
+AxisMap up_map(MeshUp up) {
+    switch (up) {
+        case MeshUp::Z:  return make_map(0, 1, 2, 1, 1, -1);   // (x, y, z) -> (x, z, -y)
+        case MeshUp::NZ: return make_map(0, 1, 2, -1, 1, 1);   // (x, y, z) -> (x, -z, y)
+        case MeshUp::NY: return make_map(0, 1, 1, -1, 2, -1);  // (x, y, z) -> (x, -y, -z)
+        case MeshUp::X:  return make_map(1, -1, 0, 1, 2, 1);   // (x, y, z) -> (-y, x, z)
+        case MeshUp::NX: return make_map(1, 1, 0, -1, 2, 1);   // (x, y, z) -> (y, -x, z)
+        default:         return AxisMap{};                     // y up already
+    }
+}
+
+// glTF: a turn of `yaw` degrees about +y, counter-clockwise seen from above (right-handed).
+AxisMap yaw_map(int yaw) {
+    switch (((yaw % 360) + 360) % 360) {
+        case 90:  return make_map(2, 1, 1, 1, 0, -1);    // (x, y, z) -> (z, y, -x)
+        case 180: return make_map(0, -1, 1, 1, 2, -1);   // (x, y, z) -> (-x, y, -z)
+        case 270: return make_map(2, -1, 1, 1, 0, 1);    // (x, y, z) -> (-z, y, x)
+        default:  return AxisMap{};
+    }
+}
+
+MeshUp resolve_up(const std::string& path, MeshUp up) {
+    return up != MeshUp::Auto ? up : is_stl_path(path) ? MeshUp::Z : MeshUp::Y;
+}
+
+}  // namespace
+
+AxisMap mesh_load_map(const std::string& path, MeshOrient o) {
+    return yaw_map(o.yaw).after(up_map(resolve_up(path, o.up)));
+}
+
+AxisMap mesh_orient_undo_grid(const std::string& path, MeshOrient o) {
+    const AxisMap to_grid = make_map(0, 1, 2, -1, 1, 1);   // glTF (x, y, z) -> grid (x, -z, y)
+    const AxisMap native = up_map(resolve_up(path, MeshUp::Auto));
+    // grid -> glTF -> (undo the load) file -> the file's own convention -> grid
+    return to_grid.after(native.after(mesh_load_map(path, o).inverse().after(to_grid.inverse())));
+}
+
+std::string mesh_front_axis(const std::string& path, MeshOrient o) {
+    // The file direction the load sends to glTF +z: out.z = sign[2] * in[axis[2]].
+    const AxisMap m = mesh_load_map(path, o);
+    return std::string(m.sign[2] < 0 ? "-" : "+") + "xyz"[m.axis[2]];
+}
+
+bool load_mesh(const std::string& path, Mesh& out, std::string& err, MeshOrient orient) {
     char magic[4] = {0, 0, 0, 0};
     {
         FILE* f = std::fopen(path.c_str(), "rb");
@@ -148,15 +312,21 @@ bool load_mesh(const std::string& path, Mesh& out, std::string& err) {
         if (n < 4) { err = "file too short: " + path; return false; }
     }
     const std::string ext = lower_ext(path);
+    bool ok = false;
     try {
-        if (std::memcmp(magic, "glTF", 4) == 0 || ext == "glb" || ext == "gltf") return load_gltf(path, out, err);
-        if (ext == "obj") return load_obj(path, out, err);
+        if (std::memcmp(magic, "glTF", 4) == 0 || ext == "glb" || ext == "gltf") ok = load_gltf(path, out, err);
+        else if (ext == "obj") ok = load_obj(path, out, err);
+        else if (ext == "stl") ok = load_stl(path, out, err);
+        else { err = "unsupported mesh format (expected .glb, .gltf, .obj or .stl): " + path; return false; }
     } catch (const std::exception& e) {
         err = std::string("failed to load ") + path + ": " + e.what();
         return false;
     }
-    err = "unsupported mesh format (expected .glb, .gltf or .obj): " + path;
-    return false;
+    if (!ok) return false;
+    if (orient.yaw % 90 != 0) { err = "the mesh turn must be 0, 90, 180 or 270 degrees"; return false; }
+    // File -> glTF y-up, then the turn: a proper rotation, so the winding is unchanged.
+    mesh_load_map(path, orient).apply(out.verts);
+    return true;
 }
 
 bool normalize_mesh_trellis(Mesh& m, MeshNorm& norm) {

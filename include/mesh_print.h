@@ -139,11 +139,16 @@ struct ColorOptions {
     float speck_mm2 = 4.0f;   // colour patches smaller than this merge into a neighbour
     float lift = 0.3f;        // shadow lift: 0 keeps the texture's tones; the levels are
                               //   stretched and a gamma of 1/(1+lift) lifts baked-in shading
+    float cell_mm = 1.0f;     // paint resolution: a triangle with an edge longer than this is
+                              //   painted in sub-triangles (Orca split states, see face_code),
+                              //   down to edges of at most cell_mm; 0 = one colour per triangle
 };
 struct PrintColors {
     std::vector<uint32_t> palette;   // 0xRRGGBB (sRGB); slot s+1 is palette[s], largest share first
     std::vector<double>   share;     // surface share of each slot, 0..1
-    std::vector<uint8_t>  face_slot; // per input face, 0-based slot
+    std::vector<uint8_t>  face_slot; // per input face, 0-based slot (the majority one when split)
+    std::vector<std::string> face_code;  // per input face, its Orca paint_color code when it is
+                                     //   painted in parts (a split tree); empty = whole triangles
     int patches = 0;                 // connected same-colour regions after the speck merge
     bool ok() const { return !palette.empty(); }
 };
@@ -155,6 +160,13 @@ PrintColors quantize_print_colors(const float* verts, int64_t V, const int32_t* 
 // Orca / Prusa / Bambu triangle-selector code for a whole triangle painted with filament
 // `slot` (1-based): 1 -> "4", 2 -> "8", 3 -> "0C", 5 -> "2C", 20 -> "2FC".
 std::string paint_color_code(int slot);
+// The code for a triangle painted in parts: `leaf_slots` (0-based) are the 4^depth leaves of a
+// uniform depth-`depth` subdivision in the order paint_subdivide emits them. Equal-coloured
+// subtrees collapse to one leaf, so a uniform triangle gives paint_color_code(slot + 1).
+std::string paint_tree_code(const uint8_t* leaf_slots, int depth);
+// The TriangleSelector's three-side split of (a, b, c) with midpoints m_ab, m_bc, m_ca: children
+// 0..3 = (a, m_ab, m_ca), (m_ab, b, m_bc), (m_bc, c, m_ca), (m_ab, m_bc, m_ca).
+constexpr int kPaintMaxDepth = 8;
 // Adds the palette (hex, share, patch count) to a report's text and JSON.
 void set_report_colors(PrintReport& report, const PrintColors& colors);
 

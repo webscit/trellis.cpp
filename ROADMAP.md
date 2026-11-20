@@ -83,7 +83,7 @@ last key-tile at the HR token count, ≈53k). BiRefNet bg-removal is done (M2); 
       upstream), shape SLAT encoder (`shape_enc.gguf`, S2C down-blocks), voxel or encoder
       coordinates, `/refine` (spec 31)
 - ☐ Pixal3D multi-view (per-view cameras into the projection grid; needs the `_mv` weights)
-- ☐ Texture-only retexturing of an existing mesh (`texture_mesh_multiview`)
+- ☑ Texture-only retexturing of an existing mesh (`--texture-mesh`, `/texture`; STL input, spec 33)
 - ☑ Trellis Studio multi-view UI: extra views with direction/elevation (main image included),
       blend temperature and front axis, gallery records keep their views
 - ☑ Server job API (`/jobs`): FIFO queue, poll + fetch, so long runs survive client/proxy

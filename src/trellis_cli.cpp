@@ -358,20 +358,46 @@ int trellis_run(const trellis::TrellisParams& cfg) {
 
     // --refine-mesh: load and normalise the mesh up front so a bad file fails before any model
     // is loaded (docs/spec/31-mesh-refine.md).
+    // --texture-mesh (docs/spec/33-texture-only.md) shares the mesh loading with refine; the input
+    // triangles are kept (texmesh_in) and painted, nothing about the geometry is generated.
     const bool refine = !cfg.refine_mesh.empty();
+    const bool texmesh = !cfg.texture_mesh.empty();
     trellis::Mesh refine_in;
     trellis::MeshNorm refine_norm;
     bool refine_encoder = false;
-    if (refine) {
+    trellis::Mesh texmesh_in;          // the input mesh, normalised (grid frame): the bake target
+    float texmesh_size = 0;            // its longest side in millimetres (for the 3MF)
+    trellis::AxisMap orient_undo;      // undoes --mesh-up / --mesh-yaw's turn on output (grid axes)
+    if (refine || texmesh) {
         std::string err;
-        if (!trellis::load_mesh(cfg.refine_mesh, refine_in, err)) { fprintf(stderr, "[trellis] %s\n", err.c_str()); return 1; }
-        if (!trellis::normalize_mesh_trellis(refine_in, refine_norm)) {
-            fprintf(stderr, "[trellis] --refine-mesh: degenerate mesh (empty or zero extent): %s\n", cfg.refine_mesh.c_str());
-            return 1;
-        }
+        const std::string& path = texmesh ? cfg.texture_mesh : cfg.refine_mesh;
+        trellis::MeshOrient orient;
+        trellis::parse_mesh_up(cfg.mesh_up, orient.up);   // validated by the argument parsers
+        orient.yaw = cfg.mesh_yaw;
+        // Thrown, not returned: trellis-server passes the text on to the client.
+        if (!trellis::load_mesh(path, refine_in, err, orient)) throw std::runtime_error(err);
+        orient_undo = trellis::mesh_orient_undo_grid(path, orient);
+        printf("[mesh] %s: up %s, turn %d deg; the file's %s side faces the front\n", path.c_str(),
+               cfg.mesh_up.c_str(), cfg.mesh_yaw, trellis::mesh_front_axis(path, orient).c_str());
+        if (!trellis::normalize_mesh_trellis(refine_in, refine_norm))
+            throw std::runtime_error("the mesh is empty or flat (zero extent): " + path);
         FILE* ef = fopen((M + "/shape_enc.gguf").c_str(), "rb");
         const bool have_enc = ef != nullptr;
         if (ef) fclose(ef);
+        if (texmesh) {
+            if (!have_enc)
+                throw std::runtime_error("painting a mesh needs " + M + "/shape_enc.gguf (convert it with"
+                                         " tools/convert.py shape_enc)");
+            // STL / OBJ carry no unit: read as millimetres. glTF is in metres.
+            const std::string ext = path.size() >= 4 ? path.substr(path.size() - 4) : path;
+            const bool gltf = ext == ".glb" || ext == "gltf" || ext == ".GLB" || ext == "GLTF";
+            texmesh_size = (0.99999f / refine_norm.scale) * (gltf ? 1000.0f : 1.0f);
+            texmesh_in = refine_in;
+            const int R = cascade ? cfg.hr_res : 512;
+            printf("[texture-mesh] %s: V=%d F=%d, %.1f mm, texture at res %d (%s); geometry kept as is\n",
+                   path.c_str(), refine_in.V(), refine_in.F(), texmesh_size, R,
+                   R == 512 ? "tex_flow_512" : "tex_flow_1024");
+        }
         if (cfg.refine_coords == 1 && !have_enc) {
             fprintf(stderr, "[trellis] --refine-coords encoder needs %s/shape_enc.gguf"
                             " (convert it with tools/convert.py shape_enc, or use --refine-coords voxel)\n", M.c_str());
@@ -380,14 +406,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         refine_encoder = cfg.refine_coords == 1 || (cfg.refine_coords < 0 && have_enc);
         if (cfg.refine_coords < 0 && !have_enc)
             printf("[refine] shape_enc.gguf not found -- using voxel coords\n");
-        if (cfg.retopo && cfg.refine_restore) {
+        if (refine && cfg.retopo && cfg.refine_restore) {
             // The retopo driver writes its own GLB from the POST dump, in the grid frame.
             fprintf(stderr, "[trellis] --refine-mesh with --retopo cannot restore the input transform;"
                             " pass --refine-restore-transform off\n");
             return 1;
         }
-        printf("[refine] %s: V=%d F=%d, %s coords, restore transform %s\n", cfg.refine_mesh.c_str(),
-               refine_in.V(), refine_in.F(), refine_encoder ? "encoder" : "voxel", cfg.refine_restore ? "on" : "off");
+        if (refine)
+            printf("[refine] %s: V=%d F=%d, %s coords, restore transform %s\n", cfg.refine_mesh.c_str(),
+                   refine_in.V(), refine_in.F(), refine_encoder ? "encoder" : "voxel", cfg.refine_restore ? "on" : "off");
     }
 
     // ---- [1/6] background removal, per view ----
@@ -674,7 +701,42 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     // Refine: the fine coords @R come from the input mesh; no sparse-structure or LR stage runs.
     vector<std::array<int,3>> refine_fine;
     const int refine_R = cascade ? cfg.hr_res : 512;
-    if (refine) {
+    trellis::ShapeLatent texmesh_lat;   // the input mesh's shape SLAT (raw posterior mean)
+    trellis::DecodeTree texmesh_tree;   // the tex decoder's voxel tree: exactly the mesh's voxels
+    if (texmesh) {
+        printf("[3/6] voxelize + encode the input mesh @res%d (sparse-structure flow skipped)\n", refine_R);
+        const double tv = now();
+        trellis::DualGrid dg = trellis::mesh_to_flexible_dual_grid(refine_in.verts.data(), refine_in.V(),
+                                                                   refine_in.faces.data(), refine_in.F(),
+                                                                   refine_R, /*coords_only=*/false);
+        std::vector<float>().swap(refine_in.verts);
+        std::vector<int32_t>().swap(refine_in.faces);
+        printf("      %d occupied voxels @res%d (%.1fs)\n", (int)dg.coords.size(), refine_R, now() - tv);
+        if (dg.coords.empty()) { fprintf(stderr, "--texture-mesh: the mesh voxelized to nothing\n"); return 1; }
+        { trellis::Model em = trellis::Model::load(M + "/shape_enc.gguf", gpu);
+          try { texmesh_lat = trellis::shape_encode(em, dg); } catch (...) { em.free(); throw; }
+          em.free(); }
+        std::vector<float>().swap(dg.dual);
+        printf("      shape SLAT encode -> %d latent voxels @res%d (%.1fs)\n", (int)texmesh_lat.coords.size(),
+               texmesh_lat.grid, now() - tv);
+        slat_stats("encoded mesh slat", texmesh_lat.feats);
+        texmesh_tree = trellis::decode_tree_from_fine(dg.coords, texmesh_lat.coords);
+        // Upstream has no token cap here. Past the cascade's cap the texture flow's attention
+        // may not fit, and the run is long anyway: stop with the remedy instead.
+        const int ntok = (int)texmesh_lat.coords.size();
+        if (ntok > cfg.max_tokens)
+            throw std::runtime_error("this mesh gives " + std::to_string(ntok) + " texture tokens at res " +
+                                     std::to_string(refine_R) + ", more than --max-tokens " +
+                                     std::to_string(cfg.max_tokens) + "; use --res 512");
+        if (ntok > 16384 && refine_R > 512)
+            printf("      [warn] %d texture tokens: the texture flow will be slow; --res 512 has ~4x fewer\n", ntok);
+        if (pose_on) {
+            const int G = 64, f = std::max(1, refine_R / G);
+            std::set<std::array<int,3>> cs;
+            for (const auto& c : dg.coords) cs.insert({c[0] / f, c[1] / f, c[2] / f});
+            pose_check(vector<std::array<int,3>>(cs.begin(), cs.end()), G, "input mesh voxels");
+        }
+    } else if (refine) {
         printf("[3/6] voxelize the input mesh @res%d (sparse-structure flow skipped)\n", refine_R);
         const double tv = now();
         trellis::DualGrid dg = trellis::mesh_to_flexible_dual_grid(refine_in.verts.data(), refine_in.V(),
@@ -794,7 +856,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     if (cfg.voxply) { FILE*f=fopen("out/myvox.ply","wb"); fprintf(f,"ply\nformat binary_little_endian 1.0\nelement vertex %zu\nproperty float x\nproperty float y\nproperty float z\nelement face 0\nproperty list uchar int vertex_indices\nend_header\n",coords.size()); for(auto&c:coords){float p[3]={(c[0]+0.5f)/32-0.5f,(c[1]+0.5f)/32-0.5f,(c[2]+0.5f)/32-0.5f}; fwrite(p,4,3,f);} fclose(f); }
     printf("      active voxels @res32 = %d\n", (int)coords.size());
     if (coords.empty()) { fprintf(stderr, "no voxels produced\n"); return 1; }
-    }   // !refine
+    }   // !refine && !texmesh
 
     bool do_tex = cfg.texture;
     // Pixal3D publishes a single (1024) texture flow, where TRELLIS.2 publishes both. The light
@@ -845,7 +907,18 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     int RES = 512;                           // final grid resolution
     const CondSet* cs_dec = &cs512;          // conds used by the HR shape + tex flows
     vector<float> lr_norm, lr_dn;            // LR (res-512) shape slat @res32 — reused for the res-512 tex path
-    if (refine) {
+    if (texmesh) {
+        // No shape flow: the texture flow's concat input is the ENCODED shape SLAT, normalised as
+        // the flow's own output would be (upstream sample_tex_slat).
+        printf("[4/7] shape SLAT from the encoder (no shape flow)\n");
+        shc = texmesh_lat.coords;
+        const size_t n = shc.size();
+        slat_norm.resize((size_t)32 * n);
+        for (size_t i = 0; i < n; ++i) for (int c = 0; c < 32; ++c)
+            slat_norm[(size_t)c + 32*i] = (texmesh_lat.feats[(size_t)c + 32*i] - SHAPE_MEAN[c]) / SHAPE_STD[c];
+        trellis::ShapeLatent().feats.swap(texmesh_lat.feats);
+        RES = refine_R; cs_dec = refine_R == 512 ? &cs512 : &cs1024;
+    } else if (refine) {
         // The reference refiner: quantize the mesh's fine coords to the latent grid (with the
         // token-budget backoff) and sample the shape SLAT there from pure noise, conditioned on the
         // view(s). One stage, at the flow of the requested resolution.
@@ -928,9 +1001,17 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
     }
 
-    printf("[5/7] FlexiDualGrid shape decode -> mesh @res%d\n", RES);
     trellis::Mesh mesh;
     trellis::ShapeOut so;
+    if (texmesh) {
+        printf("[5/7] no shape decode: the input mesh (V=%d F=%d), %d voxels @res%d from the encoder\n",
+               texmesh_in.V(), texmesh_in.F(), (int)texmesh_tree.coords.size(), RES);
+        mesh = texmesh_in;
+        so.res = RES;
+        so.coords = std::move(texmesh_tree.coords);
+        so.subs = std::move(texmesh_tree.subs);
+    } else {
+    printf("[5/7] FlexiDualGrid shape decode -> mesh @res%d\n", RES);
     {
         trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
         so = trellis::shape_decode(m, slat_dn, shc, RES); m.free();
@@ -959,6 +1040,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             fwrite(&v,4,1,f); fwrite(&fc,4,1,f); fwrite(mesh.verts.data(),4,mesh.verts.size(),f); fwrite(mesh.faces.data(),4,mesh.faces.size(),f); fclose(f);
             printf("      [dump] pre-remesh mesh -> %s\n", dp); fflush(stdout); }
     }
+    }   // !texmesh
 
     vector<float> colors, pbr6, dual_pbr6;   // colors = base RGB (PLY); pbr6 = per-vertex [V*6] for UV bake
     const std::string retopo_dual_post=(retopo_run/"dual-high.post").string();
@@ -978,11 +1060,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                           : (cascade && (int)so.coords.size() > DENSE_TEX ? 512 : RES);
         // Pixal3D does not publish a res-512 texture flow; its texture stays at cascade resolution.
         // Refine has no LR SLAT to drive the res-512 texture path: always texture at RES.
-        const bool mixed = cascade && tex_res != RES && !pix && !refine;
-        if (refine && (cfg.tex_res > 0 && cfg.tex_res != RES))
-            printf("      (--tex-res %d is not supported with --refine-mesh; texturing at res %d)\n", cfg.tex_res, RES);
-        else if (refine && cascade && (int)so.coords.size() > DENSE_TEX)
-            printf("      (dense decode, %d voxels: refine textures at res %d -- expect some outer-skin speckle)\n",
+        const bool mixed = cascade && tex_res != RES && !pix && !refine && !texmesh;
+        if ((refine || texmesh) && (cfg.tex_res > 0 && cfg.tex_res != RES))
+            printf("      (--tex-res %d is not supported with %s; texturing at res %d)\n", cfg.tex_res,
+                   texmesh ? "--texture-mesh" : "--refine-mesh", RES);
+        else if ((refine || texmesh) && cascade && (int)so.coords.size() > DENSE_TEX)
+            printf("      (dense decode, %d voxels: texturing at res %d -- expect some outer-skin speckle)\n",
                    (int)so.coords.size(), RES);
         if (dual_pbr_path && (!*dual_pbr_path || !mixed || RES != 1024)) {
             fprintf(stderr, "[trellis] dual PBR requires TRELLIS.2 with 1024 geometry and 512 primary PBR\n");
@@ -1088,6 +1171,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // mixed-res mode the correspondence never held at all (res-512 voxels vs
         // res-1024 vertices): drop the colors instead of reading out of bounds.
         // (Windows surfaced this as a silent crash at [7/7]; Linux read garbage.)
+        if (texmesh) colors.clear();   // per voxel, and the input's vertices are not voxels
         if (colors.size() != (size_t)mesh.V() * 3) {
             if (pbr_res == so.res && colors.size() < (size_t)mesh.V() * 3)
                 colors.resize((size_t)mesh.V() * 3, 0.5f);
@@ -1156,6 +1240,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // xatlas's ~superlinear chart-compute (grid 384 -> 382K faces took >9min pre-decimation),
         // occlusion-aware bucket assignment + depth-tested raster keep its bleed low.
         const bool boxuv = !cfg.xatlas;
+        // --texture-mesh: the 3MF keeps the file's size unless --print-size was given.
+        const float print_size = texmesh && !cfg.print_size_set ? texmesh_size : cfg.print_size;
         const int T = cfg.tex >= 0 ? cfg.tex : (cascade ? 2048 : 1024);
         auto dump_post = [&](const char* path) {
             FILE* dfp = fopen(path,"wb");
@@ -1315,6 +1401,17 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             return 0;
 #endif
         }
+        trellis::TriBvh bvh;
+        trellis::Mesh rm;
+        bool solid = false;
+        trellis::PrintReport solid_report;
+        bool report_pending = false;
+        std::vector<float> dv, dp; std::vector<int32_t> df;
+        if (texmesh) {
+            // The input triangles as they are: no weld, hole fill, remesh or decimation. The
+            // surface IS the true one, so the bake needs no snap (no BVH).
+            dv = mesh.verts; df = mesh.faces;
+        } else {
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors,
                                1.0f / ((float)so.res * 8.0f));
         trellis::fill_small_holes(mesh.faces);
@@ -1322,8 +1419,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // the narrow-band offset shell (watertight manifold), then quadric
         // simplify to the face target. The BVH over the original hole-filled
         // mesh serves both the remesh UDF and the bake's texel snap.
-        trellis::TriBvh bvh = trellis::TriBvh::build(mesh.verts.data(), mesh.V(),
-                                                     mesh.faces.data(), mesh.F());
+        bvh = trellis::TriBvh::build(mesh.verts.data(), mesh.V(),
+                                     mesh.faces.data(), mesh.F());
         // The narrow-band remesh offset is eps = band*scale/res, i.e. it shrinks with
         // resolution. At res-512 (band=1) that offset absorbs the decoder's sub-voxel
         // "outer-skin" noise; at res-1024 the SAME band=1 halves the world-space offset,
@@ -1347,12 +1444,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                    cfg.print_size);
         }
         remesh_options.band = remesh_band;
-        trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
-                                                          mesh.faces.data(), mesh.F(),
-                                                          bvh, so.res, remesh_options);
-        const bool solid = cfg.watertight && rm.F() > 0;
-        trellis::PrintReport solid_report;
-        bool report_pending = false;
+        rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
+                                            mesh.faces.data(), mesh.F(),
+                                            bvh, so.res, remesh_options);
+        solid = cfg.watertight && rm.F() > 0;
         if (cfg.watertight && !solid) printf("  watertight: solid remesh produced nothing; falling back to the raw mesh\n");
         // Clean the narrow-band DC output (drop degenerate faces, unify winding), then drop
         // decode floaters (the reference is a single watertight component; ours shattered into
@@ -1369,7 +1464,6 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
         const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
-        std::vector<float> dv, dp; std::vector<int32_t> df;
         if (cfg.decim > 0) {
             trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
         } else if (cfg.decim == 0) {
@@ -1435,6 +1529,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             report_pending = true;
             fflush(stdout);
         }
+        }   // !texmesh
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
         // --normal-map: a second BVH over the remeshed shell (not the decoded `mesh`, whose
         // sub-voxel outer-skin noise the band offset exists to absorb, issue #22) gives the
@@ -1456,14 +1551,18 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // Texels are shaded straight from the per-voxel PBR volume (trilinear sampling, the
         // reference bake behavior) rather than from decimation-averaged vertex colors, so
         // full material detail survives simplification.
-        trellis::VoxelPbr vox{pbr_coords, &pbr6, pbr_res, &bvh};
+        trellis::VoxelPbr vox{pbr_coords, &pbr6, pbr_res, texmesh ? nullptr : &bvh};
         const std::vector<float> no_vp;
         trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox, nsp)
                                       : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox, nsp);
         if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox, nsp);
         if (bm.ok()) {
             if (pix) pixal3d_to_trellis_frame(bm.verts);
-            if (refine && cfg.refine_restore) trellis::restore_mesh_transform(bm.verts, refine_norm);
+            if ((refine && cfg.refine_restore) || texmesh) {
+                trellis::restore_mesh_transform(bm.verts, refine_norm);
+                orient_undo.apply(bm.verts);
+                if (!bm.tangents.empty()) orient_undo.apply(bm.tangents.data(), bm.tangents.size() / 4, 4);
+            }
             trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
                                         bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
                                         /*double_sided=*/rm.F() == 0, run_seed,
@@ -1485,6 +1584,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 printf("  watertight: GLB     %s\n",
                        trellis::audit_summary(trellis::audit_mesh(wv.data(), (int64_t)wv.size()/3, wf.data(), (int64_t)wf.size()/3)).c_str());
             }
+            if (texmesh && !cfg.out_3mf.empty()) {
+                // Nothing was rebuilt, so the report audits the input's own triangles (welded
+                // over the UV seams) at the 3MF's size: a mesh that is not watertight is said so.
+                std::vector<float> wv = bm.verts; std::vector<int32_t> wf = bm.faces;
+                trellis::weld_exact(wv, wf);
+                solid_report = trellis::print_report(wv.data(), (int64_t)wv.size()/3, wf.data(), (int64_t)wf.size()/3,
+                                                     print_size, print_up_axis, cfg.print_wall);
+                report_pending = true;
+            }
             if (!cfg.out_3mf.empty()) {
                 const std::vector<float>& pv = bm.verts;   // already z-up (TRELLIS frame)
                 const trellis::PrintTexture ptex{bm.uv.data(), bm.base.data(), bm.T};
@@ -1495,15 +1603,20 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                     co.count = cfg.print_colors;
                     co.speck_mm2 = cfg.print_speck;
                     co.lift = cfg.print_color_lift;
+                    co.cell_mm = cfg.print_color_res;
                     pcol = trellis::quantize_print_colors(pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
-                                                          (int64_t)bm.faces.size()/3, ptex, cfg.print_size, co);
-                    printf("  colours: %d filaments, %d patches (specks under %.1f mm2 merged, lift %.2f) in %.1fs\n",
-                           (int)pcol.palette.size(), pcol.patches, cfg.print_speck, cfg.print_color_lift, now() - tc0);
+                                                          (int64_t)bm.faces.size()/3, ptex, print_size, co);
+                    size_t split = 0;
+                    for (const auto& code : pcol.face_code) split += code.size() > 3;   // more than one leaf
+                    printf("  colours: %d filaments, %d patches (specks under %.1f mm2 merged, lift %.2f), %zu triangles"
+                           " painted in parts (cells %.2g mm) in %.1fs\n",
+                           (int)pcol.palette.size(), pcol.patches, cfg.print_speck, cfg.print_color_lift, split,
+                           cfg.print_color_res, now() - tc0);
                     if (report_pending) trellis::set_report_colors(solid_report, pcol);
                 }
                 if (trellis::write_3mf(cfg.out_3mf.c_str(), pv.data(), (int64_t)pv.size()/3, bm.faces.data(),
-                                       (int64_t)bm.faces.size()/3, cfg.print_size, &ptex, pcol.ok() ? &pcol : nullptr))
-                    printf("      3MF -> %s (%.0f mm, %s)\n", cfg.out_3mf.c_str(), cfg.print_size,
+                                       (int64_t)bm.faces.size()/3, print_size, &ptex, pcol.ok() ? &pcol : nullptr))
+                    printf("      3MF -> %s (%.1f mm, %s)\n", cfg.out_3mf.c_str(), print_size,
                            pcol.ok() ? "filament colours" : "textured");
                 else { fprintf(stderr, "[trellis] cannot write %s\n", cfg.out_3mf.c_str()); return 1; }
             }
@@ -1536,7 +1649,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         } else printf("  watertight: solid remesh produced nothing; writing the raw mesh\n");
     }
     if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply
-    if (refine && cfg.refine_restore) trellis::restore_mesh_transform(mesh.verts, refine_norm);
+    if ((refine && cfg.refine_restore) || texmesh) {
+        trellis::restore_mesh_transform(mesh.verts, refine_norm);
+        orient_undo.apply(mesh.verts);
+    }
     if (!textured) {
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),
                            colors.empty() ? nullptr : colors.data(), run_seed,

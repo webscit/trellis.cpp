@@ -27,11 +27,33 @@
 
     <main class="workspace">
       <section class="panel panel-left">
+        <div class="mode-switch" role="tablist" aria-label="What to make">
+          <button id="mode-image" type="button" role="tab" data-mode="image" aria-selected="true">Generate from image</button>
+          <button id="mode-mesh" type="button" role="tab" data-mode="mesh" aria-selected="false"
+                  title="Paint an STL, OBJ or GLB you already have from a photo, keeping its triangles">Paint a mesh</button>
+        </div>
+
+        <div id="mesh-zone" class="meshzone hidden" tabindex="0">
+          <div id="mesh-hint" class="mesh-hint">
+            <b>Drop a mesh</b><span class="muted">STL, OBJ or GLB · or click to browse</span>
+          </div>
+          <div id="mesh-info" class="mesh-info hidden">
+            <span class="mesh-icon">◇</span>
+            <div class="mesh-text" title="Show the mesh and its orientation">
+              <b id="mesh-name"></b>
+              <span id="mesh-stats" class="muted"></span>
+            </div>
+            <button id="mesh-change" class="link-btn" type="button" title="Pick another mesh">Change</button>
+            <button id="mesh-clear" class="mesh-clear" type="button" title="Remove the mesh">✕</button>
+          </div>
+          <input id="mesh-input" type="file" accept=".stl,.obj,.glb" hidden />
+        </div>
+
         <div id="dropzone" class="dropzone" tabindex="0">
           <img id="input-preview" class="input-preview hidden" alt="input" />
           <div id="dropzone-hint" class="dropzone-hint">
             <div class="dz-icon">⬆</div>
-            <div>Drop an image here</div>
+            <div id="dropzone-text">Drop an image here</div>
             <div class="muted">or click to browse</div>
           </div>
           <span id="front-tag" class="front-tag hidden">main · front · 0°</span>
@@ -52,9 +74,9 @@
           <label class="ctl">
             <span>Resolution</span>
             <select id="ctl-res">
-              <option value="512">512 · light</option>
-              <option value="1024" selected>1024 · cascade</option>
-              <option value="1536">1536 · high</option>
+              <option id="res-512" value="512">512 · light</option>
+              <option id="res-1024" value="1024" selected>1024 · cascade</option>
+              <option id="res-1536" value="1536">1536 · high</option>
             </select>
           </label>
           <label class="ctl">
@@ -72,26 +94,32 @@
               <option value="box">box (faster)</option>
             </select>
           </label>
-          <label class="ctl">
+          <label id="ctl-tex-wrap" class="ctl">
             <span>Texture</span>
             <select id="ctl-tex">
               <option value="on" selected>on</option>
               <option value="off">off (geometry only)</option>
             </select>
           </label>
-          <label class="ctl" title="Rebuild the mesh as one closed, manifold solid a slicer accepts. Slower.">
-            <span>3D print</span>
+          <label id="ctl-print-wrap" class="ctl" title="Rebuild the mesh as one closed, manifold solid a slicer accepts. Slower.">
+            <span id="ctl-print-label">3D print</span>
             <select id="ctl-print">
               <option value="off" selected>off</option>
-              <option value="on">watertight solid</option>
+              <option id="ctl-print-on" value="on">watertight solid</option>
             </select>
           </label>
           <div id="print-opts" class="print-opts hidden">
             <label class="ctl" title="Longest side of the printed model. The 3MF is written at this size.">
-              <span>Print size (mm)</span>
+              <span class="ctl-head">
+                Print size (mm)
+                <span id="print-size-file-wrap" class="ctl-check hidden"
+                      title="The 3MF at the mesh's own size: STL / OBJ units read as millimetres, GLB as metres">
+                  <input id="ctl-print-size-file" type="checkbox" checked /> from file
+                </span>
+              </span>
               <input id="ctl-print-size" type="number" min="5" max="2000" step="5" value="100" />
             </label>
-            <label class="ctl" title="A flat face to sit on the build plate. Auto picks the lowest cut the model stands on, or adds a thin pedestal.">
+            <label id="print-base-wrap" class="ctl" title="A flat face to sit on the build plate. Auto picks the lowest cut the model stands on, or adds a thin pedestal.">
               <span>Flat base</span>
               <select id="ctl-print-base">
                 <option value="auto" selected>auto · stable, pedestal if needed</option>
@@ -101,11 +129,11 @@
                 <option value="0">none</option>
               </select>
             </label>
-            <label class="ctl" title="Fins, edges and strands thinner than this are thickened, and so are joints between thick parts (a wrist, an ankle) narrower than twice it; the rest of the model is not touched. 0 turns it off.">
+            <label id="print-wall-wrap" class="ctl" title="Fins, edges and strands thinner than this are thickened, and so are joints between thick parts (a wrist, an ankle) narrower than twice it; the rest of the model is not touched. 0 turns it off.">
               <span>Minimum wall (mm)</span>
               <input id="ctl-print-wall" type="number" min="0" max="20" step="0.1" value="0.8" />
             </label>
-            <label class="ctl" title="Generated surfaces have tears. Auto seals them and keeps wide openings (the mouth of a cup or a vase) open. Solid fills those too. Hollow seals nothing.">
+            <label id="print-interior-wrap" class="ctl" title="Generated surfaces have tears. Auto seals them and keeps wide openings (the mouth of a cup or a vase) open. Solid fills those too. Hollow seals nothing.">
               <span>Interior</span>
               <select id="ctl-print-interior">
                 <option value="auto" selected>auto · seal tears, keep cups open</option>
@@ -113,7 +141,7 @@
                 <option value="hollow">hollow · seal nothing</option>
               </select>
             </label>
-            <label class="ctl" title="Most FDM slicers ignore a 3MF's texture. With a number here the 3MF carries that many filament colours instead, one per triangle, painted the way Orca-family slicers read it (checked in Snapmaker Orca); the filament list opens with those colours.">
+            <label class="ctl" title="Most FDM slicers ignore a 3MF's texture. With a number here the 3MF carries that many filament colours instead, painted the way Orca-family slicers read it (checked in Snapmaker Orca); the filament list opens with those colours.">
               <span>3MF colours</span>
               <select id="ctl-print-colors">
                 <option value="0" selected>texture · no filament colours</option>
@@ -123,6 +151,16 @@
                 <option value="16">16 filament colours</option>
                 <option value="24">24 filament colours</option>
                 <option value="32">32 filament colours</option>
+              </select>
+            </label>
+            <label id="print-color-res-wrap" class="ctl hidden"
+                   title="Large triangles are painted in parts down to this size (Orca split painting); the triangles themselves are not changed.">
+              <span>Colour detail</span>
+              <select id="ctl-print-color-res">
+                <option value="0.5">0.5 mm · finest</option>
+                <option value="1" selected>1 mm · default</option>
+                <option value="2">2 mm · coarser, smaller file</option>
+                <option value="0">whole triangles</option>
               </select>
             </label>
           </div>
@@ -184,6 +222,19 @@
 
       <section class="panel viewer-panel">
         <div id="viewer-mount" class="viewer-mount"></div>
+        <div id="orient-bar" class="orient-bar hidden">
+          <label class="orient-up" title="The axis of the file that points up">
+            <span>Up</span>
+            <select id="orient-up"></select>
+          </label>
+          <div class="orient-turn">
+            <span>Turn</span>
+            <button id="turn-ccw" class="tool-btn" type="button" title="Turn 90° counter-clockwise, seen from above">⟲ 90°</button>
+            <span id="turn-value" class="turn-value">0°</span>
+            <button id="turn-cw" class="tool-btn" type="button" title="Turn 90° clockwise, seen from above">⟳ 90°</button>
+          </div>
+          <span class="orient-hint muted">Turn the mesh so the side in the photo faces you.</span>
+        </div>
         <details id="print-report" class="print-report hidden">
           <summary>
             <span id="print-report-badge" class="report-badge"></span>

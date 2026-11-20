@@ -24,7 +24,8 @@ Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on th
 
 New here? **Trellis Studio** is a one-command install that auto-detects your GPU
 runtime (CUDA / ROCm / Vulkan), downloads the server + weights, and gives you a
-drag-an-image → 3D desktop app with an interactive preview and a saved gallery.
+drag-an-image → 3D desktop app with an interactive preview and a saved gallery. It can also
+paint an STL, OBJ or GLB you already have from a photo.
 
 ```bash
 # Linux (x86-64)
@@ -95,6 +96,13 @@ click → rotate the result.
 5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
    thumbnail to reload its model, input image, and settings — even after restarting
    the app.
+
+**Paint a mesh** (the second tab) colours a mesh you already have from a photo and keeps its
+triangles ([texture-only mode](#texture-only-mode)): drop an STL, OBJ or GLB, turn it so the
+photo's side faces you, and paint it at 512 (default) or 1024, optionally with a 3MF of the
+mesh at its own size and filament colours. It needs `shape_enc.gguf`, which the installer
+doesn't download; see [Paint a mesh](docs/getting-started.md#paint-a-mesh) for the one-time
+conversion.
 
 The **Settings** panel (gear icon) points the app at a different models directory,
 GPU index, or port; the models directory, backend, and server binary come from the
@@ -268,7 +276,7 @@ trellis-cli goblin.png goblin.glb --3mf goblin.3mf --print-size 120 --print-base
 | `--print-wall MM` | minimum wall thickness at `--print-size` (default 0.8): fins, edges and strands thinner than this are grown, and joints between thick parts (a wrist, an ankle) narrower than twice it are thickened; the rest is not touched |
 | `--print-report PATH` | write the printability report (size, walls, base and stability, overhangs, warnings) as JSON; it is always logged |
 | `--print-interior M` | `auto` (default): cap the tears in the generated surface and keep wide openings (cups, vases) open; `solid`: fill those too; `hollow`: cap nothing |
-| `--print-colors N` | for multi-material printers: the 3MF carries N filament colours (2..32), one per triangle, instead of the texture. It is written in the paint format of the Orca family and opens painted in Snapmaker Orca, with those colours as the filament list (other slicers of the family share the format; not checked). `--print-speck MM2` (default 4) merges smaller colour patches; `--print-color-lift F` (default 0.3) lifts baked-in shadows first |
+| `--print-colors N` | for multi-material printers: the 3MF carries N filament colours (2..32) instead of the texture. It is written in the paint format of the Orca family and opens painted in Snapmaker Orca, with those colours as the filament list (other slicers of the family share the format; not checked). `--print-speck MM2` (default 4) merges smaller colour patches; `--print-color-lift F` (default 0.3) lifts baked-in shadows first. `--print-color-res MM` (default 1) paints a triangle with an edge longer than MM in parts, down to MM (Orca's split painting: the triangles themselves are unchanged); 0 gives one colour per triangle |
 
 `trellis-print in.glb out.3mf` does the geometry part for any existing GLB / glTF / OBJ, CPU
 only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `print_size`,
@@ -277,7 +285,7 @@ only. trellis-server takes `watertight`, `3mf` (then `GET /jobs/{id}/3mf`), `pri
 
 ### Mesh refinement
 
-`--refine-mesh in.glb|in.obj` re-generates an existing mesh from one or more views. The mesh's
+`--refine-mesh in.glb|in.obj|in.stl` re-generates an existing mesh from one or more views. The mesh's
 voxels fix the shape SLAT's coordinates; the shape and texture are re-sampled, blended over the
 views. The sparse-structure and LR stages are skipped.
 
@@ -294,6 +302,37 @@ python tools/convert.py shape_enc` from `ckpts/shape_enc_next_dc_f16c32_fp16.*` 
 `--refine-restore-transform off`). See
 [`docs/spec/31-mesh-refine.md`](docs/spec/31-mesh-refine.md).
 
+### Texture-only mode
+
+`--texture-mesh in.stl|in.obj|in.glb` paints an existing mesh from one or more views and
+**keeps its triangles**: no shape is generated, nothing is remeshed or decimated. This is
+upstream's `Trellis2TexturingPipeline`. The mesh goes through the shape VAE encoder
+(`shape_enc.gguf`, see above), the texture flow runs on that latent, and the PBR volume is
+baked onto the input triangles.
+
+```bash
+trellis-cli --texture-mesh part.stl --view photo.png:0 -o painted.glb --res 512 \
+            --3mf painted.3mf --print-colors 4
+```
+
+- `--res 512` uses the 512 texture flow, anything else the 1024 one (as upstream). Dense
+  meshes give many texture tokens at 1024; the run stops past `--max-tokens` and suggests 512.
+- STL files are z-up by default; OBJ and glTF are y-up. `--mesh-up auto|x|-x|y|-y|z|-z` names
+  the file axis that points up, and `--mesh-yaw 0|90|180|270` then turns the mesh about it
+  (counter-clockwise seen from above). One image is matched to the side facing the front
+  (a z-up STL's −y side at turn 0; the log names it), so turn the mesh until the photo's side
+  faces there. The output keeps the file's orientation either way.
+- The output keeps the input's position and size. `--3mf` writes the input triangles (no
+  watertight rebuild) at the file's size (STL/OBJ units read as millimetres, glTF as metres)
+  unless `--print-size` is given.
+- `--print-colors N` paints the large flat triangles of a CAD part in parts (Orca split
+  painting, `--print-color-res`), so a two-triangle face still carries the texture's detail.
+  The printability report audits the input's own triangles.
+- `--watertight`, `--faces`, `--decim`, `--print-base`, `--normal-map`, `--retopo` and
+  `--refine-mesh` are refused.
+
+See [`docs/spec/33-texture-only.md`](docs/spec/33-texture-only.md).
+
 ### trellis-server
 
 `trellis-server` keeps the process resident (no Vulkan re-init per request) and exposes:
@@ -307,11 +346,14 @@ POST /generate      multipart/form-data with an "image" file part; optional text
                     Multi-view: repeat the "image" part and add "azimuths" (one per
                     image, comma-separated; degrees or names) and optionally
                     "elevations", "blend_temp", "front_axis", "yaw_offset".
-POST /refine        a "mesh" part (GLB or OBJ) + one or more "image" parts and the
-                    same fields, plus "refine_coords" (auto|encoder|voxel) and
-                    "restore_transform" (on|off).
-POST /jobs          asynchronous form of the two above: same fields ("task"=refine for
-                    /refine) -> 202 {"id","status","position"}; errors in the fields
+POST /refine        a "mesh" part (GLB, OBJ or STL) + one or more "image" parts and the
+                    same fields, plus "refine_coords" (auto|encoder|voxel),
+                    "restore_transform" (on|off), "mesh_up" (auto|x|-x|y|-y|z|-z) and
+                    "mesh_yaw" (0|90|180|270).
+POST /texture       the /refine form, but paints the mesh and keeps its triangles
+                    (texture-only mode); geometry-changing fields answer 400.
+POST /jobs          asynchronous form of the three above: same fields ("task"=refine or
+                    texture) -> 202 {"id","status","position"}; errors in the fields
                     still answer 400 at once.
 GET  /jobs/{id}     -> {"status": queued|running|done|error, "position", "elapsed", "error"}
 GET  /jobs/{id}/result   -> model/gltf-binary (409 while queued or running)
@@ -328,6 +370,8 @@ curl -F image=@front.png -F image=@back.png -F azimuths=0,180 -F resolution=512 
      http://127.0.0.1:8080/generate -o out.glb
 curl -F mesh=@rough.glb -F image=@front.png -F image=@back.png -F azimuths=0,180 \
      http://127.0.0.1:8080/refine -o refined.glb
+curl -F mesh=@part.stl -F image=@photo.png -F resolution=512 \
+     http://127.0.0.1:8080/texture -o painted.glb
 
 id=$(curl -s -F image=@front.png -F resolution=1024 http://127.0.0.1:8080/jobs | jq -r .id)
 curl -s http://127.0.0.1:8080/jobs/$id                       # poll until "done"

@@ -10,6 +10,8 @@ interface ModelViewerEl extends HTMLElement {
   fieldOfView: string;
   jumpCameraToGoal(): void;
   resetTurntableRotation(theta?: number): void;
+  getDimensions(): { x: number; y: number; z: number };
+  getBoundingBoxCenter(): { x: number; y: number; z: number };
   toBlob(options?: {
     mimeType?: string;
     qualityArgument?: number;
@@ -103,6 +105,25 @@ export class Viewer {
     this.el.fieldOfView = "auto";
     this.el.resetTurntableRotation(0);
     this.el.jumpCameraToGoal();
+  }
+
+  /**
+   * Pin `marker` to the middle of the model's front face (+z, where the default camera
+   * looks from), or remove it with null.
+   */
+  setFrontMarker(marker: HTMLElement | null): void {
+    this.el.querySelector('[slot="hotspot-front"]')?.remove();
+    if (!marker) return;
+    try {
+      const c = this.el.getBoundingBoxCenter();
+      const d = this.el.getDimensions();
+      marker.slot = "hotspot-front";
+      marker.dataset.position = `${c.x}m ${c.y}m ${c.z + d.z / 2}m`;
+      marker.dataset.normal = "0m 0m 1m";
+      this.el.appendChild(marker);
+    } catch {
+      /* no model loaded: no marker */
+    }
   }
 
   /** A PNG snapshot of the current view for the gallery thumbnail. */

@@ -178,4 +178,69 @@ std::vector<float> tex_decode(const Model& m, const std::vector<float>& tex_late
     return decode_unet(m, tex_latent, 6, coords, &subs, nullptr);   // 6-ch PBR at the same final coords
 }
 
+DecodeTree decode_tree_from_fine(const std::vector<std::array<int,3>>& fine,
+                                 const std::vector<std::array<int,3>>& latent) {
+    // 21 bits per axis, as sparse_s2c's parent key.
+    auto key = [](int x, int y, int z) {
+        return ((uint64_t)(uint32_t)x << 42) | ((uint64_t)(uint32_t)y << 21) | (uint64_t)(uint32_t)z;
+    };
+    // levels[0] = fine; levels[k] = unique(levels[k-1] >> 1), each a sorted key set. These are
+    // the coordinate sets the encoder's four S2C blocks produce.
+    std::vector<std::vector<uint64_t>> levels(5);
+    levels[0].reserve(fine.size());
+    for (const auto& c : fine) {
+        if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= (1 << 21) || c[1] >= (1 << 21) || c[2] >= (1 << 21))
+            throw std::runtime_error("decode_tree_from_fine: coordinate out of range");
+        levels[0].push_back(key(c[0], c[1], c[2]));
+    }
+    std::sort(levels[0].begin(), levels[0].end());
+    if (std::adjacent_find(levels[0].begin(), levels[0].end()) != levels[0].end())
+        throw std::runtime_error("decode_tree_from_fine: duplicate fine voxel");
+    for (int k = 1; k <= 4; ++k) {
+        auto& L = levels[k];
+        L.reserve(levels[k - 1].size() / 2 + 1);
+        for (uint64_t v : levels[k - 1])
+            L.push_back(key((int)(v >> 43), (int)((v >> 22) & 0xfffff), (int)((v >> 1) & 0xfffff)));
+        std::sort(L.begin(), L.end());
+        L.erase(std::unique(L.begin(), L.end()), L.end());
+    }
+    // The encoder's latent must be exactly the top level, or the tree belongs to another mesh.
+    {
+        std::vector<uint64_t> top;
+        top.reserve(latent.size());
+        for (const auto& c : latent) top.push_back(key(c[0], c[1], c[2]));
+        std::sort(top.begin(), top.end());
+        if (top != levels[4])
+            throw std::runtime_error("decode_tree_from_fine: latent coords (" + std::to_string(latent.size()) +
+                                     ") are not the fine voxels' level-4 parents (" +
+                                     std::to_string(levels[4].size()) + ")");
+    }
+    // Walk top-down in sparse_c2s's order: parents in their current order, children by slot.
+    DecodeTree t;
+    std::vector<std::array<int,3>> cur = latent;
+    for (int k = 3; k >= 0; --k) {
+        const auto& L = levels[k];
+        std::vector<uint8_t> mask((size_t)8 * cur.size(), 0);
+        std::vector<std::array<int,3>> next;
+        next.reserve(L.size());
+        for (size_t i = 0; i < cur.size(); ++i) {
+            const int x = cur[i][0], y = cur[i][1], z = cur[i][2];
+            for (int o = 0; o < 8; ++o) {
+                const int cx = 2 * x + (o & 1), cy = 2 * y + ((o >> 1) & 1), cz = 2 * z + ((o >> 2) & 1);
+                if (!std::binary_search(L.begin(), L.end(), key(cx, cy, cz))) continue;
+                mask[(size_t)o + 8 * i] = 1;
+                next.push_back({ cx, cy, cz });
+            }
+        }
+        if (next.size() != L.size())
+            throw std::runtime_error("decode_tree_from_fine: stage " + std::to_string(3 - k) + " grew " +
+                                     std::to_string(next.size()) + " voxels, the encoder level has " +
+                                     std::to_string(L.size()));
+        t.subs.push_back(std::move(mask));
+        cur = std::move(next);
+    }
+    t.coords = std::move(cur);
+    return t;
+}
+
 } // namespace trellis

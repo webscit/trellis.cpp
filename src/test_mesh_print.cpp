@@ -19,6 +19,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -166,6 +168,50 @@ static void speck_sheet(Mesh& m, std::vector<float>& uv, std::vector<unsigned ch
 }
 
 static MeshAudit audit(const Mesh& m) { return audit_mesh(m.verts.data(), m.V(), m.faces.data(), m.F()); }
+
+// An Orca paint_color string -> the 0-based slots of the 4^depth leaves of a uniform depth-`depth`
+// subdivision (TriangleSelector child order). Written from Orca's reader, independently of the
+// encoder: the string is read from its end, each hex digit gives 4 bits (2^j first); per node a
+// nibble: split sides in bits 0-1, then the state / special side; a leaf state 0b11 means one
+// more nibble (state - 3), 0xF meaning a second one (state - 18); a split node's children come
+// as 3, 2, 1, 0. Only three-side splits are expected. False on anything malformed.
+static bool decode_paint(const std::string& code, int depth, std::vector<uint8_t>& leaves) {
+    std::vector<bool> bits;
+    for (auto it = code.crbegin(); it != code.crend(); ++it) {
+        const char ch = *it;
+        int d = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'A' && ch <= 'F' ? 10 + ch - 'A' : -1;
+        if (d < 0) return false;
+        for (int i = 0; i < 4; ++i) bits.push_back(d >> i & 1);
+    }
+    size_t at = 0;
+    auto nibble = [&](int& v) {
+        if (at + 4 > bits.size()) return false;
+        v = 0;
+        for (int i = 0; i < 4; ++i) v |= (int)bits[at++] << i;
+        return true;
+    };
+    leaves.assign((size_t)1 << (2 * depth), 0xFF);
+    std::function<bool(size_t, size_t, int)> node = [&](size_t first, size_t n, int d) {
+        int c = 0;
+        if (!nibble(c)) return false;
+        if ((c & 3) == 0) {
+            int state = c >> 2;
+            if (state == 3) {
+                int x = 0;
+                if (!nibble(x)) return false;
+                if (x == 15) { if (!nibble(x)) return false; state = x + 18; } else state = x + 3;
+            }
+            if (state < 1) return false;
+            std::fill(leaves.begin() + first, leaves.begin() + first + n, (uint8_t)(state - 1));
+            return true;
+        }
+        if ((c & 3) != 3 || d == 0) return false;
+        for (int child = 3; child >= 0; --child)
+            if (!node(first + child * (n / 4), n / 4, d - 1)) return false;
+        return true;
+    };
+    return node(0, leaves.size(), depth) && std::none_of(leaves.begin(), leaves.end(), [](uint8_t s) { return s == 0xFF; });
+}
 
 static Mesh remesh(const Mesh& m, int res, const RemeshOptions& options) {
     const TriBvh bvh = TriBvh::build(m.verts.data(), m.V(), m.faces.data(), m.F());
@@ -426,6 +472,119 @@ int main(int argc, char** argv) {
         const char* codes[] = {"4", "8", "0C", "1C", "2C", "2FC", "EFC"};
         for (int i = 0; i < 7; ++i)
             CHECK(paint_color_code(slots[i]) == codes[i], "paint code of %d: %s, expected %s", slots[i], paint_color_code(slots[i]).c_str(), codes[i]);
+
+        // Split painting (Orca split states): decoded here the way Orca's
+        // FacetsAnnotation::set_triangle_from_string + TriangleSelector::deserialize read it.
+        for (uint8_t s = 0; s < kMaxPrintColors; ++s) {
+            CHECK(paint_tree_code(&s, 0) == paint_color_code(s + 1), "leaf tree of slot %d", s + 1);
+            const std::vector<uint8_t> same(16, s);
+            CHECK(paint_tree_code(same.data(), 2) == paint_color_code(s + 1), "uniform depth-2 tree of slot %d", s + 1);
+        }
+        std::mt19937 trng(11);
+        for (int depth = 1; depth <= 4; ++depth)
+            for (int k : {2, 4, 21, 32})
+                for (int trial = 0; trial < 20; ++trial) {
+                    const int64_t n = (int64_t)1 << (2 * depth);
+                    std::vector<uint8_t> leaves(n);
+                    // runs, so that some subtrees collapse and some do not
+                    for (int64_t i = 0; i < n; ++i) leaves[i] = (i == 0 || trng() % 4 == 0) ? (uint8_t)(trng() % k) : leaves[i - 1];
+                    const std::string code = paint_tree_code(leaves.data(), depth);
+                    std::vector<uint8_t> back;
+                    CHECK(decode_paint(code, depth, back) && back == leaves, "split tree round trip, depth %d, %d colours: %s",
+                          depth, k, code.c_str());
+                }
+
+        // A red disc on a blue 100 mm square made of two triangles: both are painted in parts
+        // (141 mm diagonal at 1 mm cells -> depth 8), and each decoded leaf, placed with the
+        // TriangleSelector's child geometry, has the colour of the texture at its centre.
+        {
+            Mesh sq;
+            sq.verts = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0};
+            sq.faces = {0, 1, 2, 0, 2, 3};
+            const std::vector<float> suv = {0, 0, 1, 0, 1, 1, 0, 1};
+            const int T = 256;
+            const double cx = 0.5, cy = 0.45, r = 0.3;
+            std::vector<unsigned char> img((size_t)T * T * 4, 255);
+            for (int y = 0; y < T; ++y)
+                for (int x = 0; x < T; ++x) {
+                    const double u = (x + 0.5) / T, v = (y + 0.5) / T;
+                    const bool in = (u - cx) * (u - cx) + (v - cy) * (v - cy) < r * r;
+                    unsigned char* p = &img[4 * ((size_t)y * T + x)];
+                    p[0] = in ? 220 : 30; p[1] = 30; p[2] = in ? 30 : 220;
+                }
+            const PrintTexture disc{suv.data(), img.data(), T};
+            ColorOptions dco;
+            dco.count = 2; dco.lift = 0.0f; dco.speck_mm2 = 4.0f;
+            dco.cell_mm = 0.0f;
+            const PrintColors whole = quantize_print_colors(sq.verts.data(), sq.V(), sq.faces.data(), sq.F(), disc, 100.0f, dco);
+            CHECK(whole.face_code.empty(), "cell 0 split the triangles");
+            dco.cell_mm = 1.0f;
+            const PrintColors pc = quantize_print_colors(sq.verts.data(), sq.V(), sq.faces.data(), sq.F(), disc, 100.0f, dco);
+            CHECK(pc.palette.size() == 2 && pc.face_code.size() == 2, "disc: %zu slots, %zu codes", pc.palette.size(), pc.face_code.size());
+            if (pc.palette.size() == 2 && pc.face_code.size() == 2) {
+                const int red = (pc.palette[0] >> 16) > (pc.palette[0] & 0xFF) ? 0 : 1;
+                const double area_disc = 3.14159265 * r * r;
+                CHECK(std::fabs(pc.share[red] - area_disc) < 0.01, "disc share %g, expected %g", pc.share[red], area_disc);
+                int64_t wrong = 0, total = 0;
+                for (int f = 0; f < 2; ++f) {
+                    std::vector<uint8_t> leaves;
+                    const bool ok = decode_paint(pc.face_code[f], 8, leaves);
+                    CHECK(ok && pc.face_code[f].size() > 3, "disc face %d: code of %zu digits does not decode", f, pc.face_code[f].size());
+                    if (!ok) continue;
+                    size_t at = 0;
+                    std::function<void(const double*, const double*, const double*, int)> walk =
+                        [&](const double* a, const double* b, const double* c, int d) {
+                            if (d == 0) {
+                                const double u = (a[0] + b[0] + c[0]) / 3, v = (a[1] + b[1] + c[1]) / 3;
+                                const double dist = std::sqrt((u - cx) * (u - cx) + (v - cy) * (v - cy));
+                                const uint8_t s = leaves[at++];
+                                if (std::fabs(dist - r) > 0.02) { ++total; wrong += (s == red) != (dist < r); }
+                                return;
+                            }
+                            const double ab[2] = {(a[0] + b[0]) / 2, (a[1] + b[1]) / 2}, bc[2] = {(b[0] + c[0]) / 2, (b[1] + c[1]) / 2},
+                                         ca[2] = {(c[0] + a[0]) / 2, (c[1] + a[1]) / 2};
+                            walk(a, ab, ca, d - 1); walk(ab, b, bc, d - 1); walk(bc, c, ca, d - 1); walk(ab, bc, ca, d - 1);
+                        };
+                    const double UV[8] = {0, 0, 1, 0, 1, 1, 0, 1};
+                    const double* P[4] = {&UV[0], &UV[2], &UV[4], &UV[6]};
+                    const int32_t* t = &sq.faces[3 * f];
+                    walk(P[t[0]], P[t[1]], P[t[2]], 8);
+                }
+                CHECK(total > 100000 && wrong == 0, "disc: %lld of %lld leaves away from the rim have the wrong colour",
+                      (long long)wrong, (long long)total);
+                printf("split paint: 2 triangles -> codes of %zu and %zu digits, disc share %.4f (%.4f)\n",
+                       pc.face_code[0].size(), pc.face_code[1].size(), pc.share[red], area_disc);
+            }
+        }
+        // T-junction: a tall blue triangle (split to depth 7) on a red sliver below it (depth 6)
+        // that shares its base; the two faces have their own UV vertices (a seam). Their leaves
+        // share no vertices along the base, yet the 0.3 mm2 sliver must merge into the blue as
+        // a speck, which only the border along the base allows.
+        {
+            Mesh tj;
+            tj.verts = {0, 0, 0, 1, 0, 0, 0.5f, 3, 0,      // blue: base + apex
+                        0, 0, 0, 1, 0, 0, 0.5f, -0.0005f, 0};   // red sliver under the base
+            tj.faces = {0, 1, 2, 3, 5, 4};
+            const std::vector<float> tuv = {0.1f, 0.1f, 0.3f, 0.1f, 0.2f, 0.3f, 0.85f, 0.85f, 0.95f, 0.85f, 0.9f, 0.9f};
+            const int T = 64;
+            std::vector<unsigned char> img((size_t)T * T * 4, 255);
+            for (int y = 0; y < T; ++y)
+                for (int x = 0; x < T; ++x) {
+                    const bool red = x > 0.8 * T && y > 0.8 * T;
+                    unsigned char* q = &img[4 * ((size_t)y * T + x)];
+                    q[0] = red ? 220 : 30; q[1] = 30; q[2] = red ? 30 : 220;
+                }
+            const PrintTexture ttex{tuv.data(), img.data(), T};
+            ColorOptions tco;
+            tco.count = 2; tco.lift = 0.0f; tco.speck_mm2 = 4.0f; tco.cell_mm = 1.0f;
+            const PrintColors kept = [&] { ColorOptions o = tco; o.speck_mm2 = 0; return quantize_print_colors(
+                tj.verts.data(), tj.V(), tj.faces.data(), tj.F(), ttex, 100.0f, o); }();
+            CHECK(kept.palette.size() == 2 && kept.face_code.size() == 2, "T-junction fixture: %zu slots without the merge",
+                  kept.palette.size());
+            const PrintColors merged = quantize_print_colors(tj.verts.data(), tj.V(), tj.faces.data(), tj.F(), ttex, 100.0f, tco);
+            CHECK(merged.palette.size() == 1 && merged.patches == 1, "T-junction speck not merged: %zu slots, %d patches",
+                  merged.palette.size(), merged.patches);
+        }
 
         Mesh cube;
         std::vector<float> uv;

@@ -31,4 +31,18 @@ std::vector<float> tex_decode(const Model& m, const std::vector<float>& tex_late
                               const std::vector<std::array<int,3>>& coords0,
                               const std::vector<std::vector<uint8_t>>& subs);
 
+// The decoder's voxel tree when there is no shape decode to replay: texture-only mode
+// (docs/spec/33-texture-only.md). Upstream's tex decoder grows exactly the fine voxels that the
+// shape ENCODER merged (its S2C spatial cache), so the tree is the fine set halved level by
+// level. `subs[k]` is the [8*N_k] child mask of decoder stage k in sparse_c2s's layout
+// (o + 8*i, child (2x + (o&1), 2y + (o>>1&1), 2z + (o>>2&1))), walked from `latent` in its
+// given order; `coords` is the order of tex_decode's output rows (a permutation of `fine`).
+struct DecodeTree {
+    std::vector<std::vector<uint8_t>> subs;     // 4 stages
+    std::vector<std::array<int,3>> coords;      // final voxels, tex_decode row order
+};
+// Throws if `latent` (the encoder's coords) is not exactly the set of `fine` >> 4.
+DecodeTree decode_tree_from_fine(const std::vector<std::array<int,3>>& fine,
+                                 const std::vector<std::array<int,3>>& latent);
+
 } // namespace trellis

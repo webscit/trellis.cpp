@@ -86,6 +86,34 @@ body {
 .panel-left > * { flex: 0 0 auto; }
 .viewer-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; padding: 0; overflow: hidden; }
 
+/* ---- mode switch: Generate from image | Paint a mesh ---- */
+.mode-switch {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px; padding: 3px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+}
+.mode-switch button {
+  background: transparent; color: var(--muted); border: none; border-radius: 6px;
+  padding: 7px 6px; font-size: 12.5px; cursor: pointer; white-space: nowrap;
+}
+.mode-switch button:hover { color: var(--text); }
+.mode-switch button[aria-selected="true"] { background: var(--accent); color: #fff; font-weight: 600; }
+
+/* ---- mesh slot ("Paint a mesh") ---- */
+.meshzone {
+  border: 1.5px dashed var(--border); border-radius: 10px; background: var(--panel-2);
+  padding: 10px 12px; cursor: pointer; transition: border-color 0.15s, background 0.15s;
+}
+.meshzone:hover, .meshzone.drag { border-color: var(--accent); background: #20283a; }
+.mesh-hint { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.mesh-hint .muted { font-size: 12px; }
+.mesh-info { display: flex; align-items: center; gap: 8px; }
+.mesh-icon { color: var(--accent); font-size: 18px; }
+.mesh-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.mesh-text b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-text .muted { font-size: 11.5px; }
+.mesh-clear { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0 2px; }
+.mesh-clear:hover { color: var(--err); }
+
 /* ---- dropzone ---- */
 .dropzone {
   position: relative; aspect-ratio: 1 / 1; width: 100%;
@@ -143,6 +171,10 @@ body {
 }
 .ctl select:focus, .ctl input:focus { outline: none; border-color: var(--accent); }
 .ctl select option { background: var(--panel-2); color: var(--text); }
+.ctl input:disabled { color: var(--muted); cursor: not-allowed; }
+.ctl-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ctl-check { display: inline-flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; }
+.ctl .ctl-check input { margin: 0; padding: 0; }
 
 .primary {
   background: var(--accent); color: #fff; border: none; border-radius: 8px;
@@ -178,6 +210,31 @@ body {
 }
 .tool-btn:hover:not(:disabled) { border-color: var(--accent); }
 .tool-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* mesh preview: orientation controls under the viewer, a pin on the front face */
+.orient-bar {
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding: 8px 12px; border-top: 1px solid var(--border); background: var(--panel); font-size: 13px;
+}
+.orient-up, .orient-turn { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.orient-up select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 7px; padding: 5px 6px; font-size: 13px;
+}
+.orient-up select:focus { outline: none; border-color: var(--accent); }
+.turn-value { min-width: 34px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; }
+.orient-hint { font-size: 12px; }
+.front-marker {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none;
+  transform: translateY(-50%);
+}
+.front-marker img {
+  width: 44px; height: 44px; object-fit: contain; background: #0e1014;
+  border: 2px solid var(--accent); border-radius: 7px;
+}
+.front-marker span {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 5px; background: var(--accent); color: #fff;
+  white-space: nowrap;
+}
 /* 3D print: options under the toggle, report above the viewer toolbar */
 .print-opts {
   display: flex; flex-direction: column; gap: 10px;
@@ -283,4 +340,9 @@ body {
   box-shadow: 0 6px 20px rgba(0,0,0,0.4);
 }
 .toast.err { border-left-color: var(--err); }
+.toast-action {
+  display: block; margin-top: 8px; background: var(--accent); color: #fff; border: none;
+  border-radius: 6px; padding: 5px 10px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.toast-action:hover { background: var(--accent-2); }
 .toast.ok { border-left-color: var(--ok); }
